@@ -125,11 +125,14 @@ to re-derive at nontrivial cost — fix it. That fix is part of the task, not a 
 
 ## Claude Code skills (bonus, Claude-Code-specific)
 
-`.claude/skills/farm-diagnose` and `.claude/skills/farm-deploy` formalize the
-investigation and deploy checklists above as Claude Code skills, auto-invoked from the
-matching intent. They're a convenience layer on top of `docs/airtho/`, not a separate
-source of truth — every fact in them also exists as prose in `docs/airtho/`, so agents
-on other harnesses aren't missing anything by not having them.
+[`skills/farm-diagnose`](skills/farm-diagnose/SKILL.md) and
+[`skills/farm-deploy`](skills/farm-deploy/SKILL.md) formalize the investigation and
+deploy checklists above as Claude Code skills. They live in a plain `skills/` folder
+(not `.claude/skills/`) so they're visible in a normal directory listing; if your
+harness expects skills under `.claude/skills/`, symlink or copy them there. They're a
+convenience layer on top of `docs/airtho/`, not a separate source of truth — every fact
+in them also exists as prose in `docs/airtho/`, so agents on other harnesses aren't
+missing anything by not having them.
 
 ## Repo-level facts (not Airtho-specific)
 
