@@ -409,6 +409,20 @@ _HMS_FAILURE_REASONS: dict[str, str] = {
     "0702_8003": "Clogged nozzle",
 }
 
+# SD/MicroSD card read/write HMS short codes that should be auto-cleared instead
+# of notified. These are transient faults (a glitchy read/write, the print file
+# briefly going unavailable) that a clean_print_error ack resolves — on a farm
+# they otherwise stall the dispatch gate and spam notifications. Codes that need
+# physical intervention (no card / full / write-protected) are deliberately left
+# out so they still notify. Matched against _hms_short_code().
+_HMS_SDCARD_AUTO_CLEAR: set[str] = {
+    "0500_C010",  # MicroSD Card read/write exception: please reinsert or replace.
+    "0500_402F",  # MicroSD card sector data is damaged.
+    "0500_800E",  # Print file not available (storage media may have been removed).
+    "0500_8013",  # Print file not available (storage media may have been removed).
+    "0300_800E",  # Print file not available (storage media may have been removed).
+}
+
 
 def _hms_short_code(attr: int, code: int | str) -> str:
     """Build the canonical "MMMM_CCCC" HMS short code from raw attr/code values."""
@@ -881,6 +895,7 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                     )
 
                     sent_count = 0
+                    sdcard_cleared = False
                     for error in new_errors:
                         module_name = module_names.get(error.module, f"Module 0x{error.module:02X}")
                         # Build short code like "0700_8010"
@@ -888,6 +903,19 @@ async def on_printer_status_change(printer_id: int, state: PrinterState):
                         error_code_int = int(error.code.replace("0x", ""), 16) if error.code else 0
                         error_code_masked = error_code_int & 0xFFFF
                         short_code = f"{(error.attr >> 16) & 0xFFFF:04X}_{error_code_masked:04X}"
+
+                        # Auto-clear transient SD card read/write faults instead of
+                        # notifying. clean_print_error acks the whole error list, so
+                        # one call covers all of them; guard so we only send once.
+                        if short_code in _HMS_SDCARD_AUTO_CLEAR:
+                            if not sdcard_cleared:
+                                client = printer_manager.get_client(printer_id)
+                                if client and client.clear_hms_errors():
+                                    logging.getLogger(__name__).info(
+                                        f"[HMS] Auto-cleared SD card error {short_code} on printer {printer_id}"
+                                    )
+                                sdcard_cleared = True
+                            continue
 
                         # Only notify for errors with known descriptions — printers
                         # send many undocumented/phantom codes that aren't real errors.
