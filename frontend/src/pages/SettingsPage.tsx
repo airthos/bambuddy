@@ -1066,7 +1066,11 @@ export function SettingsPage() {
       (settings.default_timelapse ?? false) !== (localSettings.default_timelapse ?? false) ||
       (settings.stagger_group_size ?? 2) !== (localSettings.stagger_group_size ?? 2) ||
       (settings.stagger_interval_minutes ?? 5) !== (localSettings.stagger_interval_minutes ?? 5) ||
-      (settings.require_plate_clear ?? false) !== (localSettings.require_plate_clear ?? false);
+      (settings.require_plate_clear ?? false) !== (localSettings.require_plate_clear ?? false) ||
+      (settings.sentry_enabled ?? false) !== (localSettings.sentry_enabled ?? false) ||
+      (settings.sentry_retention_days ?? 7) !== (localSettings.sentry_retention_days ?? 7) ||
+      (settings.sentry_pre_roll_minutes ?? 1) !== (localSettings.sentry_pre_roll_minutes ?? 1) ||
+      (settings.sentry_post_roll_seconds ?? 60) !== (localSettings.sentry_post_roll_seconds ?? 60);
 
     if (!hasChanges) {
       return;
@@ -1152,6 +1156,10 @@ export function SettingsPage() {
         stagger_group_size: localSettings.stagger_group_size,
         stagger_interval_minutes: localSettings.stagger_interval_minutes,
         require_plate_clear: localSettings.require_plate_clear,
+        sentry_enabled: localSettings.sentry_enabled,
+        sentry_retention_days: localSettings.sentry_retention_days,
+        sentry_pre_roll_minutes: localSettings.sentry_pre_roll_minutes,
+        sentry_post_roll_seconds: localSettings.sentry_post_roll_seconds,
       };
       updateMutation.mutate(settingsToSave);
     }, 500);
