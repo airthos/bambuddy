@@ -48,6 +48,10 @@ has not been fixed — `background_dispatch.py` would need to either share the
 scheduler's `busy_printers` bookkeeping or gate on the same idle-check the scheduler
 uses.
 
+Note: a related but distinct gap in the same two paths — Print Now/Reprint silently
+never running the farm post-processor at all — was fixed in Fix 9 (`95dfeae8`). That fix
+does not touch dispatch coordination; this race is still open.
+
 ## Farm-mode features that intentionally trade safety for uptime
 
 Not a bug, but worth stating explicitly so it isn't "fixed" by someone unfamiliar with

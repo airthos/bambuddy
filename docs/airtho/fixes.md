@@ -1,6 +1,6 @@
 # Bug Fixes Applied (committed to `airthos/bambuddy`)
 
-_Last updated: 2026-07-01. Commit hashes are the source of truth — `git show <hash>` to
+_Last updated: 2026-07-02. Commit hashes are the source of truth — `git show <hash>` to
 verify a fix's current form; this file records intent and root cause, which don't rot as
 fast as line numbers do._
 
@@ -109,3 +109,42 @@ queue when the setting is off. Bundle: `index-2xBfCIGy.js`.
 **Net effect:** after any failure/abort/cancel, the queue on that printer now holds
 until a human physically clears the bed and clicks Clear Plate — the farm no longer
 auto-dispatches the next job onto a bed with a partial part still on it.
+
+## Fix 9: Print Now/Reprint silently skipped the farm post-processor (`95dfeae8`)
+
+**Discovered 2026-07-02** — a batch sent to all three farm printers finished printing
+but no part was pushed off the bed, despite "Run farm post-processor" being enabled.
+
+**Root cause:** the queue/scheduler path (`print_scheduler.py`) has always correctly run
+`farm_process.py` when `PrintQueueItem.script_processing` is set. But `background_dispatch.py`
+— the separate code path behind "Print Now" (library route) and "Reprint" — uploads the
+library/archive file straight to the printer via FTP and never calls the post-processor at
+all. Worse, the frontend checkbox for it in reprint mode (`ScheduleOptions.scriptProcessing`)
+was already wired up and rendered, but `handleSubmit` only spread `printOptions` into the
+`api.printLibraryFile`/`api.reprintArchive` calls — `scriptProcessing` lived in a sibling
+state object and was silently dropped before the request even left the browser. Neither
+`FilePrintRequest` nor `ReprintRequest` had a field for it either.
+
+Net effect: a print dispatched via Print Now or Reprint got the printer's stock
+`MACHINE_END_GCODE` — no bed-cooldown loop, no push-off sweep — regardless of the farm loop
+setting, because that setting only ever reached the queue path.
+
+**Fix:**
+- Extracted the copy → subprocess → swap-file-path logic out of `print_scheduler.py` into
+  `backend/app/services/farm_post_process.py` (`apply_farm_post_process()`), so both dispatch
+  paths run the exact same code instead of two copies drifting apart.
+- Added `script_processing: bool = False` to `FilePrintRequest` (`schemas/library.py`) and
+  `ReprintRequest` (`schemas/archive.py`).
+- Wired the helper into both `_run_reprint_archive` and `_run_print_library_file` in
+  `background_dispatch.py`, right before the FTP upload; `plate_id` resolution was moved
+  earlier so the post-processor gets the correct plate. The processed temp file is uploaded
+  in place of the original and cleaned up in a `finally` block regardless of outcome — a
+  broken/missing script always falls back to the original file rather than blocking the print.
+- Fixed the frontend drop: `script_processing: scheduleOptions.scriptProcessing` is now
+  explicitly included in both reprint-mode API calls in `PrintModal/index.tsx`.
+- New bundle: `index-DddjGGig.js`.
+
+See [`known-issues.md`](known-issues.md) — the *post-processor* half of the "Print Now /
+Add to Queue" dispatch-path split is fixed by this; the double-dispatch *race* (both paths
+firing for the same printer at once) documented there under Fix 7 is a separate,
+still-open issue.
