@@ -32,8 +32,9 @@ USAGE
 OPTIONS
 -------
   -o / --output            Output filename
-  --cooldown-temp INT      Bed release temp C              (default: 40)
+  --cooldown-temp INT      Bed release temp C              (default: 35)
   --push-speed INT         Center push feedrate mm/min     (default: 2000)
+  --flex-speed INT         Bed flex (bending cycle) feedrate mm/min (default: 300)
   --push-x FLOAT           Push X centre mm               (default: auto)
   --lane-offset FLOAT      Left/right lane offset from X centre mm (default: 60)
   --test                   Test mode flag
@@ -140,6 +141,7 @@ def build_end_sequence(
     flex_cycles=3,
     flex_z=204,
     flex_drop=20,
+    flex_speed=300,
 ):
     """
     Generate the farm loop end GCODE block.
@@ -251,12 +253,14 @@ def build_end_sequence(
         flex_bottom_z = round(flex_z + flex_drop, 2)  # full flex (bed lower)
         a("; --- FarmLoop Stage 1 bed flex ---")
         a("; Toolhead stays at X65 Y265 (cooldown park). Clip engages mechanically as bed drops.")
-        a("G1 Z{} F600 ; approach clip engage position".format(flex_engage_z))
+        a("; Slower than the F600 used elsewhere -- a slow flex gives the plate more time")
+        a("; to bend against the clip instead of snapping through, for a cleaner release.")
+        a("G1 Z{} F{} ; approach clip engage position".format(flex_engage_z, flex_speed))
         a("M400")
         for i in range(flex_cycles):
-            a("G1 Z{} F600 ; flex down {}/{} ({}mm past clip)".format(flex_bottom_z, i + 1, flex_cycles, flex_drop))
+            a("G1 Z{} F{} ; flex down {}/{} ({}mm past clip)".format(flex_bottom_z, flex_speed, i + 1, flex_cycles, flex_drop))
             a("G4 P500")
-            a("G1 Z{} F600 ; flex up -- plate springs back".format(flex_engage_z))
+            a("G1 Z{} F{} ; flex up -- plate springs back".format(flex_engage_z, flex_speed))
             a("G4 P300")
         a("")
 
@@ -306,7 +310,8 @@ def build_end_sequence(
 # ---------------------------------------------------------------------------
 
 def build_test_gcode(lines, max_z, push_x, cooldown_temp, push_speed, lane_offset,
-                     flex_cycles, flex_z, flex_drop, test_bed_temp, test_nozzle_temp):
+                     flex_cycles, flex_z, flex_drop, test_bed_temp, test_nozzle_temp,
+                     flex_speed=300):
     """
     Build a test GCODE file: keeps real machine start through M204 S10000,
     then homes, dwells 10s, runs end sequence.
@@ -341,6 +346,7 @@ def build_test_gcode(lines, max_z, push_x, cooldown_temp, push_speed, lane_offse
         flex_cycles=flex_cycles,
         flex_z=flex_z,
         flex_drop=flex_drop,
+        flex_speed=flex_speed,
     )
 
     injected = (
@@ -492,8 +498,8 @@ def main():
     )
     parser.add_argument("input", help="Input .gcode.3mf file")
     parser.add_argument("-o", "--output",        default=None)
-    parser.add_argument("--cooldown-temp",       type=int,   default=40,
-                        help="Bed release temp C (default: 40)")
+    parser.add_argument("--cooldown-temp",       type=int,   default=35,
+                        help="Bed release temp C (default: 35)")
     parser.add_argument("--push-speed",          type=int,   default=2000,
                         help="Center push feedrate mm/min (default: 2000)")
     parser.add_argument("--push-x",              type=float, default=None,
@@ -506,6 +512,8 @@ def main():
                         help="Absolute Z where FarmLoop clip engages (default: 204 = 26x2mm jog clicks up from Z256 floor)")
     parser.add_argument("--flex-drop",           type=float, default=20.0,
                         help="mm bed drops past clip engagement each flex cycle (default: 20 = 10x2mm jog clicks)")
+    parser.add_argument("--flex-speed",          type=int,   default=300,
+                        help="Bed flex (bending cycle) feedrate mm/min (default: 300, slower gives a cleaner bend)")
     parser.add_argument("--test",                action="store_true",
                         help="Test mode: home + warm + dwell + end sequence only")
     parser.add_argument("--test-bed-temp",       type=int,   default=None,
@@ -595,6 +603,7 @@ def main():
             flex_cycles=args.flex_cycles,
             flex_z=args.flex_z,
             flex_drop=args.flex_drop,
+            flex_speed=args.flex_speed,
             test_bed_temp=test_bed_temp,
             test_nozzle_temp=args.test_nozzle_temp,
         )
@@ -626,6 +635,7 @@ def main():
             flex_cycles=args.flex_cycles,
             flex_z=args.flex_z,
             flex_drop=args.flex_drop,
+            flex_speed=args.flex_speed,
         )
         + "; EXECUTABLE_BLOCK_END\n"
     )
@@ -681,7 +691,7 @@ def process_inplace(path: Path, plate_id: int = 1) -> None:
     end_block = (
         "; FEATURE: Custom\n"
         "; MACHINE_END_GCODE_START\n"
-        + build_end_sequence(max_z=max_z, cooldown_temp=40, push_x=push_x)
+        + build_end_sequence(max_z=max_z, cooldown_temp=35, push_x=push_x, flex_speed=300)
         + "; EXECUTABLE_BLOCK_END\n"
     )
 
