@@ -282,6 +282,22 @@ async def _flush_index_rows(archive_id: int, rows: list[tuple[int, int, int, int
         await db.commit()
 
 
+async def _persist_session_totals(session: RecordingSession) -> None:
+    """Mirrors the in-memory running totals onto the DB row. Without this,
+    frame_count/size_bytes only reflect reality once a session ends (set in
+    _end_session) — the storage breakdown and recordings list in Settings
+    would show 0 bytes for every job still actively recording."""
+    async with _database.async_session() as db:
+        result = await db.execute(
+            select(CameraRecordingSession).where(CameraRecordingSession.archive_id == session.archive_id)
+        )
+        row = result.scalar_one_or_none()
+        if row is not None:
+            row.frame_count = session.frame_count
+            row.size_bytes = session.size_bytes
+            await db.commit()
+
+
 async def _pump_session(session: RecordingSession) -> None:
     """Consume frames from the shared broadcaster and append them to this
     session's framelog file. File format per frame: [4B length][8B ts_ms][JPEG bytes],
@@ -317,6 +333,7 @@ async def _pump_session(session: RecordingSession) -> None:
                 pending_rows.append((seq, ts_ms, offset, len(frame)))
                 if len(pending_rows) >= _FRAME_INDEX_BATCH:
                     await _flush_index_rows(session.archive_id, pending_rows)
+                    await _persist_session_totals(session)
                     pending_rows = []
     except asyncio.CancelledError:
         pass
@@ -325,6 +342,7 @@ async def _pump_session(session: RecordingSession) -> None:
     finally:
         if pending_rows:
             await _flush_index_rows(session.archive_id, pending_rows)
+            await _persist_session_totals(session)
 
 
 async def _watchdog(session: RecordingSession, printer_id: int, archive_id: int) -> None:
