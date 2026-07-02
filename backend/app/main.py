@@ -4880,16 +4880,6 @@ async def lifespan(app: FastAPI):
     # Rehydrate persisted awaiting-plate-clear gate (#961) so prompts survive restarts
     await printer_manager.load_awaiting_plate_clear_from_db()
 
-    # Resume or close out any Sentry recordings left mid-flight by a previous
-    # process (backend restart during an active print) — same shape as the
-    # plate-clear rehydration above.
-    try:
-        from backend.app.services import camera_recorder
-
-        await camera_recorder.reconcile_on_startup()
-    except Exception:
-        logging.getLogger(__name__).exception("Sentry: reconcile_on_startup failed")
-
     # Layer change callback for external camera timelapse
     async def on_layer_change(printer_id: int, layer_num: int):
         """Capture timelapse frame on layer change + first layer notification."""
@@ -5018,6 +5008,21 @@ async def lifespan(app: FastAPI):
     # Connect to all active printers
     async with async_session() as db:
         await init_printer_connections(db)
+
+    # Resume or close out any Sentry recordings left mid-flight by a previous
+    # process (backend restart during an active print). Must run AFTER
+    # init_printer_connections above — reconcile checks printer_manager.is_connected(),
+    # which is otherwise always False this early in startup, misclassifying every
+    # in-progress recording as "printer offline" and orphaning it needlessly.
+    # MQTT connect is fire-and-forget from init_printer_connections, so give it a
+    # few seconds to actually establish before checking.
+    await asyncio.sleep(3)
+    try:
+        from backend.app.services import camera_recorder
+
+        await camera_recorder.reconcile_on_startup()
+    except Exception:
+        logging.getLogger(__name__).exception("Sentry: reconcile_on_startup failed")
 
     # Auto-connect to Spoolman if enabled
     async with async_session() as db:
