@@ -105,12 +105,17 @@ as a local uncommitted diff.
 Cherry-picked from `airthos/print-farm`, adds the farm's end-of-print loop sequence.
 
 - **What it does:** strips the stock `MACHINE_END_GCODE_START` block and injects: a bed
-  cooldown loop (`M190` at **40°C** — raised from 35°C on 2026-06-12, commit `1d5d3c6c`;
-  40 iterations) → `M140 S0` (clears the bed setpoint so the UI shows 0°C, not a
-  leftover 25°C) → a bed-flex sequence (Z204↔Z224, three cycles) → a part push-off sweep
-  across center/right/left lanes, all at **2000 mm/min** since 2026-06-12 (commit
-  `509f5e02` — the center lane used to run at a "slow" 300 mm/min and now matches the
-  other lanes; controlled by the `push_speed` param / `--push-speed` CLI flag).
+  cooldown loop (`M190` at **35°C** — raised to 40°C on 2026-06-12 (commit `1d5d3c6c`),
+  then reverted back to 35°C on 2026-07-02 (commit `910c5319`) after the farm reported the
+  plates weren't cooling enough at 40°C to release cleanly; 40 iterations) → `M140 S0`
+  (clears the bed setpoint so the UI shows 0°C, not a leftover 25°C) → a bed-flex sequence
+  (Z204↔Z224, three cycles, now at a deliberately slow **300 mm/min** as of 2026-07-02 —
+  was 600 mm/min, same as every other Z move in the script; slowing just the flex gives
+  the plate more time to bend against the clip instead of snapping through, for a cleaner
+  release — controlled by the `flex_speed` param / `--flex-speed` CLI flag) → a part
+  push-off sweep across center/right/left lanes, all at **2000 mm/min** since 2026-06-12
+  (commit `509f5e02` — the center lane used to run at a "slow" 300 mm/min and now matches
+  the other lanes; controlled by the `push_speed` param / `--push-speed` CLI flag).
   Note: the "40" in the `M190` loop is the **iteration count**, not the temperature —
   the temperature is the separate `cooldown_temp` param.
 - **Plate-aware:** reads/writes `Metadata/plate_{N}.gcode` and
