@@ -338,4 +338,76 @@ async def test_force_shutdown_then_subscribe_via_registry_works():
     queue = await bc2.subscribe()
     chunk = await asyncio.wait_for(queue.get(), timeout=1.0)
     assert chunk == b"hello"
+
+
+# ---------------------------------------------------------------------------
+# Pinned subscribers (Sentry mode) — a recording must survive an unrelated
+# viewer's stop-camera call, which today force-shuts-down the whole
+# broadcaster (routes/camera.py::stop_camera_stream).
+# ---------------------------------------------------------------------------
+
+
+async def test_pinned_subscriber_blocks_force_shutdown():
+    bc = MjpegBroadcaster("p1", _make_factory([b"x"] * 1000, delay=0.02))
+    pinned = await bc.subscribe(pinned=True)
+
+    await bc.force_shutdown()
+
+    assert not bc.stopped
+    assert bc.pinned_subscriber_count == 1
+    # The pump is still alive and still delivering frames to the pinned queue.
+    chunk = await asyncio.wait_for(pinned.get(), timeout=1.0)
+    assert chunk == b"x"
+
+    # Cleanup: the pinned subscriber ends its own session.
+    await bc.unsubscribe(pinned)
+    await bc.force_shutdown()
+    assert bc.stopped
+
+
+async def test_non_pinned_unsubscribe_unaffected_by_pinning():
+    """A live viewer leaving normally must still work while a recording
+    (pinned) is attached — pinning must not change ordinary unsubscribe()."""
+    bc = MjpegBroadcaster("p1", _make_factory([b"x"] * 1000, delay=0.02))
+    pinned = await bc.subscribe(pinned=True)
+    viewer = await bc.subscribe()
+
+    remaining = await bc.unsubscribe(viewer)
+    assert remaining == 1  # only the pinned queue is left
+    assert not bc.stopped  # grace-teardown must not fire — pinned still attached
+
+    await bc.unsubscribe(pinned)
+    await bc.force_shutdown()
+
+
+async def test_grace_teardown_proceeds_once_pinned_subscriber_leaves(monkeypatch):
+    """Once the pinned (recorder) subscriber ends its own session, the normal
+    last-subscriber-leaves grace window must still tear the upstream down."""
+    monkeypatch.setattr(camera_fanout, "_GRACE_SECONDS", 0.05)
+    bc = MjpegBroadcaster("p1", _make_factory([b"x"] * 1000, delay=0.005))
+    pinned = await bc.subscribe(pinned=True)
+
+    remaining = await bc.unsubscribe(pinned)
+    assert remaining == 0
+
+    await asyncio.sleep(0.15)  # past the grace window
+    assert bc.stopped
+
+
+async def test_force_shutdown_with_mixed_subscribers_then_pinned_leaves():
+    """One pinned + one non-pinned: force_shutdown no-ops while both non-pinned
+    stop calls arrive, and only tears down after the pinned one also leaves."""
+    bc = MjpegBroadcaster("p1", _make_factory([b"x"] * 1000, delay=0.02))
+    pinned = await bc.subscribe(pinned=True)
+    viewer1 = await bc.subscribe()
+    viewer2 = await bc.subscribe()
+
+    await bc.unsubscribe(viewer1)
+    await bc.force_shutdown()  # e.g. viewer2's tab sends /camera/stop
+    assert not bc.stopped, "force_shutdown must not kill the pinned (recording) subscriber"
+
+    await bc.unsubscribe(viewer2)
+    await bc.unsubscribe(pinned)
+    await bc.force_shutdown()
+    assert bc.stopped
     await shutdown_broadcaster("p1")

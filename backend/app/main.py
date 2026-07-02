@@ -24,6 +24,7 @@ from backend.app.api.routes import (
     background_dispatch as background_dispatch_routes,
     bug_report,
     camera,
+    camera_recordings,
     cloud,
     discovery,
     external_links,
@@ -665,6 +666,21 @@ def _maybe_start_layer_timelapse(printer, printer_id: int, archive_id: int) -> b
     )
     logging.getLogger(__name__).info("Started layer timelapse for printer %s, archive %s", printer_id, archive_id)
     return True
+
+
+async def _maybe_start_sentry_recording(printer, printer_id: int, archive_id: int) -> bool:
+    """Start a Sentry-mode camera recording for archive_id, if enabled.
+
+    Mirrors _maybe_start_layer_timelapse's role for that feature: centralizes
+    the same call across all of on_print_start's archive-resolution branches
+    (expected-archive promotion, fallback archive, fresh archive) plus the
+    restart-recovery hook in on_print_running_observed, so a future branch
+    can't forget to wire it in (see docs/airtho/fixes.md "Fix 9" for the
+    multi-dispatch-path lesson this is guarding against).
+    """
+    from backend.app.services import camera_recorder
+
+    return await camera_recorder.start_session(printer, printer_id, archive_id)
 
 
 def _format_hms_error_summary(hms_errors: list[dict]) -> str | None:
@@ -2106,6 +2122,7 @@ async def on_print_start(printer_id: int, data: dict):
                 # branch and used to skip start_session entirely — frames were
                 # never captured and the post-print stitch silently returned None.
                 _maybe_start_layer_timelapse(printer, printer_id, archive.id)
+                await _maybe_start_sentry_recording(printer, printer_id, archive.id)
 
                 # Inject ams_mapping into usage tracker session — the session was created
                 # before expected-print promotion, so it may have ams_mapping=None when
@@ -2641,6 +2658,7 @@ async def on_print_start(printer_id: int, data: dict):
                 logger.info("Created fallback archive %s for %s (no 3MF available)", fallback_archive.id, print_name)
 
                 _maybe_start_layer_timelapse(printer, printer_id, fallback_archive.id)
+                await _maybe_start_sentry_recording(printer, printer_id, fallback_archive.id)
 
                 # Track as active print
                 _active_prints[(printer_id, fallback_archive.filename)] = fallback_archive.id
@@ -2720,6 +2738,7 @@ async def on_print_start(printer_id: int, data: dict):
                 logger.info("Created archive %s for %s", archive.id, downloaded_filename)
 
                 _maybe_start_layer_timelapse(printer, printer_id, archive.id)
+                await _maybe_start_sentry_recording(printer, printer_id, archive.id)
 
                 # Record starting energy from smart plug if available (#941: persisted column)
                 await _record_energy_start(archive, printer_id, db, context="auto-archive")
@@ -3095,7 +3114,24 @@ async def on_print_running_observed(printer_id: int, data: dict):
             )
             return
 
+        # Same restart-recovery gap applies to Sentry recording: on_print_start
+        # is suppressed by the #1304 guard on the first RUNNING push after
+        # startup, so a job already printing when Bambuddy came up would
+        # otherwise never get a recording session. Find its archive the same
+        # way _active_prints lookups elsewhere resolve "the printing archive
+        # for this printer" — most-recent 'printing' row for the printer.
+        from backend.app.models.archive import PrintArchive
+
+        archive_result = await db.execute(
+            select(PrintArchive)
+            .where(PrintArchive.printer_id == printer_id, PrintArchive.status == "printing")
+            .order_by(PrintArchive.started_at.desc())
+        )
+        printing_archive = archive_result.scalars().first()
+
     await _capture_timelapse_baseline_at_start(printer, printer_id, logger)
+    if printing_archive is not None:
+        await _maybe_start_sentry_recording(printer, printer_id, printing_archive.id)
 
 
 async def on_print_complete(printer_id: int, data: dict):
@@ -3297,6 +3333,16 @@ async def on_print_complete(printer_id: int, data: dict):
                 archive = result.scalar_one_or_none()
                 if archive:
                     archive_id = archive.id
+
+    # Sentry mode: schedule the post-roll tail and close the recording, if one
+    # is active for this archive. Fires unconditionally regardless of
+    # completed/failed/cancelled — same +post-roll buffer either way.
+    try:
+        from backend.app.services import camera_recorder
+
+        await camera_recorder.handle_print_complete(archive_id)
+    except Exception:
+        logger.exception("Sentry: handle_print_complete failed for archive %s", archive_id)
 
     # Cleanup: delete uploaded file from printer SD card to prevent phantom prints (Issue #374)
     # The print scheduler uploads files to the SD card root (/). Some printers (e.g. P1S)
@@ -4834,6 +4880,16 @@ async def lifespan(app: FastAPI):
     # Rehydrate persisted awaiting-plate-clear gate (#961) so prompts survive restarts
     await printer_manager.load_awaiting_plate_clear_from_db()
 
+    # Resume or close out any Sentry recordings left mid-flight by a previous
+    # process (backend restart during an active print) — same shape as the
+    # plate-clear rehydration above.
+    try:
+        from backend.app.services import camera_recorder
+
+        await camera_recorder.reconcile_on_startup()
+    except Exception:
+        logging.getLogger(__name__).exception("Sentry: reconcile_on_startup failed")
+
     # Layer change callback for external camera timelapse
     async def on_layer_change(printer_id: int, layer_num: int):
         """Capture timelapse frame on layer change + first layer notification."""
@@ -5023,6 +5079,11 @@ async def lifespan(app: FastAPI):
     # Start the archive auto-purge sweeper (#1008 follow-up)
     await archive_purge_service.start_scheduler()
 
+    # Start the Sentry-mode recording retention sweeper
+    from backend.app.services.camera_recording_purge import camera_recording_purge_service
+
+    await camera_recording_purge_service.start_scheduler()
+
     # Start AMS history recording
     start_ams_history_recording()
 
@@ -5070,6 +5131,12 @@ async def lifespan(app: FastAPI):
     local_backup_service.stop_scheduler()
     library_trash_service.stop_scheduler()
     archive_purge_service.stop_scheduler()
+    try:
+        from backend.app.services.camera_recording_purge import camera_recording_purge_service
+
+        camera_recording_purge_service.stop_scheduler()
+    except Exception:
+        logging.getLogger(__name__).exception("Sentry: failed to stop retention sweeper cleanly")
     obico_detection_service.stop()
     stop_ams_history_recording()
     stop_runtime_tracking()
@@ -5532,6 +5599,8 @@ app.include_router(spoolman_inventory.router, prefix=app_settings.api_prefix)
 app.include_router(updates.router, prefix=app_settings.api_prefix)
 app.include_router(maintenance.router, prefix=app_settings.api_prefix)
 app.include_router(camera.router, prefix=app_settings.api_prefix)
+app.include_router(camera_recordings.router, prefix=app_settings.api_prefix)
+app.include_router(camera_recordings.global_router, prefix=app_settings.api_prefix)
 app.include_router(external_links.router, prefix=app_settings.api_prefix)
 app.include_router(projects.router, prefix=app_settings.api_prefix)
 app.include_router(library.router, prefix=app_settings.api_prefix)

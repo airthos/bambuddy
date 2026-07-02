@@ -20,7 +20,8 @@ export type SettingsSearchTab =
   | 'spoolbuddy'
   | 'users'
   | 'backup'
-  | 'failure-detection';
+  | 'failure-detection'
+  | 'sentry';
 
 export type SettingsSearchSubTab = 'users' | 'email' | 'ldap' | 'oidc' | 'twofa' | 'security';
 

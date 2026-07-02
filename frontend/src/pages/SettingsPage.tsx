@@ -1,5 +1,5 @@
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Loader2, Plus, Plug, AlertTriangle, RotateCcw, Bell, Download, RefreshCw, ExternalLink, Globe, Droplets, Thermometer, FileText, Edit2, Send, CheckCircle, XCircle, History, Trash2, Zap, TrendingUp, Calendar, DollarSign, Power, PowerOff, Key, Copy, Database, X, Shield, Printer, Cylinder, Wifi, Home, Video, Users, Lock, Unlock, ChevronDown, Save, Mail, Flame, Layers, ListOrdered, Code, Terminal, Search, Scale, Settings as SettingsIcon, ScanEye, Cog } from 'lucide-react';
+import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
+import { Loader2, Plus, Plug, AlertTriangle, RotateCcw, Bell, Download, RefreshCw, ExternalLink, Globe, Droplets, Thermometer, FileText, Edit2, Send, CheckCircle, XCircle, History, Trash2, Zap, TrendingUp, Calendar, DollarSign, Power, PowerOff, Key, Copy, Database, X, Shield, Printer, Cylinder, Wifi, Home, Video, Users, Lock, Unlock, ChevronDown, Save, Mail, Flame, Layers, ListOrdered, Code, Terminal, Search, Scale, Settings as SettingsIcon, ScanEye, Cog, Radar, Star } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api } from '../api/client';
@@ -42,12 +42,13 @@ import { defaultNavItems, getDefaultView, setDefaultView } from '../components/L
 import { availableLanguages } from '../i18n';
 import { useToast } from '../contexts/ToastContext';
 import { useTheme, type ThemeStyle, type DarkBackground, type LightBackground, type ThemeAccent } from '../contexts/ThemeContext';
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Palette } from 'lucide-react';
 import { registerSettingsSearch, getSettingsSearchEntries } from '../lib/settingsSearch';
 import type { UsersSubTab } from '../lib/settingsSearch';
+import { formatFileSize } from '../utils/file';
 
-const validTabs = ['general', 'plugs', 'notifications', 'queue', 'filament', 'network', 'apikeys', 'virtual-printer', 'spoolbuddy', 'failure-detection', 'users', 'backup'] as const;
+const validTabs = ['general', 'plugs', 'notifications', 'queue', 'filament', 'network', 'apikeys', 'virtual-printer', 'spoolbuddy', 'failure-detection', 'sentry', 'users', 'backup'] as const;
 type TabType = typeof validTabs[number];
 
 // Cross-tab search registrations for cards rendered inline in this file.
@@ -101,6 +102,8 @@ registerSettingsSearch({ labelKey: 'settings.tabs.failureDetection', labelFallba
 registerSettingsSearch({ labelKey: 'failureDetection.perPrinterTitle', labelFallback: 'Per-Printer Settings', tab: 'failure-detection', keywords: 'failure detection per printer enable per-printer sensitivity', anchor: 'card-fd-perprinter' });
 registerSettingsSearch({ labelKey: 'failureDetection.statusTitle', labelFallback: 'Detection Status', tab: 'failure-detection', keywords: 'failure detection status running connection', anchor: 'card-fd-status' });
 registerSettingsSearch({ labelKey: 'failureDetection.historyTitle', labelFallback: 'Detection History', tab: 'failure-detection', keywords: 'failure detection history log events', anchor: 'card-fd-history' });
+// Sentry mode
+registerSettingsSearch({ labelKey: 'settings.tabs.sentry', labelFallback: 'Sentry', tab: 'sentry', keywords: 'sentry camera recording playback timeline retention pre-roll post-roll security', anchor: 'card-sentry' });
 // Email auth sub-cards (subTab=email)
 registerSettingsSearch({ labelKey: 'settings.email.advancedAuth', labelFallback: 'Advanced Email Authentication', tab: 'users', subTab: 'email', keywords: 'email authentication advanced password reset self-service forgot', anchor: 'card-email-advanced-auth' });
 registerSettingsSearch({ labelKey: 'settings.email.testConnection', labelFallback: 'Test SMTP Connection', tab: 'users', subTab: 'email', keywords: 'email smtp test connection send check', anchor: 'card-email-test' });
@@ -212,6 +215,7 @@ export function SettingsPage() {
   const [showClearLogsConfirm, setShowClearLogsConfirm] = useState(false);
   const [showClearStorageConfirm, setShowClearStorageConfirm] = useState(false);
   const [showBulkPlugConfirm, setShowBulkPlugConfirm] = useState<'on' | 'off' | null>(null);
+  const [showClearRecordingsConfirm, setShowClearRecordingsConfirm] = useState(false);
   const [showReleaseNotes, setShowReleaseNotes] = useState(false);
   const [showDisableAuthConfirm, setShowDisableAuthConfirm] = useState(false);
   const [showChangePasswordModal, setShowChangePasswordModal] = useState(false);
@@ -426,6 +430,60 @@ export function SettingsPage() {
     queryKey: ['printers'],
     queryFn: api.getPrinters,
   });
+
+  // Sentry mode
+  const sentryPrinters = useMemo(() => printers?.filter(p => p.is_active) ?? [], [printers]);
+
+  const { data: sentryStorageRaw } = useQuery({
+    queryKey: ['sentry-storage'],
+    queryFn: api.getRecordingStorage,
+    refetchInterval: 10000,
+  });
+  const sentryStorage = sentryStorageRaw ?? { total_bytes: 0, kept_forever_bytes: 0, categories: [] };
+
+  const sentryRecordingQueries = useQueries({
+    queries: sentryPrinters.map(p => ({
+      queryKey: ['recordings', p.id],
+      queryFn: () => api.getRecordings(p.id),
+      refetchInterval: 10000,
+    })),
+  });
+  const sentrySessions = useMemo(() => {
+    const all = sentryPrinters.flatMap((_p, i) => sentryRecordingQueries[i]?.data ?? []);
+    return all
+      .sort((a, b) => new Date(b.started_at ?? 0).getTime() - new Date(a.started_at ?? 0).getTime())
+      .slice(0, 15);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sentryPrinters, sentryRecordingQueries]);
+
+  const invalidateSentryQueries = () => {
+    queryClient.invalidateQueries({ queryKey: ['sentry-storage'] });
+    sentryPrinters.forEach(p => queryClient.invalidateQueries({ queryKey: ['recordings', p.id] }));
+  };
+
+  const keepForeverMutation = useMutation({
+    mutationFn: ({ printerId, archiveId, keep }: { printerId: number; archiveId: number; keep: boolean }) =>
+      api.setRecordingKeepForever(printerId, archiveId, keep),
+    onSuccess: invalidateSentryQueries,
+  });
+  const deleteRecordingMutation = useMutation({
+    mutationFn: ({ printerId, archiveId }: { printerId: number; archiveId: number }) =>
+      api.deleteRecording(printerId, archiveId),
+    onSuccess: () => {
+      invalidateSentryQueries();
+      showToast(t('settings.sentryRecordingDeleted'));
+    },
+  });
+  const clearRecordingsMutation = useMutation({
+    mutationFn: api.clearRecordings,
+    onSuccess: (result) => {
+      invalidateSentryQueries();
+      setShowClearRecordingsConfirm(false);
+      showToast(t('settings.sentryRecordingsCleared', { count: result.deleted }));
+    },
+  });
+
+  const handleClearRecordings = () => clearRecordingsMutation.mutate();
 
   const { data: notificationTemplates, isLoading: templatesLoading } = useQuery({
     queryKey: ['notification-templates'],
@@ -1446,6 +1504,18 @@ export function SettingsPage() {
           <ScanEye className="w-4 h-4" />
           {t('settings.tabs.failureDetection')}
           <span className={`w-2 h-2 rounded-full ${obicoActive ? 'bg-green-400' : 'bg-gray-500'}`} />
+        </button>
+        <button
+          onClick={() => handleTabChange('sentry')}
+          className={`px-4 py-2 text-sm font-medium transition-colors border-b-2 -mb-px lg:border-b-0 lg:border-l-2 lg:-ml-px lg:mb-0 lg:justify-start flex items-center gap-2 ${
+            activeTab === 'sentry'
+              ? 'text-bambu-green border-bambu-green'
+              : 'text-bambu-gray hover:text-gray-900 dark:hover:text-white border-transparent'
+          }`}
+        >
+          <Radar className="w-4 h-4" />
+          {t('settings.tabs.sentry')}
+          <span className={`w-2 h-2 rounded-full ${localSettings?.sentry_enabled ? 'bg-green-400' : 'bg-gray-500'}`} />
         </button>
         <button
           onClick={() => handleTabChange('users')}
@@ -5892,6 +5962,203 @@ export function SettingsPage() {
         <div id="card-failure-detection">
           <FailureDetectionSettings />
         </div>
+      )}
+
+      {activeTab === 'sentry' && localSettings && (
+        <div className="flex flex-col lg:flex-row gap-4 lg:gap-6">
+          <div className="space-y-3 flex-1 lg:max-w-xl">
+            <Card id="card-sentry">
+              <CardHeader>
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Radar className="w-5 h-5 text-bambu-green" />
+                    <h2 className="text-lg font-semibold text-white">{t('settings.tabs.sentry')}</h2>
+                  </div>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={localSettings.sentry_enabled ?? false}
+                      onChange={(e) => updateSetting('sentry_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                  </label>
+                </div>
+                <p className="text-sm text-bambu-gray mt-2">{t('settings.sentryEnabledDescription')}</p>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div>
+                  <label className="block text-xs text-bambu-gray mb-1">
+                    {t('settings.sentryRetentionDays')}
+                  </label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      max={30}
+                      value={localSettings.sentry_retention_days ?? 7}
+                      onChange={(e) => updateSetting('sentry_retention_days', Math.max(1, Math.min(30, parseInt(e.target.value) || 1)))}
+                      className="w-24 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                    />
+                    <span className="text-sm text-bambu-gray">{t('settings.sentryDays')}</span>
+                  </div>
+                  <p className="text-xs text-bambu-gray mt-1">{t('settings.sentryRetentionDaysHelp')}</p>
+                </div>
+
+                <div className="flex gap-4">
+                  <div className="flex-1">
+                    <label className="block text-xs text-bambu-gray mb-1">
+                      {t('settings.sentryPreRoll')}
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min={0}
+                        max={10}
+                        value={localSettings.sentry_pre_roll_minutes ?? 1}
+                        onChange={(e) => updateSetting('sentry_pre_roll_minutes', Math.max(0, Math.min(10, parseInt(e.target.value) || 0)))}
+                        className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                      />
+                      <span className="text-sm text-bambu-gray shrink-0">{t('settings.sentryMinutes')}</span>
+                    </div>
+                    <p className="text-xs text-bambu-gray mt-1">{t('settings.sentryPreRollHelp')}</p>
+                  </div>
+                  <div className="flex-1">
+                    <label className="block text-xs text-bambu-gray mb-1">
+                      {t('settings.sentryPostRoll')}
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min={0}
+                        max={600}
+                        value={localSettings.sentry_post_roll_seconds ?? 60}
+                        onChange={(e) => updateSetting('sentry_post_roll_seconds', Math.max(0, Math.min(600, parseInt(e.target.value) || 0)))}
+                        className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                      />
+                      <span className="text-sm text-bambu-gray shrink-0">{t('settings.sentrySeconds')}</span>
+                    </div>
+                    <p className="text-xs text-bambu-gray mt-1">{t('settings.sentryPostRollHelp')}</p>
+                  </div>
+                </div>
+
+                <p className="text-xs text-yellow-400 bg-yellow-500/10 border border-yellow-500/30 rounded-lg px-3 py-2">
+                  {t('settings.sentryNotImplementedNotice')}
+                </p>
+              </CardContent>
+            </Card>
+          </div>
+
+          <div className="space-y-3 flex-1 lg:max-w-xl">
+            <Card id="card-sentry-storage">
+              <CardHeader>
+                <div className="flex items-center justify-between">
+                  <h2 className="text-lg font-semibold text-white">{t('settings.sentryStorageTitle')}</h2>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => setShowClearRecordingsConfirm(true)}
+                    disabled={sentryStorage.total_bytes === 0 || clearRecordingsMutation.isPending}
+                  >
+                    <Trash2 className="w-4 h-4" />
+                    {t('settings.sentryClearRecordings')}
+                  </Button>
+                </div>
+                <p className="text-xs text-bambu-gray mt-1">{t('settings.sentryStorageDescription')}</p>
+              </CardHeader>
+              <CardContent>
+                {sentryStorage.categories.length === 0 ? (
+                  <p className="text-sm text-bambu-gray">{t('settings.sentryNoRecordings')}</p>
+                ) : (
+                  <>
+                    <div className="w-full h-3 bg-bambu-dark rounded-full overflow-hidden flex">
+                      {sentryStorage.categories.map((category, index) => (
+                        <div
+                          key={category.key}
+                          className={`${getStorageColor(category.key, index)} h-full`}
+                          style={{ width: `${category.percent_of_total}%` }}
+                          title={`${category.label}: ${formatFileSize(category.bytes)}`}
+                        />
+                      ))}
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-3">
+                      {sentryStorage.categories.map((category, index) => (
+                        <div key={category.key} className="flex items-center gap-2 text-xs">
+                          <span className={`w-3 h-3 rounded-full ${getStorageColor(category.key, index)}`} />
+                          <span className="text-bambu-gray">{category.label}</span>
+                          <span className="text-white">{formatFileSize(category.bytes)}</span>
+                          <span className="text-bambu-gray">({category.percent_of_total.toFixed(1)}%)</span>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="mt-2 text-xs text-bambu-gray">
+                      {t('settings.storageUsageTotal', 'Total')}: <span className="text-white">{formatFileSize(sentryStorage.total_bytes)}</span>
+                      {sentryStorage.kept_forever_bytes > 0 && (
+                        <span className="ml-2">
+                          · {t('settings.sentryKeptForeverAmount', { amount: formatFileSize(sentryStorage.kept_forever_bytes) })}
+                        </span>
+                      )}
+                    </div>
+                  </>
+                )}
+              </CardContent>
+            </Card>
+
+            <Card id="card-sentry-recordings">
+              <CardHeader>
+                <h2 className="text-lg font-semibold text-white">{t('settings.sentryRecordingsTitle')}</h2>
+                <p className="text-xs text-bambu-gray mt-1">{t('settings.sentryRecordingsDescription')}</p>
+              </CardHeader>
+              <CardContent>
+                {sentrySessions.length === 0 ? (
+                  <p className="text-sm text-bambu-gray">{t('settings.sentryNoRecordings')}</p>
+                ) : (
+                  <div className="space-y-1 max-h-96 overflow-y-auto">
+                    {sentrySessions.map((rec) => {
+                      const printerName = sentryPrinters.find(p => p.id === rec.printer_id)?.name ?? `#${rec.printer_id}`;
+                      return (
+                        <div key={rec.archive_id} className="flex items-center gap-2 py-2 border-b border-bambu-dark-tertiary text-xs">
+                          <button
+                            onClick={() => keepForeverMutation.mutate({ printerId: rec.printer_id, archiveId: rec.archive_id, keep: !rec.keep_forever })}
+                            title={t('settings.sentryKeepForever')}
+                            className={rec.keep_forever ? 'text-bambu-green' : 'text-bambu-gray hover:text-white'}
+                          >
+                            <Star className="w-4 h-4" fill={rec.keep_forever ? 'currentColor' : 'none'} />
+                          </button>
+                          <div className="flex-1 min-w-0">
+                            <p className="text-white truncate">{rec.file ?? rec.print_name ?? `#${rec.archive_id}`}</p>
+                            <p className="text-bambu-gray">
+                              {printerName} · {rec.started_at ? new Date(rec.started_at).toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) : '—'} · {formatFileSize(rec.size_bytes)} · {rec.frame_count} {t('settings.sentryFrames')}
+                            </p>
+                          </div>
+                          <button
+                            onClick={() => deleteRecordingMutation.mutate({ printerId: rec.printer_id, archiveId: rec.archive_id })}
+                            title={t('settings.sentryDeleteRecording')}
+                            className="text-bambu-gray hover:text-red-400"
+                            disabled={rec.status === 'recording'}
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      );
+                    })}
+                  </div>
+                )}
+              </CardContent>
+            </Card>
+          </div>
+        </div>
+      )}
+
+      {showClearRecordingsConfirm && (
+        <ConfirmModal
+          title={t('settings.sentryClearRecordings')}
+          message={t('settings.sentryClearRecordingsConfirm')}
+          confirmText={t('settings.sentryClearRecordings')}
+          variant="danger"
+          onConfirm={handleClearRecordings}
+          onCancel={() => setShowClearRecordingsConfirm(false)}
+        />
       )}
 
       {activeTab === 'backup' && (

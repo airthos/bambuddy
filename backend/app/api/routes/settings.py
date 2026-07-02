@@ -137,6 +137,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "default_timelapse",
             "ldap_enabled",
             "ldap_auto_provision",
+            "sentry_enabled",
         ]:
             settings_dict[setting.key] = setting.value.lower() == "true"
         elif setting.key in [
@@ -159,6 +160,9 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "stagger_group_size",
             "stagger_interval_minutes",
             "forecast_global_lead_time_days",
+            "sentry_retention_days",
+            "sentry_pre_roll_minutes",
+            "sentry_post_roll_seconds",
         ]:
             settings_dict[setting.key] = int(setting.value)
         elif setting.key == "default_printer_id":

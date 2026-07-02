@@ -45,6 +45,12 @@ class MjpegBroadcaster:
         self._key = key
         self._factory = factory
         self._subscribers: list[asyncio.Queue[bytes]] = []
+        # Subscribers that must survive a force_shutdown()/grace teardown —
+        # used by the Sentry recorder so an unrelated viewer's "stop camera"
+        # call (which today force-shuts-down the whole broadcaster; see
+        # routes/camera.py::stop_camera_stream) can't kill an in-progress
+        # recording. A pinned queue is always also in _subscribers.
+        self._pinned_subscribers: set[asyncio.Queue[bytes]] = set()
         self._lock = asyncio.Lock()
         self._pump_task: asyncio.Task | None = None
         self._grace_task: asyncio.Task | None = None
@@ -65,8 +71,17 @@ class MjpegBroadcaster:
     def stopped(self) -> bool:
         return self._stopped
 
-    async def subscribe(self) -> asyncio.Queue[bytes]:
-        """Add a subscriber and ensure the upstream pump is running."""
+    @property
+    def pinned_subscriber_count(self) -> int:
+        return len(self._pinned_subscribers)
+
+    async def subscribe(self, *, pinned: bool = False) -> asyncio.Queue[bytes]:
+        """Add a subscriber and ensure the upstream pump is running.
+
+        ``pinned=True`` marks this subscriber as one that must survive
+        force_shutdown()/grace teardown (see _pinned_subscribers). Default
+        is False so every existing caller (live-viewer routes) is unaffected.
+        """
         async with self._lock:
             if self._stopped:
                 raise RuntimeError(f"broadcaster {self._key!r} is stopped")
@@ -78,6 +93,8 @@ class MjpegBroadcaster:
 
             queue: asyncio.Queue[bytes] = asyncio.Queue(maxsize=_SUBSCRIBER_QUEUE_SIZE)
             self._subscribers.append(queue)
+            if pinned:
+                self._pinned_subscribers.add(queue)
 
             if self._pump_task is None or self._pump_task.done():
                 # Reset the disconnect signal in case a previous pump set it.
@@ -95,6 +112,7 @@ class MjpegBroadcaster:
                 self._subscribers.remove(queue)
             except ValueError:
                 return len(self._subscribers)  # Already removed (e.g. force_shutdown)
+            self._pinned_subscribers.discard(queue)
             remaining = len(self._subscribers)
             if remaining == 0 and not self._stopped:
                 # Last subscriber left. Schedule grace-window teardown.
@@ -102,7 +120,23 @@ class MjpegBroadcaster:
             return remaining
 
     async def force_shutdown(self) -> None:
-        """Tear down immediately, kick all subscribers. Idempotent."""
+        """Tear down immediately, kick all non-pinned subscribers. Idempotent.
+
+        No-ops while any pinned subscriber is attached (e.g. an active Sentry
+        recording) — a viewer's "stop camera" call must not be able to kill a
+        recording that happens to share the same upstream connection. The
+        pinned subscriber releases itself (via unsubscribe()) when its own
+        session ends, at which point a subsequent force_shutdown() (or the
+        normal grace window) proceeds as usual.
+        """
+        async with self._lock:
+            if self._pinned_subscribers:
+                logger.info(
+                    "force_shutdown(%s) suppressed: %d pinned subscriber(s) active",
+                    self._key,
+                    len(self._pinned_subscribers),
+                )
+                return
         pump_task = await self._mark_stopped_locked(notify_subscribers=True)
         await self._await_pump_cancellation(pump_task)
 
@@ -116,6 +150,11 @@ class MjpegBroadcaster:
         pump_task: asyncio.Task | None = None
         async with self._lock:
             if self._subscribers or self._stopped:
+                return
+            if self._pinned_subscribers:
+                # Defense-in-depth: unreachable in practice, since a pinned
+                # queue is always also in _subscribers, so remaining == 0
+                # above already implies no pinned subscribers exist.
                 return
             self._upstream_disconnect.set()
             pump_task = self._pump_task

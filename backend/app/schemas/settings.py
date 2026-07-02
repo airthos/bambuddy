@@ -332,6 +332,30 @@ class AppSettings(BaseModel):
         description="JSON object with 'order' key containing array of sidebar item IDs (empty = no default)",
     )
 
+    # Sentry mode (per-job camera recording)
+    sentry_enabled: bool = Field(
+        default=False,
+        description="Record camera frames for each print job (from just before dispatch to shortly after completion) for later playback",
+    )
+    sentry_retention_days: int = Field(
+        default=7,
+        ge=1,
+        le=30,
+        description="Number of days to keep recorded camera frames before they're deleted",
+    )
+    sentry_pre_roll_minutes: int = Field(
+        default=1,
+        ge=0,
+        le=10,
+        description="Minutes of recording to keep before a job's print actually starts",
+    )
+    sentry_post_roll_seconds: int = Field(
+        default=60,
+        ge=0,
+        le=600,
+        description="Seconds of recording to keep after a job finishes, fails, or is cancelled",
+    )
+
 
 class AppSettingsUpdate(BaseModel):
     """Schema for updating settings (all fields optional)."""
@@ -440,6 +464,10 @@ class AppSettingsUpdate(BaseModel):
     obico_enabled_printers: str | None = None
     default_sidebar_order: str | None = None
     forecast_global_lead_time_days: int | None = Field(default=None, ge=0)
+    sentry_enabled: bool | None = None
+    sentry_retention_days: int | None = Field(default=None, ge=1, le=30)
+    sentry_pre_roll_minutes: int | None = Field(default=None, ge=0, le=10)
+    sentry_post_roll_seconds: int | None = Field(default=None, ge=0, le=600)
 
     @field_validator("gcode_snippets")
     @classmethod

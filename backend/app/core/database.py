@@ -172,6 +172,7 @@ async def init_db():
         archive,
         auth_ephemeral,
         bug_report,
+        camera_recording,
         color_catalog,
         external_link,
         filament,

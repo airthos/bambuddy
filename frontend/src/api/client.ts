@@ -189,6 +189,34 @@ export interface CameraDiagnoseStage {
   code: string | null;
 }
 
+export interface CameraRecordingSummary {
+  archive_id: number;
+  printer_id: number;
+  status: 'recording' | 'completed' | 'orphaned';
+  started_at: string | null;
+  stopped_at: string | null;
+  frame_count: number;
+  size_bytes: number;
+  keep_forever: boolean;
+  file: string | null;
+  print_name: string | null;
+  filament_type: string | null;
+  archive_status: string | null;
+}
+
+export interface RecordingStorageCategory {
+  key: string;
+  label: string;
+  bytes: number;
+  percent_of_total: number;
+}
+
+export interface RecordingStorageSummary {
+  total_bytes: number;
+  kept_forever_bytes: number;
+  categories: RecordingStorageCategory[];
+}
+
 export interface CameraDiagnoseResult {
   printer_id: number;
   protocol: 'rtsp' | 'chamber_image';
@@ -1152,6 +1180,11 @@ export interface AppSettings {
   obico_enabled_printers: string;
   // Inventory forecasting global lead time
   forecast_global_lead_time_days: number;
+  // Sentry mode (per-job camera recording)
+  sentry_enabled: boolean;
+  sentry_retention_days: number;
+  sentry_pre_roll_minutes: number;
+  sentry_post_roll_seconds: number;
 }
 
 export type AppSettingsUpdate = Partial<AppSettings>;
@@ -5129,6 +5162,23 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(body),
     }),
+
+  // Sentry mode — per-job camera recordings
+  getRecordings: (printerId: number) =>
+    request<CameraRecordingSummary[]>(`/printers/${printerId}/recordings`),
+  getRecordingFrames: (printerId: number, archiveId: number) =>
+    request<{ seq: number; ts_ms: number }[]>(`/printers/${printerId}/recordings/${archiveId}/frames`),
+  getRecordingFrameUrl: (printerId: number, archiveId: number, seq: number) =>
+    withStreamToken(`${API_BASE}/printers/${printerId}/recordings/${archiveId}/frames/${seq}`),
+  setRecordingKeepForever: (printerId: number, archiveId: number, keep: boolean) =>
+    request<{ archive_id: number; keep_forever: boolean }>(
+      `/printers/${printerId}/recordings/${archiveId}/keep-forever?keep=${keep}`,
+      { method: 'POST' }
+    ),
+  deleteRecording: (printerId: number, archiveId: number) =>
+    request<{ deleted: boolean }>(`/printers/${printerId}/recordings/${archiveId}`, { method: 'DELETE' }),
+  getRecordingStorage: () => request<RecordingStorageSummary>('/camera-recordings/storage'),
+  clearRecordings: () => request<{ deleted: number }>('/camera-recordings/clear', { method: 'POST' }),
 
   // Plate Detection - Multi-reference calibration (stores up to 5 references per printer)
   checkPlateEmpty: (printerId: number, options?: { useExternal?: boolean; includeDebugImage?: boolean }) => {
