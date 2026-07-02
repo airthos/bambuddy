@@ -2,6 +2,7 @@ export default {
   // Navigation
   nav: {
     printers: 'Printers',
+    cameras: 'Cameras',
     archives: 'Archives',
     queue: 'Print Queue',
     stats: 'Statistics',
@@ -2686,6 +2687,11 @@ export default {
         port: 'Port',
         profile: 'Profile',
       },
+    },
+    grid: {
+      title: 'Cameras',
+      subtitle: 'Live view of every printer camera at once',
+      empty: 'No active printers with cameras found',
     },
   },
 
