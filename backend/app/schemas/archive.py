@@ -236,3 +236,7 @@ class ReprintRequest(BaseModel):
     layer_inspect: bool = False
     timelapse: bool = False
     use_ams: bool = True  # Not exposed in UI, but needed for API
+    # Run the farm post-processor script (bed cooldown + push-off end sequence)
+    # before upload. Mirrors PrintQueueItem.script_processing — Reprint bypasses
+    # the queue, so this has to be requested explicitly here too.
+    script_processing: bool = False

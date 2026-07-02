@@ -251,6 +251,38 @@ def test_dispatch_option_defaults_align_with_request_schema_defaults():
         )
 
 
+def test_script_processing_wired_into_both_dispatch_branches():
+    """Regression guard for the Print Now/Reprint push-off bug.
+
+    Both "Print Now" (`print_library_file`) and "Reprint" bypass the print
+    queue entirely (`background_dispatch.py` is a separate code path from
+    `print_scheduler.py`), so PrintQueueItem.script_processing being enabled
+    on a *queued* job says nothing about whether a direct dispatch runs the
+    farm post-processor. Before this was fixed, neither path ran it at all —
+    the "Run farm post-processor" checkbox in reprint mode was silently
+    dropped before it ever reached the API. This asserts the shared helper is
+    actually invoked once per `_process_job` branch, and that both request
+    schemas expose the field with the same off-by-default value, so the two
+    can't drift out of sync again.
+    """
+    import inspect
+
+    from backend.app.schemas.archive import ReprintRequest
+    from backend.app.schemas.library import FilePrintRequest
+    from backend.app.services import background_dispatch as bd
+
+    assert ReprintRequest().script_processing is False
+    assert FilePrintRequest().script_processing is False
+
+    src = inspect.getsource(bd)
+    assert src.count("apply_farm_post_process(") == 2, (
+        "Expected apply_farm_post_process() to be called exactly once in each of "
+        "_run_reprint_archive and _run_print_library_file. If this drops to 1, one "
+        "dispatch path silently stopped running the farm post-processor again."
+    )
+    assert 'job.options.get("script_processing"' in src
+
+
 @pytest.mark.asyncio
 async def test_cancel_job_not_found_returns_false():
     """Cancelling a nonexistent job returns not_found."""

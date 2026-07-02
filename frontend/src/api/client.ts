@@ -4168,6 +4168,7 @@ export const api = {
       vibration_cali?: boolean;
       layer_inspect?: boolean;
       use_ams?: boolean;
+      script_processing?: boolean;
     }
   ) =>
     request<BackgroundDispatchResponse>(
@@ -5629,6 +5630,7 @@ export const api = {
       layer_inspect?: boolean;
       timelapse?: boolean;
       use_ams?: boolean;
+      script_processing?: boolean;
       project_id?: number;
       cleanup_library_after_dispatch?: boolean;
     }

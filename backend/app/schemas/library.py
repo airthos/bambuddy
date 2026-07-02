@@ -208,6 +208,10 @@ class FilePrintRequest(BaseModel):
     layer_inspect: bool = False
     timelapse: bool = False
     use_ams: bool = True
+    # Run the farm post-processor script (bed cooldown + push-off end sequence)
+    # before upload. Mirrors PrintQueueItem.script_processing — Print Now bypasses
+    # the queue, so this has to be requested explicitly here too.
+    script_processing: bool = False
     # Project to associate the resulting archive with
     project_id: int | None = None
     # When true, delete the LibraryFile row + disk file after the archive has

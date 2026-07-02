@@ -740,6 +740,7 @@ export function PrintModal({
                   plate_name: selectedPlateName,
                   ams_mapping: printerMapping,
                   ...printOptions,
+                  script_processing: scheduleOptions.scriptProcessing,
                   project_id: projectId,
                   cleanup_library_after_dispatch: cleanupLibraryAfterDispatch,
                 });
@@ -751,6 +752,7 @@ export function PrintModal({
                   plate_name: selectedPlateName,
                   ams_mapping: printerMapping,
                   ...printOptions,
+                  script_processing: scheduleOptions.scriptProcessing,
                 });
               }
               // Queue remaining copies if quantity > 1

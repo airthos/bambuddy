@@ -31,6 +31,7 @@ from backend.app.services.bambu_ftp import (
     upload_file_async,
     with_ftp_retry,
 )
+from backend.app.services.farm_post_process import apply_farm_post_process
 from backend.app.services.printer_manager import printer_manager
 
 logger = logging.getLogger(__name__)
@@ -589,9 +590,22 @@ class BackgroundDispatchService:
             # Sanitize: firmware parses ftp://{filename} as a URL, spaces break it
             remote_filename = remote_filename.replace(" ", "_")
             remote_path = f"/{remote_filename}"
+            plate_id = self._resolve_plate_id(file_path, job.options.get("plate_id"))
 
             ftp_retry_enabled, ftp_retry_count, ftp_retry_delay, ftp_timeout = await get_ftp_retry_settings()
             self._raise_if_cancel_requested(job)
+
+            # Farm post-process script (#1420): "Print Now"/"Reprint" upload the
+            # archive file as-is unless this runs — without it the bed cooldown +
+            # push-off end sequence never gets injected, even with the toggle on.
+            upload_path = file_path
+            processed_path: Path | None = None
+            if job.options.get("script_processing", False):
+                processed_path = await apply_farm_post_process(
+                    db, file_path, plate_id, log_label=f"Dispatch job {job.id}"
+                )
+                if processed_path is not None:
+                    upload_path = processed_path
 
             await self._set_active_message(job, f"Preparing upload to {printer_name}...")
             await delete_file_async(
@@ -632,7 +646,7 @@ class BackgroundDispatchService:
                         upload_file_async,
                         printer_ip,
                         printer_access_code,
-                        file_path,
+                        upload_path,
                         remote_path,
                         progress_callback=upload_progress_callback,
                         socket_timeout=ftp_timeout,
@@ -646,7 +660,7 @@ class BackgroundDispatchService:
                     uploaded = await upload_file_async(
                         printer_ip,
                         printer_access_code,
-                        file_path,
+                        upload_path,
                         remote_path,
                         progress_callback=upload_progress_callback,
                         socket_timeout=ftp_timeout,
@@ -667,8 +681,6 @@ class BackgroundDispatchService:
                     job.source_id,
                     ams_mapping=job.options.get("ams_mapping"),
                 )
-
-                plate_id = self._resolve_plate_id(file_path, job.options.get("plate_id"))
 
                 self._raise_if_cancel_requested(job)
 
@@ -741,6 +753,9 @@ class BackgroundDispatchService:
             except DispatchJobCancelled:
                 await self._set_active_message(job, f"Cancelled upload on {printer_name}.")
                 raise
+            finally:
+                if processed_path is not None:
+                    processed_path.unlink(missing_ok=True)
 
     async def _run_print_library_file(self, job: PrintDispatchJob):
         from backend.app.main import register_expected_print
@@ -793,9 +808,22 @@ class BackgroundDispatchService:
             # Sanitize: firmware parses ftp://{filename} as a URL, spaces break it
             remote_filename = remote_filename.replace(" ", "_")
             remote_path = f"/{remote_filename}"
+            plate_id = self._resolve_plate_id(file_path, job.options.get("plate_id"))
 
             ftp_retry_enabled, ftp_retry_count, ftp_retry_delay, ftp_timeout = await get_ftp_retry_settings()
             self._raise_if_cancel_requested(job)
+
+            # Farm post-process script (#1420): "Print Now"/"Reprint" upload the
+            # library file as-is unless this runs — without it the bed cooldown +
+            # push-off end sequence never gets injected, even with the toggle on.
+            upload_path = file_path
+            processed_path: Path | None = None
+            if job.options.get("script_processing", False):
+                processed_path = await apply_farm_post_process(
+                    db, file_path, plate_id, log_label=f"Dispatch job {job.id}"
+                )
+                if processed_path is not None:
+                    upload_path = processed_path
 
             await self._set_active_message(job, f"Preparing upload to {printer_name}...")
             await delete_file_async(
@@ -836,7 +864,7 @@ class BackgroundDispatchService:
                         upload_file_async,
                         printer_ip,
                         printer_access_code,
-                        file_path,
+                        upload_path,
                         remote_path,
                         progress_callback=upload_progress_callback,
                         socket_timeout=ftp_timeout,
@@ -850,7 +878,7 @@ class BackgroundDispatchService:
                     uploaded = await upload_file_async(
                         printer_ip,
                         printer_access_code,
-                        file_path,
+                        upload_path,
                         remote_path,
                         progress_callback=upload_progress_callback,
                         socket_timeout=ftp_timeout,
@@ -872,8 +900,6 @@ class BackgroundDispatchService:
                     archive.id,
                     ams_mapping=job.options.get("ams_mapping"),
                 )
-
-                plate_id = self._resolve_plate_id(file_path, job.options.get("plate_id"))
 
                 self._raise_if_cancel_requested(job)
 
@@ -962,6 +988,9 @@ class BackgroundDispatchService:
                 await db.rollback()
                 await self._set_active_message(job, f"Cancelled upload on {printer_name}.")
                 raise
+            finally:
+                if processed_path is not None:
+                    processed_path.unlink(missing_ok=True)
 
     @staticmethod
     async def _verify_print_response(

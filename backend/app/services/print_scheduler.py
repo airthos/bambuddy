@@ -28,6 +28,7 @@ from backend.app.services.bambu_ftp import (
     upload_file_async,
     with_ftp_retry,
 )
+from backend.app.services.farm_post_process import apply_farm_post_process
 from backend.app.services.filament_deficit import compute_deficit_for_queue_item
 from backend.app.services.notification_service import notification_service
 from backend.app.services.printer_manager import printer_manager, supports_drying
@@ -2140,47 +2141,14 @@ class PrintScheduler:
 
         # Farm post-process script
         if item.script_processing:
-            try:
-                script_path = await self._get_setting(db, "post_process_script")
-                if script_path and script_path.strip():
-                    import asyncio
-                    import shutil as _shutil
-                    import tempfile as _tmpmod
-
-                    with _tmpmod.NamedTemporaryFile(delete=False, suffix=".3mf") as tmp:
-                        script_out_path = Path(tmp.name)
-                    _shutil.copy2(file_path, script_out_path)
-                    try:
-                        proc = await asyncio.create_subprocess_exec(
-                            script_path.strip(),
-                            str(script_out_path),
-                            str(item.plate_id or 1),
-                            stdout=asyncio.subprocess.PIPE,
-                            stderr=asyncio.subprocess.PIPE,
-                        )
-                        _, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-                        if proc.returncode == 0:
-                            if injected_path and injected_path.exists():
-                                injected_path.unlink(missing_ok=True)
-                            injected_path = script_out_path
-                            file_path = script_out_path
-                            logger.info("Queue item %s: post_process_script applied", item.id)
-                        else:
-                            script_out_path.unlink(missing_ok=True)
-                            logger.warning(
-                                "Queue item %s: post_process_script failed (rc=%s): %s",
-                                item.id,
-                                proc.returncode,
-                                stderr.decode(errors="replace"),
-                            )
-                    except asyncio.TimeoutError:
-                        proc.kill()
-                        script_out_path.unlink(missing_ok=True)
-                        logger.warning("Queue item %s: post_process_script timed out, using original", item.id)
-                else:
-                    logger.warning("Queue item %s: script_processing enabled but post_process_script not configured", item.id)
-            except Exception as e:
-                logger.warning("Queue item %s: post_process_script error, using original: %s", item.id, e)
+            processed_path = await apply_farm_post_process(
+                db, file_path, item.plate_id, log_label=f"Queue item {item.id}"
+            )
+            if processed_path is not None:
+                if injected_path and injected_path.exists():
+                    injected_path.unlink(missing_ok=True)
+                injected_path = processed_path
+                file_path = processed_path
 
         # Upload file to printer via FTP
         # Use a clean filename to avoid issues with double extensions like .gcode.3mf
