@@ -198,6 +198,32 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   const currentSeq = frameList?.[currentFrame]?.seq;
   const currentTsMs = frameList?.[currentFrame]?.ts_ms;
 
+  // Double-buffer the visible frame: only swap the <img> src once the new
+  // frame has actually finished loading, instead of binding src directly to
+  // currentSeq. Binding directly still flickers/blanks on a cache miss (or a
+  // decode that hasn't resolved yet) because the browser shows nothing (or a
+  // broken-image icon) between the old src being replaced and the new one
+  // becoming visible. This way the previous frame stays on screen the entire
+  // time — visible only updates on a confirmed load, so a slow/uncached
+  // frame just holds the last good frame a little longer instead of blanking.
+  const [displayUrl, setDisplayUrl] = useState<string | null>(null);
+  useEffect(() => {
+    setDisplayUrl(null); // don't show the previous recording's last frame while the new one loads
+  }, [selectedArchiveId]);
+  useEffect(() => {
+    if (!selectedRecording || currentSeq == null) return;
+    const url = api.getRecordingFrameUrl(activePrinterId, selectedRecording.archive_id, currentSeq);
+    let cancelled = false;
+    const img = new Image();
+    img.onload = () => {
+      if (!cancelled) setDisplayUrl(url);
+    };
+    img.src = url;
+    return () => {
+      cancelled = true;
+    };
+  }, [activePrinterId, selectedRecording, currentSeq]);
+
   return (
     <div className="flex flex-col gap-3 h-full min-h-0">
       {/* Printer strip — basic 24h preview per printer: raw (time-proportional) + events (one tick per job) */}
@@ -248,17 +274,17 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
         })}
       </div>
 
-      {/* Viewport + stats overlay. max-h is a viewport-relative (vh) cap, not a
-          percentage of the parent — percentage heights only work if every
-          ancestor up to a definite-height box resolves cleanly, which is
-          fragile through Layout's flex-stretched <main>. A real loaded <img>
-          exposed exactly this: with no image, the placeholder text is short
-          and never stresses the layout; once a frame renders at its
-          intrinsic size, a broken height chain lets it grow past the
-          viewport, pushing the playback bar and timeline below the fold. vh
-          sidesteps the whole chain and guarantees the rest of the page
-          always has room regardless of how ancestors resolve. */}
-      <Card className="relative flex-1 min-h-[80px] max-h-[50vh] flex items-center justify-center overflow-hidden">
+      {/* Viewport + stats overlay. min-h-0 is the key rule here: flex items
+          default to min-height:auto, which for a box containing an <img>
+          resolves to the image's *intrinsic* size — that default silently
+          overrides flex-shrink/overflow-hidden and is exactly what let a
+          loaded frame grow the box past the viewport (invisible with no
+          image loaded, since the placeholder text is short — only showed up
+          once a real frame rendered). min-h-0 overrides that default so
+          flex-1 can size this box to exactly the remaining space, no more
+          and no less — a viewport-relative max-h cap isn't needed and was
+          leaving dead space whenever the real remaining space was smaller. */}
+      <Card className="relative flex-1 min-h-0 flex items-center justify-center overflow-hidden">
         {!selectedRecording ? (
           <p className="text-bambu-gray text-sm px-6 text-center">{t('camera.timeline.selectPrompt')}</p>
         ) : (
@@ -294,13 +320,10 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
 
             {!frameList || frameList.length === 0 ? (
               <p className="text-bambu-gray text-sm">{t('settings.sentryNoRecordings')}</p>
+            ) : displayUrl ? (
+              <img src={displayUrl} alt="" className="w-full h-full object-contain" decoding="async" />
             ) : (
-              <img
-                src={api.getRecordingFrameUrl(activePrinterId, selectedRecording.archive_id, currentSeq ?? 0)}
-                alt=""
-                className="w-full h-full object-contain"
-                decoding="async"
-              />
+              <p className="text-bambu-gray text-sm">{t('common.loading')}</p>
             )}
             {currentTsMs != null && (
               <span className="absolute bottom-3 left-3 text-xs text-white bg-bambu-dark/80 px-2 py-1 rounded">
