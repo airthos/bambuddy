@@ -2740,6 +2740,8 @@ export default {
       prevFrame: 'Previous frame',
       nextFrame: 'Next frame',
       retentionNote: 'Last 7 days · shaded blocks = footage past {{days}}-day retention',
+      rawTimeline: 'Raw timeline (time-proportional)',
+      eventsTimeline: 'Events (one tick per job, idle time compressed)',
       stats: {
         printer: 'Printer',
         filament: 'Filament',

@@ -81,7 +81,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   const [selectedArchiveId, setSelectedArchiveId] = useState<number | null>(null);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const [fps, setFps] = useState<number>(10);
+  const [fps, setFps] = useState<number>(2); // default to "Slow"
   const [liveFollow, setLiveFollow] = useState(false);
 
   const recordingQueries = useQueries({
@@ -199,13 +199,14 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   const currentTsMs = frameList?.[currentFrame]?.ts_ms;
 
   return (
-    <div className="flex flex-col gap-4 flex-1 min-h-0">
-      {/* Printer strip — basic 24h preview per printer */}
-      <div className="flex gap-3 overflow-x-auto pb-1">
+    <div className="flex flex-col gap-3 h-full min-h-0">
+      {/* Printer strip — basic 24h preview per printer: raw (time-proportional) + events (one tick per job) */}
+      <div className="flex gap-3 overflow-x-auto pb-1 shrink-0">
         {printers.map(p => {
           const recs = (recordingsByPrinter.get(p.id) ?? []).filter(r => recordingEnd(r) > dayAgo);
           const isLive = recs.some(r => r.status === 'recording');
           const blocks = buildTimeline(recs);
+          const jobBlocks = blocks.filter((b): b is JobBlock => b.type === 'job');
           return (
             <button
               key={p.id}
@@ -220,7 +221,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
                   {isLive ? t('camera.timeline.printing') : t('camera.timeline.idle')}
                 </span>
               </div>
-              <div className="flex h-3 rounded overflow-hidden bg-bambu-dark-tertiary">
+              <div className="flex h-3 rounded overflow-hidden bg-bambu-dark-tertiary" title={t('camera.timeline.rawTimeline')}>
                 {blocks.map((b, i) => {
                   const clampedStart = Math.max(b.start, dayAgo);
                   const width = ((b.end - clampedStart) / (now - dayAgo)) * 100;
@@ -228,9 +229,19 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
                   return <div key={i} style={{ width: `${width}%` }} className={cls} />;
                 })}
               </div>
-              <div className="flex justify-between text-[10px] text-bambu-gray mt-1">
+              <div className="flex justify-between text-[10px] text-bambu-gray mt-1 mb-1.5">
                 <span>{t('camera.timeline.hoursAgo', { count: 24 })}</span>
                 <span>{t('camera.timeline.now')}</span>
+              </div>
+              {/* Events row — one equally-spaced tick per job, ignoring idle gap duration */}
+              <div className="flex gap-0.5 h-1.5" title={t('camera.timeline.eventsTimeline')}>
+                {jobBlocks.length === 0 ? (
+                  <div className="flex-1 rounded-full bg-bambu-dark-tertiary opacity-40" />
+                ) : (
+                  jobBlocks.map((b, i) => (
+                    <div key={i} className={`flex-1 rounded-full ${jobClass(b.recording)}`} />
+                  ))
+                )}
               </div>
             </button>
           );
@@ -238,7 +249,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
       </div>
 
       {/* Viewport + stats overlay */}
-      <Card className="relative flex-1 min-h-[340px] flex items-center justify-center overflow-hidden">
+      <Card className="relative flex-1 min-h-[80px] flex items-center justify-center overflow-hidden">
         {!selectedRecording ? (
           <p className="text-bambu-gray text-sm px-6 text-center">{t('camera.timeline.selectPrompt')}</p>
         ) : (
@@ -294,11 +305,22 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
 
       {/* Playback controls */}
       {selectedRecording && (
-        <div className="flex flex-wrap items-center gap-3">
+        <div className="flex flex-wrap items-center gap-3 shrink-0">
           <Button variant="secondary" size="sm" onClick={() => nudge(-1)} title={t('camera.timeline.prevFrame')}>
             <SkipBack className="w-4 h-4" />
           </Button>
-          <Button variant="primary" size="sm" onClick={() => setPlaying(p => !p)} disabled={!frameList || frameList.length === 0}>
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => {
+              if (!playing && currentFrame >= maxFrame) {
+                setLiveFollow(false);
+                setCurrentFrame(0);
+              }
+              setPlaying(p => !p);
+            }}
+            disabled={!frameList || frameList.length === 0}
+          >
             {playing ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
           </Button>
           <Button variant="secondary" size="sm" onClick={() => nudge(1)} title={t('camera.timeline.nextFrame')}>
@@ -344,8 +366,8 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
         </div>
       )}
 
-      {/* Full timeline for the active printer */}
-      <Card>
+      {/* Full timeline for the active printer — raw/time-proportional, the detailed counterpart to the events row above */}
+      <Card className="shrink-0">
         <CardHeader className="flex items-center justify-between text-xs text-bambu-gray" dense>
           <span className="text-white font-medium">{printers.find(p => p.id === activePrinterId)?.name}</span>
           <span>{t('camera.timeline.retentionNote', { days: 7 })}</span>

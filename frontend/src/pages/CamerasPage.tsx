@@ -20,7 +20,7 @@ export function CamerasPage() {
   const activePrinters = printers?.filter(p => p.is_active) ?? [];
 
   return (
-    <div className="p-4 md:p-8 flex flex-col min-h-full">
+    <div className={`p-4 md:p-8 flex flex-col ${viewMode === 'detail' ? 'h-full overflow-hidden' : 'min-h-full'}`}>
       <div className="mb-6 flex flex-wrap items-center justify-between gap-3">
         <div>
           <h1 className="text-2xl font-bold text-white flex items-center gap-3">
@@ -71,7 +71,9 @@ export function CamerasPage() {
           ))}
         </div>
       ) : (
-        <CameraTimelineView printers={activePrinters} />
+        <div className="flex-1 min-h-0">
+          <CameraTimelineView printers={activePrinters} />
+        </div>
       )}
     </div>
   );
