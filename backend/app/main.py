@@ -2267,6 +2267,7 @@ async def on_print_start(printer_id: int, data: dict):
                     }
                     await _send_print_start_notification(printer_id, data, archive_data, logger)
                 _load_objects_from_archive(existing_archive, printer_id, logger)
+                await _maybe_start_sentry_recording(printer, printer_id, existing_archive.id)
                 return
 
             # Name-match only (no subtask_id to anchor on): decide resume vs.
