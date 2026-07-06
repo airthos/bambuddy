@@ -5247,6 +5247,11 @@ PUBLIC_API_PATTERNS = [
     # Camera (streams loaded via <img> tag)
     "/camera/stream",  # /printers/{id}/camera/stream
     "/camera/snapshot",  # /printers/{id}/camera/snapshot
+    # Sentry recording playback frames — also loaded via <img> tag. NOTE: must
+    # NOT be a broader "/recordings/" pattern — that would also exempt the
+    # keep-forever/delete endpoints (which need real permission checks, not
+    # just a stream token) since "in path" matching doesn't distinguish routes.
+    "/frames/",  # /printers/{id}/recordings/{archive_id}/frames/{seq} (not the /frames list endpoint, no trailing slash there)
     # Slicer token-authenticated downloads — protocol handlers (bambustudioopen://,
     # orcaslicer://) cannot send auth headers. These endpoints validate a short-lived
     # download token in the URL path instead.
