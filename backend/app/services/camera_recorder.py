@@ -298,51 +298,102 @@ async def _persist_session_totals(session: RecordingSession) -> None:
             await db.commit()
 
 
+_RECONNECT_BACKOFF_SECONDS = 5
+_MAX_RECONNECT_ATTEMPTS = 60  # ~5 minutes of retrying before giving up for good
+
+
+async def _reconnect_upstream(session: RecordingSession) -> bool:
+    """Resubscribe to the printer's camera broadcaster after the upstream
+    unexpectedly ended (camera socket dropped, printer's single camera slot
+    briefly taken by something else, transient network blip, etc). Without
+    this, a session that loses its camera connection mid-print silently stops
+    recording forever while staying "active" until the print itself
+    completes — which is exactly what happened in production: sessions
+    captured ~10 frames then went dark for 30+ minutes with no recording and
+    no error, because the pump exited quietly on upstream-end and nothing
+    ever tried again.
+    """
+    try:
+        await session.broadcaster.unsubscribe(session.queue)
+    except Exception:
+        pass  # best-effort; the broadcaster may already consider it gone
+    try:
+        session.queue = await session.broadcaster.subscribe(pinned=True)
+        return True
+    except Exception:
+        logger.exception("Sentry: reconnect failed for archive %s", session.archive_id)
+        return False
+
+
 async def _pump_session(session: RecordingSession) -> None:
     """Consume frames from the shared broadcaster and append them to this
     session's framelog file. File format per frame: [4B length][8B ts_ms][JPEG bytes],
     big-endian. The frame index stores `offset` pointing at the JPEG bytes
     (i.e. past the 12-byte header) so the frame-serving API can pread() directly.
+
+    Runs an outer retry loop: if the upstream ends unexpectedly (not because
+    stop_session() was called), reconnect with backoff instead of giving up.
     """
-    pending_rows: list[tuple[int, int, int, int]] = []
-    try:
-        with open(session.file_path, "ab") as fh:
-            while True:
-                chunk = await session.queue.get()
-                if not chunk:
-                    logger.warning(
-                        "Sentry: upstream ended for archive %s (printer %s)",
-                        session.archive_id,
-                        session.printer_id,
-                    )
-                    break
-                frame = _extract_jpeg(chunk)
-                if frame is None:
-                    continue
+    reconnect_attempts = 0
+    with open(session.file_path, "ab") as fh:
+        while True:
+            pending_rows: list[tuple[int, int, int, int]] = []
+            ended_by_cancel = False
+            try:
+                while True:
+                    chunk = await session.queue.get()
+                    if not chunk:
+                        logger.warning(
+                            "Sentry: camera upstream ended for archive %s (printer %s)",
+                            session.archive_id,
+                            session.printer_id,
+                        )
+                        break
+                    frame = _extract_jpeg(chunk)
+                    if frame is None:
+                        continue
 
-                ts_ms = int(time.time() * 1000)
-                header = len(frame).to_bytes(4, "big") + ts_ms.to_bytes(8, "big")
-                fh.write(header)
-                offset = fh.tell()
-                fh.write(frame)
-                fh.flush()
+                    ts_ms = int(time.time() * 1000)
+                    header = len(frame).to_bytes(4, "big") + ts_ms.to_bytes(8, "big")
+                    fh.write(header)
+                    offset = fh.tell()
+                    fh.write(frame)
+                    fh.flush()
 
-                seq = session.frame_count
-                session.frame_count += 1
-                session.size_bytes += len(frame)
-                pending_rows.append((seq, ts_ms, offset, len(frame)))
-                if len(pending_rows) >= _FRAME_INDEX_BATCH:
+                    seq = session.frame_count
+                    session.frame_count += 1
+                    session.size_bytes += len(frame)
+                    reconnect_attempts = 0  # any real frame resets the backoff counter
+                    pending_rows.append((seq, ts_ms, offset, len(frame)))
+                    if len(pending_rows) >= _FRAME_INDEX_BATCH:
+                        await _flush_index_rows(session.archive_id, pending_rows)
+                        await _persist_session_totals(session)
+                        pending_rows = []
+            except asyncio.CancelledError:
+                ended_by_cancel = True
+            except Exception:
+                logger.exception("Sentry: pump crashed for archive %s", session.archive_id)
+            finally:
+                if pending_rows:
                     await _flush_index_rows(session.archive_id, pending_rows)
                     await _persist_session_totals(session)
-                    pending_rows = []
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        logger.exception("Sentry: pump crashed for archive %s", session.archive_id)
-    finally:
-        if pending_rows:
-            await _flush_index_rows(session.archive_id, pending_rows)
-            await _persist_session_totals(session)
+
+            if ended_by_cancel or session.stopping:
+                return  # normal end-of-session teardown (stop_session/watchdog), not a failure
+
+            reconnect_attempts += 1
+            if reconnect_attempts > _MAX_RECONNECT_ATTEMPTS:
+                logger.error(
+                    "Sentry: giving up on archive %s after %d failed reconnect attempts",
+                    session.archive_id,
+                    reconnect_attempts,
+                )
+                return
+            await asyncio.sleep(_RECONNECT_BACKOFF_SECONDS)
+            if session.stopping:
+                return
+            if not await _reconnect_upstream(session):
+                continue  # loop back and retry after another backoff
 
 
 async def _watchdog(session: RecordingSession, printer_id: int, archive_id: int) -> None:

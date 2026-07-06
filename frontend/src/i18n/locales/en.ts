@@ -3,6 +3,7 @@ export default {
   nav: {
     printers: 'Printers',
     cameras: 'Cameras',
+    sentry: 'Sentry',
     archives: 'Archives',
     queue: 'Print Queue',
     stats: 'Statistics',

@@ -10,7 +10,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.api.routes.camera import get_printer_or_404
-from backend.app.core.auth import RequirePermissionIfAuthEnabled
+from backend.app.core.auth import RequireCameraStreamTokenIfAuthEnabled, RequirePermissionIfAuthEnabled
 from backend.app.core.database import get_db
 from backend.app.core.permissions import Permission
 from backend.app.models.archive import PrintArchive
@@ -82,9 +82,14 @@ async def get_frame(
     archive_id: int,
     seq: int,
     db: AsyncSession = Depends(get_db),
-    _: User | None = RequirePermissionIfAuthEnabled(Permission.CAMERA_VIEW),
+    _: None = RequireCameraStreamTokenIfAuthEnabled,
 ):
-    """Serves a single JPEG frame by seq, pread from the session's packed framelog file."""
+    """Serves a single JPEG frame by seq, pread from the session's packed framelog file.
+
+    Loaded via a plain <img src="..."> tag in the frontend, which can't send an
+    Authorization header — needs the lightweight stream-token scheme (same as
+    the live snapshot/stream endpoints), not full session/permission auth.
+    """
     await get_printer_or_404(printer_id, db)
 
     frame_result = await db.execute(
