@@ -248,8 +248,17 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
         })}
       </div>
 
-      {/* Viewport + stats overlay */}
-      <Card className="relative flex-1 min-h-[80px] flex items-center justify-center overflow-hidden">
+      {/* Viewport + stats overlay. max-h is a viewport-relative (vh) cap, not a
+          percentage of the parent — percentage heights only work if every
+          ancestor up to a definite-height box resolves cleanly, which is
+          fragile through Layout's flex-stretched <main>. A real loaded <img>
+          exposed exactly this: with no image, the placeholder text is short
+          and never stresses the layout; once a frame renders at its
+          intrinsic size, a broken height chain lets it grow past the
+          viewport, pushing the playback bar and timeline below the fold. vh
+          sidesteps the whole chain and guarantees the rest of the page
+          always has room regardless of how ancestors resolve. */}
+      <Card className="relative flex-1 min-h-[80px] max-h-[50vh] flex items-center justify-center overflow-hidden">
         {!selectedRecording ? (
           <p className="text-bambu-gray text-sm px-6 text-center">{t('camera.timeline.selectPrompt')}</p>
         ) : (
