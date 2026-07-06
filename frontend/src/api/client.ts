@@ -1185,6 +1185,9 @@ export interface AppSettings {
   sentry_retention_days: number;
   sentry_pre_roll_minutes: number;
   sentry_post_roll_seconds: number;
+  sentry_interval_enabled: boolean;
+  sentry_interval_minutes: number;
+  sentry_interval_retention_days: number;
 }
 
 export type AppSettingsUpdate = Partial<AppSettings>;

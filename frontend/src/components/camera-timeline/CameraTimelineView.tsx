@@ -109,6 +109,26 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   });
   const maxFrame = frameList && frameList.length > 0 ? frameList.length - 1 : 0;
 
+  // Preload every frame into the browser's HTTP cache as soon as a recording
+  // is selected. Without this, the first playthrough visibly flickers/stalls
+  // because <img src> only starts fetching a frame the instant playback
+  // reaches it — a second playthrough is smooth only because everything's
+  // already cached by then. Firing all the requests up front (the browser
+  // queues them respecting its own per-host connection limit) gets that
+  // same smoothness on the very first play.
+  useEffect(() => {
+    if (!frameList || selectedArchiveId == null) return;
+    let cancelled = false;
+    for (const f of frameList) {
+      if (cancelled) break;
+      const img = new Image();
+      img.src = api.getRecordingFrameUrl(activePrinterId, selectedArchiveId, f.seq);
+    }
+    return () => {
+      cancelled = true;
+    };
+  }, [frameList, selectedArchiveId, activePrinterId]);
+
   // Follow the newest frame while liveFollow is on and the session is still recording.
   useEffect(() => {
     if (liveFollow && selectedRecording?.status === 'recording' && frameList) {

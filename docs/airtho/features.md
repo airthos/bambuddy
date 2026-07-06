@@ -128,3 +128,96 @@ Cherry-picked from `airthos/print-farm`, adds the farm's end-of-print loop seque
   So the archive viewer showing unprocessed gcode is expected, not a bug — don't
   "fix" this without understanding why it's intentional (archives are meant to preserve
   the source-of-truth file).
+
+## 3. Sentry Mode — Per-Job Camera Recording + Interval Snapshots
+
+_Added 2026-07-02 through 2026-07-06._
+
+Two independent camera-logging features, both off by default, configured in
+Settings → Sentry:
+
+### 3a. Per-job recording
+Records camera frames for each print job — from dispatch through completion plus a
+configurable post-roll — rather than 24/7. Sessions are keyed 1:1 to `print_archives`
+rows. Settings: `sentry_enabled`, `sentry_retention_days` (default 7), `sentry_pre_roll_minutes`
+(default 1 — **best-effort only**, see limitation below), `sentry_post_roll_seconds`
+(default 60).
+
+**Architecture:**
+- `backend/app/models/camera_recording.py` — `CameraRecordingSession` (one row per
+  archive) + `CameraRecordingFrame` (frame index). Frames are packed into one
+  `.framelog` file per session (`data/camera_recordings/{printer_id}/{archive_id}.framelog`,
+  format `[4B length][8B ts_ms][JPEG bytes]`), not one file per frame — at farm scale
+  that would be hundreds of thousands of files/week.
+- `backend/app/services/camera_recorder.py` — subscribes to the printer's existing
+  `MjpegBroadcaster` (`camera_fanout.py`) as a **pinned** subscriber, so it can never
+  be evicted by an unrelated viewer's "stop camera" call, and live viewers can still
+  use the camera while a recording is active (they share the same upstream connection).
+  Runs a watchdog that closes the session (`status='orphaned'`) if the print never
+  reaches `RUNNING` or the printer disconnects for too long — required so a pinned
+  subscriber can never wedge camera access to a printer forever. Also retries with
+  backoff (5s, up to ~5 min) if the camera upstream disconnects mid-print instead of
+  giving up permanently — this was a real production bug (see Fix log below).
+- Hooked into `on_print_start` (3 call sites), `on_print_running_observed`
+  (restart-recovery), and `on_print_complete` in `main.py`, plus
+  `reconcile_on_startup()` for backend restarts mid-print.
+- `backend/app/services/camera_recording_purge.py` — retention sweeper, respects a
+  per-session `keep_forever` flag.
+- `backend/app/api/routes/camera_recordings.py` — list/frames/frame-image/keep-forever/
+  delete/storage/clear-all.
+
+**Known limitation:** true pre-roll (frames from *before* the camera connection opens)
+isn't physically possible without holding every printer's camera connection open 24/7,
+which defeats the point of event-triggered recording — nothing is watching an idle
+printer between jobs, so there's nothing to buffer from. `sentry_pre_roll_minutes` is
+honored on a best-effort basis only (recording starts as early in the dispatch pipeline
+as possible, not literally N minutes ahead).
+
+### 3b. Interval snapshots
+Independent, much simpler feature: captures one snapshot per active printer on a fixed
+schedule (5/10/30/60 min, configurable), regardless of print state — a basic ambient
+check-in even when nothing is printing. Settings: `sentry_interval_enabled`,
+`sentry_interval_minutes` (default 30), `sentry_interval_retention_days` (default 30).
+Storage is tiny by comparison — a few GB/month for the whole farm even at 5-minute
+intervals — since it's sparse sampling, not continuous capture.
+
+- `backend/app/models/camera_recording.py::CameraIntervalSnapshot` — one row + one
+  JPEG file per snapshot (file count is never a concern at this sampling rate).
+- `backend/app/services/camera_interval_capture.py` — polling loop; reuses
+  `try_get_active_buffered_frame()`/`is_stream_active()` (the same pattern the
+  existing manual-snapshot route uses) to avoid opening a second camera connection
+  when a live viewer or the per-job recorder is already using it.
+- Settings UI includes a live storage estimate (client-side calculation, not a real
+  usage query) so the interval/retention tradeoff is visible before committing to it.
+
+### Frontend
+- Sidebar nav: "Cameras" → "Sentry" (Radar icon). Grid/Detail toggle lives on that page;
+  Detail is a per-printer timeline (24h mini-previews, scrubbable job timeline,
+  frame-by-frame player with speed control).
+- Player preloads every frame into the browser's HTTP cache as soon as a recording is
+  selected (`new Image()` per frame) — without this the first playthrough visibly
+  flickers/stalls because `<img src>` only starts fetching a frame the instant playback
+  reaches it.
+
+### Fixes applied post-launch (for the historical record)
+1. **Settings not persisting** — the Settings page's debounced auto-save uses a
+   hardcoded field list for both change-detection and the save payload; the `sentry_*`
+   fields were never added to either, so toggling the switch updated local UI state
+   only and was silently discarded on refresh.
+2. **Frames returning 401** — two separate causes, both now fixed: (a) the frame-image
+   endpoint required full session auth but loads via `<img src>`, which can't send
+   `Authorization` headers — switched to the same stream-token scheme the live camera
+   view uses; (b) a **global auth middleware** in `main.py` blocks every `/api/*`
+   request unless the path matches an allowlist (`PUBLIC_API_PATTERNS`) — the existing
+   camera stream/snapshot routes are on it, the new frame/snapshot-image routes weren't.
+   Added narrow patterns (`/frames/`, `/snapshots/`) — deliberately not the broader
+   `/recordings/`, which would have also exempted the keep-forever/delete endpoints
+   from real permission checks.
+3. **Recording captured ~12 frames then went dark for the rest of a 37-minute print** —
+   the pump exited silently and permanently on the first camera disconnect (caused by a
+   backend restart during deploy), while the session stayed marked "active" until the
+   print naturally completed. Root-caused live against production logs/DB. Fixed with
+   the reconnect-with-backoff logic described above.
+4. **`reconcile_on_startup()` UNIQUE-constraint crash** — it called `start_session()`
+   without `resume_row=`, which tried to `INSERT` a `CameraRecordingSession` row that
+   already existed. Caught by a dedicated regression test before it hit production.

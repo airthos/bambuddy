@@ -37,6 +37,24 @@ class CameraRecordingSession(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
 
+class CameraIntervalSnapshot(Base):
+    """One periodic snapshot, independent of print jobs — a fixed-interval
+    ambient log (e.g. every 5/10/30/60 min) rather than the per-job continuous
+    recording above. Each snapshot is its own JPEG file (not packed) since the
+    interval is sparse enough that file count is never a concern (e.g. 5 min
+    across 3 printers = 864 files/day, nowhere near the per-frame-file problem
+    continuous recording would have).
+    """
+
+    __tablename__ = "camera_interval_snapshots"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    printer_id: Mapped[int] = mapped_column(ForeignKey("printers.id", ondelete="CASCADE"), index=True)
+    captured_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    file_path: Mapped[str] = mapped_column(String(500))
+    size_bytes: Mapped[int] = mapped_column(Integer, default=0)
+
+
 class CameraRecordingFrame(Base):
     """Index row for one frame inside a session's packed .framelog file.
 

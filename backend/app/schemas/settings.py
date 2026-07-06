@@ -349,6 +349,22 @@ class AppSettings(BaseModel):
         le=10,
         description="Minutes of recording to keep before a job's print actually starts",
     )
+    sentry_interval_enabled: bool = Field(
+        default=False,
+        description="Independent of per-job recording: capture one snapshot per active printer on a fixed interval, regardless of print state",
+    )
+    sentry_interval_minutes: int = Field(
+        default=30,
+        ge=1,
+        le=180,
+        description="Minutes between interval snapshots",
+    )
+    sentry_interval_retention_days: int = Field(
+        default=30,
+        ge=1,
+        le=365,
+        description="Number of days to keep interval snapshots before they're deleted",
+    )
     sentry_post_roll_seconds: int = Field(
         default=60,
         ge=0,
@@ -468,6 +484,9 @@ class AppSettingsUpdate(BaseModel):
     sentry_retention_days: int | None = Field(default=None, ge=1, le=30)
     sentry_pre_roll_minutes: int | None = Field(default=None, ge=0, le=10)
     sentry_post_roll_seconds: int | None = Field(default=None, ge=0, le=600)
+    sentry_interval_enabled: bool | None = None
+    sentry_interval_minutes: int | None = Field(default=None, ge=1, le=180)
+    sentry_interval_retention_days: int | None = Field(default=None, ge=1, le=365)
 
     @field_validator("gcode_snippets")
     @classmethod

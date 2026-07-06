@@ -193,11 +193,12 @@ async def test_start_session_idempotent_per_archive(monkeypatch, db_session, pri
 
 async def test_pump_writes_frames_and_completes_on_stop(monkeypatch, db_session, printer_factory, archive_factory, recorder_session_maker):
     await _set_sentry_enabled(db_session, True)
-    # keep_alive=False: let the fake upstream end naturally after 3 frames,
-    # so _pump_session's flush happens via its own clean "chunk is falsy"
-    # break — not racing stop_session()'s task-cancellation timing (which
-    # only guarantees pending_rows is flushed *eventually*, not that all 3
-    # frames were queued by the moment we decide to cancel).
+    # keep_alive=False: let the fake upstream end naturally after 3 frames.
+    # Cap reconnect attempts to 0 so that natural end terminates the pump
+    # outright instead of replaying the same 3 frames via the retry loop —
+    # we want one deterministic pass here; the retry loop itself has its own
+    # dedicated tests below.
+    monkeypatch.setattr(camera_recorder, "_MAX_RECONNECT_ATTEMPTS", 0)
     monkeypatch.setattr(
         camera_routes, "generate_chamber_mjpeg_stream", _fake_chamber_stream([b"AAA", b"BB", b"C"], keep_alive=False)
     )

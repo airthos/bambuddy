@@ -3,6 +3,7 @@ retention for per-job camera recordings written by camera_recorder.py.
 """
 
 import os
+from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import Response
@@ -14,7 +15,7 @@ from backend.app.core.auth import RequireCameraStreamTokenIfAuthEnabled, Require
 from backend.app.core.database import get_db
 from backend.app.core.permissions import Permission
 from backend.app.models.archive import PrintArchive
-from backend.app.models.camera_recording import CameraRecordingFrame, CameraRecordingSession
+from backend.app.models.camera_recording import CameraIntervalSnapshot, CameraRecordingFrame, CameraRecordingSession
 from backend.app.models.printer import Printer
 from backend.app.models.user import User
 from backend.app.services.camera_recording_purge import camera_recording_purge_service
@@ -152,6 +153,56 @@ async def delete_recording(
     if not deleted:
         raise HTTPException(status_code=404, detail="Recording not found, or still recording")
     return {"deleted": True}
+
+
+@router.get("/{printer_id}/snapshots")
+async def list_snapshots(
+    printer_id: int,
+    limit: int = 100,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.CAMERA_VIEW),
+):
+    """Most recent interval snapshots for a printer (independent of print jobs)."""
+    await get_printer_or_404(printer_id, db)
+
+    result = await db.execute(
+        select(CameraIntervalSnapshot)
+        .where(CameraIntervalSnapshot.printer_id == printer_id)
+        .order_by(CameraIntervalSnapshot.captured_at.desc())
+        .limit(min(limit, 500))
+    )
+    return [
+        {"id": row.id, "captured_at": row.captured_at.isoformat(), "size_bytes": row.size_bytes}
+        for row in result.scalars().all()
+    ]
+
+
+@router.get("/{printer_id}/snapshots/{snapshot_id}/image")
+async def get_snapshot_image(
+    printer_id: int,
+    snapshot_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: None = RequireCameraStreamTokenIfAuthEnabled,
+):
+    """Serves one interval snapshot's JPEG. Loaded via <img src>, same
+    stream-token auth as the per-job frame endpoint (see PUBLIC_API_PATTERNS)."""
+    await get_printer_or_404(printer_id, db)
+
+    result = await db.execute(
+        select(CameraIntervalSnapshot).where(
+            CameraIntervalSnapshot.id == snapshot_id, CameraIntervalSnapshot.printer_id == printer_id
+        )
+    )
+    snapshot = result.scalar_one_or_none()
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail="Snapshot not found")
+
+    try:
+        data = Path(snapshot.file_path).read_bytes()
+    except OSError as e:
+        raise HTTPException(status_code=404, detail=f"Snapshot file unavailable: {e}") from e
+
+    return Response(content=data, media_type="image/jpeg")
 
 
 @global_router.get("/storage")

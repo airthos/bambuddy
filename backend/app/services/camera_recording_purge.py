@@ -45,6 +45,8 @@ class CameraRecordingPurgeService:
             logger.info("Stopped Sentry recording retention sweeper")
 
     async def _scheduler_loop(self):
+        from backend.app.services.camera_interval_capture import camera_interval_capture_service
+
         while True:
             try:
                 await asyncio.sleep(self._check_interval)
@@ -52,6 +54,10 @@ class CameraRecordingPurgeService:
                     deleted = await self.purge_expired(db)
                     if deleted:
                         logger.info("Sentry retention sweep: deleted %d expired recording(s)", deleted)
+                async with _database.async_session() as db:
+                    deleted_snapshots = await camera_interval_capture_service.purge_expired(db)
+                    if deleted_snapshots:
+                        logger.info("Sentry retention sweep: deleted %d expired interval snapshot(s)", deleted_snapshots)
             except asyncio.CancelledError:
                 break
             except Exception as e:  # pragma: no cover - defensive

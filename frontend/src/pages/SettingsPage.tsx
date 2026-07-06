@@ -121,6 +121,10 @@ registerSettingsSearch({ labelKey: 'backup.history', labelFallback: 'Backup Hist
 registerSettingsSearch({ labelKey: 'backup.localBackup', labelFallback: 'Local Backup', tab: 'backup', keywords: 'local backup download zip manual export', anchor: 'card-backup-local' });
 registerSettingsSearch({ labelKey: 'backup.scheduledBackup', labelFallback: 'Scheduled Backups', tab: 'backup', keywords: 'scheduled backup automatic hourly daily weekly retention local path', anchor: 'card-backup-scheduled' });
 
+// Measured average P1S chamber-camera JPEG size — used only for the
+// interval-snapshot storage estimate below, not for any real accounting.
+const AVG_FRAME_BYTES_ESTIMATE = 85_000;
+
 const STORAGE_CATEGORY_COLORS: Record<string, string> = {
   database: 'bg-blue-600',
   library_files: 'bg-green-500',
@@ -1070,7 +1074,10 @@ export function SettingsPage() {
       (settings.sentry_enabled ?? false) !== (localSettings.sentry_enabled ?? false) ||
       (settings.sentry_retention_days ?? 7) !== (localSettings.sentry_retention_days ?? 7) ||
       (settings.sentry_pre_roll_minutes ?? 1) !== (localSettings.sentry_pre_roll_minutes ?? 1) ||
-      (settings.sentry_post_roll_seconds ?? 60) !== (localSettings.sentry_post_roll_seconds ?? 60);
+      (settings.sentry_post_roll_seconds ?? 60) !== (localSettings.sentry_post_roll_seconds ?? 60) ||
+      (settings.sentry_interval_enabled ?? false) !== (localSettings.sentry_interval_enabled ?? false) ||
+      (settings.sentry_interval_minutes ?? 30) !== (localSettings.sentry_interval_minutes ?? 30) ||
+      (settings.sentry_interval_retention_days ?? 30) !== (localSettings.sentry_interval_retention_days ?? 30);
 
     if (!hasChanges) {
       return;
@@ -1160,6 +1167,9 @@ export function SettingsPage() {
         sentry_retention_days: localSettings.sentry_retention_days,
         sentry_pre_roll_minutes: localSettings.sentry_pre_roll_minutes,
         sentry_post_roll_seconds: localSettings.sentry_post_roll_seconds,
+        sentry_interval_enabled: localSettings.sentry_interval_enabled,
+        sentry_interval_minutes: localSettings.sentry_interval_minutes,
+        sentry_interval_retention_days: localSettings.sentry_interval_retention_days,
       };
       updateMutation.mutate(settingsToSave);
     }, 500);
@@ -6053,6 +6063,85 @@ export function SettingsPage() {
                 <p className="text-xs text-yellow-400 bg-yellow-500/10 border border-yellow-500/30 rounded-lg px-3 py-2">
                   {t('settings.sentryNotImplementedNotice')}
                 </p>
+              </CardContent>
+            </Card>
+
+            <Card id="card-sentry-interval">
+              <CardHeader>
+                <div className="flex items-center justify-between">
+                  <h2 className="text-lg font-semibold text-white">{t('settings.sentryIntervalTitle')}</h2>
+                  <label className="relative inline-flex items-center cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={localSettings.sentry_interval_enabled ?? false}
+                      onChange={(e) => updateSetting('sentry_interval_enabled', e.target.checked)}
+                      className="sr-only peer"
+                    />
+                    <div className="w-11 h-6 bg-bambu-dark-tertiary peer-focus:outline-none rounded-full peer peer-checked:after:translate-x-full peer-checked:after:border-white after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all peer-checked:bg-bambu-green"></div>
+                  </label>
+                </div>
+                <p className="text-sm text-bambu-gray mt-2">{t('settings.sentryIntervalDescription')}</p>
+              </CardHeader>
+              <CardContent className="space-y-4">
+                <div>
+                  <label className="block text-xs text-bambu-gray mb-1">{t('settings.sentryIntervalMinutes')}</label>
+                  <div className="flex gap-2 flex-wrap">
+                    {[5, 10, 30, 60].map(mins => (
+                      <button
+                        key={mins}
+                        onClick={() => updateSetting('sentry_interval_minutes', mins)}
+                        className={`px-3 py-1.5 rounded-lg text-sm font-medium transition-colors ${
+                          (localSettings.sentry_interval_minutes ?? 30) === mins
+                            ? 'bg-bambu-green text-white'
+                            : 'bg-bambu-dark-tertiary text-bambu-gray hover:text-white'
+                        }`}
+                      >
+                        {mins} {t('settings.sentryMinutes')}
+                      </button>
+                    ))}
+                    <input
+                      type="number"
+                      min={1}
+                      max={180}
+                      value={localSettings.sentry_interval_minutes ?? 30}
+                      onChange={(e) => updateSetting('sentry_interval_minutes', Math.max(1, Math.min(180, parseInt(e.target.value) || 1)))}
+                      className="w-20 px-3 py-1.5 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                    />
+                  </div>
+                </div>
+
+                <div>
+                  <label className="block text-xs text-bambu-gray mb-1">{t('settings.sentryIntervalRetention')}</label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      max={365}
+                      value={localSettings.sentry_interval_retention_days ?? 30}
+                      onChange={(e) => updateSetting('sentry_interval_retention_days', Math.max(1, Math.min(365, parseInt(e.target.value) || 1)))}
+                      className="w-24 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
+                    />
+                    <span className="text-sm text-bambu-gray">{t('settings.sentryDays')}</span>
+                  </div>
+                </div>
+
+                {(() => {
+                  const mins = localSettings.sentry_interval_minutes ?? 30;
+                  const days = localSettings.sentry_interval_retention_days ?? 30;
+                  const printerCount = Math.max(1, sentryPrinters.length);
+                  const framesPerDay = (1440 / mins) * printerCount;
+                  const bytesPerDay = framesPerDay * AVG_FRAME_BYTES_ESTIMATE;
+                  return (
+                    <div className="text-xs text-bambu-gray bg-bambu-dark rounded-lg px-3 py-2">
+                      {t('settings.sentryIntervalEstimate', {
+                        perDay: formatFileSize(bytesPerDay),
+                        perWeek: formatFileSize(bytesPerDay * 7),
+                        total: formatFileSize(bytesPerDay * days),
+                        days,
+                      })}
+                    </div>
+                  );
+                })()}
               </CardContent>
             </Card>
           </div>

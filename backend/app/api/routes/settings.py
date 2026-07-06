@@ -138,6 +138,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "ldap_enabled",
             "ldap_auto_provision",
             "sentry_enabled",
+            "sentry_interval_enabled",
         ]:
             settings_dict[setting.key] = setting.value.lower() == "true"
         elif setting.key in [
@@ -163,6 +164,8 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "sentry_retention_days",
             "sentry_pre_roll_minutes",
             "sentry_post_roll_seconds",
+            "sentry_interval_minutes",
+            "sentry_interval_retention_days",
         ]:
             settings_dict[setting.key] = int(setting.value)
         elif setting.key == "default_printer_id":

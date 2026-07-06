@@ -5089,6 +5089,11 @@ async def lifespan(app: FastAPI):
 
     await camera_recording_purge_service.start_scheduler()
 
+    # Start the Sentry interval-snapshot capture loop (independent of print jobs)
+    from backend.app.services.camera_interval_capture import camera_interval_capture_service
+
+    await camera_interval_capture_service.start_scheduler()
+
     # Start AMS history recording
     start_ams_history_recording()
 
@@ -5142,6 +5147,12 @@ async def lifespan(app: FastAPI):
         camera_recording_purge_service.stop_scheduler()
     except Exception:
         logging.getLogger(__name__).exception("Sentry: failed to stop retention sweeper cleanly")
+    try:
+        from backend.app.services.camera_interval_capture import camera_interval_capture_service
+
+        camera_interval_capture_service.stop_scheduler()
+    except Exception:
+        logging.getLogger(__name__).exception("Sentry: failed to stop interval-snapshot loop cleanly")
     obico_detection_service.stop()
     stop_ams_history_recording()
     stop_runtime_tracking()
@@ -5252,6 +5263,7 @@ PUBLIC_API_PATTERNS = [
     # keep-forever/delete endpoints (which need real permission checks, not
     # just a stream token) since "in path" matching doesn't distinguish routes.
     "/frames/",  # /printers/{id}/recordings/{archive_id}/frames/{seq} (not the /frames list endpoint, no trailing slash there)
+    "/snapshots/",  # /printers/{id}/snapshots/{id}/image (not the /snapshots list endpoint)
     # Slicer token-authenticated downloads — protocol handlers (bambustudioopen://,
     # orcaslicer://) cannot send auth headers. These endpoints validate a short-lived
     # download token in the URL path instead.
