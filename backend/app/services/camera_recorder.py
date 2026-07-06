@@ -47,6 +47,7 @@ logger = logging.getLogger(__name__)
 RECORDINGS_DIR_NAME = "camera_recordings"
 _FRAME_INDEX_BATCH = 10
 _RUNNING_TIMEOUT_SECONDS = 120  # give up if the print never actually starts
+_ACTIVE_GCODE_STATES = {"RUNNING", "PREPARE"}  # PREPARE covers bed leveling/calibration, which can outlast the timeout
 _DISCONNECT_TIMEOUT_SECONDS = 600  # close the session if the printer's unreachable this long mid-print
 _RUNNING_POLL_SECONDS = 3
 _DISCONNECT_POLL_SECONDS = 5
@@ -411,7 +412,7 @@ async def _watchdog(session: RecordingSession, printer_id: int, archive_id: int)
         reached_running = False
         while time.monotonic() < deadline:
             status = printer_manager.get_status(printer_id)
-            if status is not None and getattr(status, "gcode_state", None) == "RUNNING":
+            if status is not None and getattr(status, "gcode_state", None) in _ACTIVE_GCODE_STATES:
                 reached_running = True
                 break
             await asyncio.sleep(_RUNNING_POLL_SECONDS)
