@@ -506,6 +506,14 @@ async def reconcile_on_startup() -> None:
                 row.stopped_at = datetime.utcnow()
                 continue
 
+            if row.archive_id in _active_sessions:
+                # A print-start callback (on_print_start / on_print_running_observed,
+                # which can fire before this runs) already brought the session back
+                # up for this same archive_id. start_session() would just return
+                # False here (its own idempotency guard) — treating that as failure
+                # would wrongly stomp a session that's already live and recording.
+                continue
+
             logger.info("Sentry: resuming recording for archive %s after restart", row.archive_id)
             # resume_row=row is required here — without it, start_session()
             # would try to INSERT a fresh CameraRecordingSession row and hit

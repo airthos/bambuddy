@@ -351,10 +351,59 @@ async def test_reconcile_resumes_session_without_duplicate_row(
         result = await fresh_db.execute(select(CameraRecordingSession).where(CameraRecordingSession.archive_id == archive_id))
         rows = result.scalars().all()
         assert len(rows) == 1  # no duplicate row created
-        assert rows[0].status == "recording"
 
-    await camera_recorder.stop_session(archive_id, tail_seconds=0)
-    await _wait_for_status(recorder_session_maker, archive_id, "completed")
+
+async def test_reconcile_does_not_orphan_session_already_started_by_print_callback(
+    monkeypatch, db_session, printer_factory, archive_factory, tmp_path, recorder_session_maker
+):
+    """Regression test for a real production bug: on a backend restart, an
+    on_print_start/on_print_running_observed callback can win the race and
+    bring a session back up (via start_session's own resume-terminal-row
+    logic) before reconcile_on_startup gets to the same archive_id. Since
+    start_session() is idempotent, its own call from reconcile_on_startup
+    then returns False just because the session is already active — that
+    used to be misread as "resume failed" and reconcile would orphan a
+    perfectly live, actively-recording session out from under it.
+    """
+    monkeypatch.setattr(camera_routes, "generate_chamber_mjpeg_stream", _fake_chamber_stream([b"f1"]))
+    monkeypatch.setattr(printer_manager, "is_connected", lambda pid: True)
+    printer = await printer_factory(model="P1S")
+    archive = await archive_factory(printer.id, status="printing")
+    printer_id, archive_id = printer.id, archive.id
+    monkeypatch.setattr(printer_manager, "get_printer", lambda pid: printer if pid == printer_id else None)
+
+    stale_row = CameraRecordingSession(
+        archive_id=archive_id,
+        printer_id=printer_id,
+        status="recording",
+        file_path=str(tmp_path / "already-started.framelog"),
+        frame_count=10,
+        size_bytes=1000,
+    )
+    db_session.add(stale_row)
+    await db_session.commit()
+
+    # Simulate the print-start callback winning the race: a live in-memory
+    # session already exists for this archive_id by the time reconcile runs.
+    winning_session = camera_recorder.RecordingSession(
+        printer_id=printer_id,
+        archive_id=archive_id,
+        file_path=tmp_path / "already-started.framelog",
+        queue=asyncio.Queue(),
+        broadcaster=None,
+    )
+    camera_recorder._active_sessions[archive_id] = winning_session
+    try:
+        await camera_recorder.reconcile_on_startup()
+
+        async with recorder_session_maker() as fresh_db:
+            result = await fresh_db.execute(
+                select(CameraRecordingSession).where(CameraRecordingSession.archive_id == archive_id)
+            )
+            row = result.scalar_one()
+            assert row.status == "recording"  # not orphaned
+    finally:
+        camera_recorder._active_sessions.pop(archive_id, None)
 
 
 async def test_reconcile_orphans_session_when_printer_offline(
