@@ -111,6 +111,12 @@ async def start_session(
     ``resume_row`` is set only by reconcile_on_startup() when resuming a
     session whose DB row already exists from a prior process — skips the
     insert and re-seeds frame_count/size_bytes instead of starting at 0.
+
+    When called without resume_row, a leftover terminal-status row for the
+    same archive_id (from a previous watchdog-killed or crash-orphaned attempt
+    on the same still-printing job) is also revived rather than inserted over
+    — the archive_id UNIQUE constraint would otherwise reject the insert and
+    the job would silently get no recording at all.
     """
     if archive_id in _active_sessions:
         return False
@@ -118,8 +124,26 @@ async def start_session(
     if resume_row is None:
         async with _database.async_session() as db:
             sentry_enabled, _, _, _ = await _get_sentry_config(db)
-        if not sentry_enabled:
-            return False
+            if not sentry_enabled:
+                return False
+            # A row can already exist for this archive_id if an earlier attempt
+            # for the same still-printing job ended (e.g. the old RUNNING-timeout
+            # watchdog bug, or a backend restart mid-print before that row was
+            # reconciled). Reuse it instead of inserting — the UNIQUE constraint
+            # on archive_id would otherwise reject a fresh row outright and the
+            # job would silently get no recording at all.
+            existing = await db.execute(
+                select(CameraRecordingSession).where(CameraRecordingSession.archive_id == archive_id)
+            )
+            existing_row = existing.scalar_one_or_none()
+            if existing_row is not None:
+                if existing_row.status == "recording":
+                    return False  # a live row with no in-memory session is reconcile_on_startup's job, not ours
+                existing_row.status = "recording"
+                existing_row.stopped_at = None
+                await db.commit()
+                await db.refresh(existing_row)
+                resume_row = existing_row
     # else: resuming a session that was already recording before a restart —
     # finish it out regardless of the current sentry_enabled value, same as
     # any other in-flight operation isn't aborted by a settings change.
