@@ -276,10 +276,10 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
               <p className="text-bambu-gray text-sm">{t('settings.sentryNoRecordings')}</p>
             ) : (
               <img
-                key={`${selectedArchiveId}-${currentSeq}`}
                 src={api.getRecordingFrameUrl(activePrinterId, selectedRecording.archive_id, currentSeq ?? 0)}
                 alt=""
-                className="max-h-full max-w-full object-contain"
+                className="w-full h-full object-contain"
+                decoding="async"
               />
             )}
             {currentTsMs != null && (
