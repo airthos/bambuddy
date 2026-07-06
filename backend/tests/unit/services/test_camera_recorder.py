@@ -257,6 +257,36 @@ async def test_watchdog_orphans_session_if_running_never_reached(monkeypatch, db
     await _wait_for_status(recorder_session_maker, archive.id, "orphaned")
 
 
+async def test_watchdog_does_not_orphan_when_running_reached(monkeypatch, db_session, printer_factory, archive_factory, recorder_session_maker):
+    """Regression test for a real production bug: the watchdog checked
+    ``status.gcode_state`` but PrinterState's field is actually named
+    ``state`` — so the getattr() default of None meant reached_running was
+    NEVER True, and every single recording got killed as "orphaned" once
+    _RUNNING_TIMEOUT_SECONDS elapsed, regardless of what the printer was
+    actually doing. Uses the real PrinterState field name here so a
+    regression back to the wrong attribute name fails this test.
+    """
+    await _set_sentry_enabled(db_session, True)
+    monkeypatch.setattr(camera_routes, "generate_chamber_mjpeg_stream", _fake_chamber_stream([b"f1"]))
+    monkeypatch.setattr(camera_recorder, "_RUNNING_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(camera_recorder, "_RUNNING_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(camera_recorder, "_DISCONNECT_POLL_SECONDS", 0.01)
+
+    class _RunningState:
+        state = "RUNNING"
+
+    monkeypatch.setattr(printer_manager, "get_status", lambda pid: _RunningState())
+    monkeypatch.setattr(printer_manager, "is_connected", lambda pid: True)
+    printer = await printer_factory(model="P1S")
+    archive = await archive_factory(printer.id, status="printing")
+
+    await camera_recorder.start_session(printer, printer.id, archive.id)
+    await asyncio.sleep(0.2)  # give the watchdog time to have wrongly orphaned it, if the bug regresses
+    assert archive.id in camera_recorder._active_sessions
+    await camera_recorder.stop_session(archive.id, tail_seconds=0)
+    await _wait_for_status(recorder_session_maker, archive.id, "completed")
+
+
 async def test_watchdog_orphans_session_on_prolonged_disconnect(monkeypatch, db_session, printer_factory, archive_factory, recorder_session_maker):
     await _set_sentry_enabled(db_session, True)
     monkeypatch.setattr(camera_routes, "generate_chamber_mjpeg_stream", _fake_chamber_stream([b"f1"]))
@@ -264,7 +294,7 @@ async def test_watchdog_orphans_session_on_prolonged_disconnect(monkeypatch, db_
     monkeypatch.setattr(camera_recorder, "_DISCONNECT_POLL_SECONDS", 0.01)
 
     class _RunningState:
-        gcode_state = "RUNNING"
+        state = "RUNNING"
 
     monkeypatch.setattr(printer_manager, "get_status", lambda pid: _RunningState())
     monkeypatch.setattr(printer_manager, "is_connected", lambda pid: False)

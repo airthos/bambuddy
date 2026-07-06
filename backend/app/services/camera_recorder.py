@@ -436,7 +436,7 @@ async def _watchdog(session: RecordingSession, printer_id: int, archive_id: int)
         reached_running = False
         while time.monotonic() < deadline:
             status = printer_manager.get_status(printer_id)
-            if status is not None and getattr(status, "gcode_state", None) in _ACTIVE_GCODE_STATES:
+            if status is not None and getattr(status, "state", None) in _ACTIVE_GCODE_STATES:
                 reached_running = True
                 break
             await asyncio.sleep(_RUNNING_POLL_SECONDS)
