@@ -40,13 +40,19 @@ interface JobBlock {
 }
 type TimelineBlock = GapBlock | JobBlock;
 
+// rate is what actually matters for video mode: it's a multiplier on
+// playbackRate, and since segments already encode each frame's *real*
+// captured duration (variable frame rate, not a fixed fps), rate: 1 already
+// reproduces true real-time elapsed playback exactly, regardless of the
+// P1S's actual (inconsistent, sub-1fps) capture cadence -- no extra
+// handling needed. fps is only the JPEG-mode (pre-video-ready) fallback
+// frame-stepping interval.
 const SPEEDS = [
-  { key: 'slow', fps: 2, rate: 0.25 },
-  { key: 'normal', fps: 10, rate: 1 },
-  { key: 'fast', fps: 30, rate: 2 },
-  { key: 'veryFast', fps: 60, rate: 4 },
+  { key: 'half', fps: 1, rate: 0.5 },
+  { key: 'normal', fps: 2, rate: 1 },
+  { key: 'double', fps: 4, rate: 2 },
+  { key: 'fiveX', fps: 10, rate: 5 },
 ] as const;
-const MAX_PLAYBACK_RATE = Math.max(...SPEEDS.map(s => s.rate));
 
 function recordingStart(r: CameraRecordingSummary): number {
   return r.started_at ? new Date(r.started_at).getTime() : Date.now();
@@ -96,7 +102,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   const [selectedArchiveId, setSelectedArchiveId] = useState<number | null>(null);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const [speedKey, setSpeedKey] = useState<(typeof SPEEDS)[number]['key']>('slow');
+  const [speedKey, setSpeedKey] = useState<(typeof SPEEDS)[number]['key']>('normal');
   const speed = SPEEDS.find(s => s.key === speedKey) ?? SPEEDS[0];
   const fps = speed.fps;
   const [liveFollow, setLiveFollow] = useState(false);
@@ -204,16 +210,18 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
         xhrSetup: (xhr, requestUrl) => {
           xhr.open('GET', withFreshToken(requestUrl), true);
         },
-        // At the fastest playback rate (SPEEDS' veryFast, 4x), burning
-        // through a second of *video* only takes 0.25 real seconds -- so
-        // keeping a 30-real-second safety cushion against ever catching up
-        // to the buffered edge means holding ~120 seconds of video ahead of
-        // playback, not 30. hls.js stops prefetching once EITHER
-        // maxBufferLength or maxBufferSize is hit, so raise the byte cap
-        // too -- otherwise a run of larger-than-usual segments could hit
-        // the default 60MB size cap well before 120s of buffer is reached.
-        maxBufferLength: 30 * MAX_PLAYBACK_RATE,
-        maxBufferSize: 200 * 1000 * 1000,
+        // Buffer the *entire* recording eagerly on selection, not just N
+        // seconds ahead -- seeking into a not-yet-buffered spot ("buffering
+        // forever") is what happens when the fetch-on-demand path doesn't
+        // keep up; buffering everything up front sidesteps that class of
+        // bug outright, and hls.js already fills forward from wherever the
+        // playhead currently is, so this also naturally prioritizes
+        // whatever's closest to the current position. Bounded by
+        // maxBufferSize (segments are small post-halved-resolution, so even
+        // a multi-hour recording comfortably fits under this).
+        maxBufferLength: Infinity,
+        maxMaxBufferLength: Infinity,
+        maxBufferSize: 1000 * 1000 * 1000,
         liveSyncDurationCount: 1,
       });
       hls.on(Hls.Events.ERROR, (_evt, data) => {
