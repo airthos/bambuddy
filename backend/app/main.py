@@ -5265,6 +5265,11 @@ PUBLIC_API_PATTERNS = [
     # just a stream token) since "in path" matching doesn't distinguish routes.
     "/frames/",  # /printers/{id}/recordings/{archive_id}/frames/{seq} (not the /frames list endpoint, no trailing slash there)
     "/snapshots/",  # /printers/{id}/snapshots/{id}/image (not the /snapshots list endpoint)
+    # Sentry HLS playback — fetched by hls.js's own internal XHR/fetch calls
+    # (and natively by Safari), neither of which carry the app's normal
+    # Authorization header. Same stream-token scheme as frames above.
+    "/hls/playlist.m3u8",
+    "/hls/segments/",
     # Slicer token-authenticated downloads — protocol handlers (bambustudioopen://,
     # orcaslicer://) cannot send auth headers. These endpoints validate a short-lived
     # download token in the URL path instead.

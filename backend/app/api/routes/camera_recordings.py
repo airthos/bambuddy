@@ -6,7 +6,7 @@ import os
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.responses import Response
+from fastapi.responses import FileResponse, Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -33,6 +33,7 @@ def _session_to_dict(row: CameraRecordingSession, archive: PrintArchive | None) 
         "stopped_at": row.stopped_at.isoformat() if row.stopped_at else None,
         "frame_count": row.frame_count,
         "size_bytes": row.size_bytes,
+        "video_status": row.video_status,
         "keep_forever": row.keep_forever,
         "file": archive.filename if archive else None,
         "print_name": archive.print_name if archive else None,
@@ -119,6 +120,77 @@ async def get_frame(
         raise HTTPException(status_code=404, detail=f"Recording file unavailable: {e}") from e
 
     return Response(content=data, media_type="image/jpeg")
+
+
+@router.get("/{printer_id}/recordings/{archive_id}/hls/playlist.m3u8")
+async def get_recording_playlist(
+    printer_id: int,
+    archive_id: int,
+    token: str | None = None,
+    db: AsyncSession = Depends(get_db),
+    _: None = RequireCameraStreamTokenIfAuthEnabled,
+):
+    """Serves the HLS playlist for this recording, rewriting each segment
+    reference into an absolute, token-bearing URL as the response is built.
+
+    The playlist file on disk (written by camera_hls.py) intentionally has
+    no tokens baked in — segment URLs need the token that's valid *right
+    now*, not whatever was valid when a segment was first written (a
+    recording being scrubbed/watched can easily outlive a single token's
+    lifetime). Native HLS players (Safari) fetch playlist and segments
+    directly with no way to inject a header/query param per-request, so the
+    server has to embed a working token directly into the URLs it hands back.
+    """
+    await get_printer_or_404(printer_id, db)
+
+    result = await db.execute(select(CameraRecordingSession).where(CameraRecordingSession.archive_id == archive_id))
+    session = result.scalar_one_or_none()
+    if session is None or session.video_status != "ready" or not session.video_path:
+        raise HTTPException(status_code=404, detail="Playlist not available")
+
+    try:
+        raw = Path(session.video_path).read_text()
+    except OSError as e:
+        raise HTTPException(status_code=404, detail=f"Playlist unavailable: {e}") from e
+
+    base = f"/api/v1/printers/{printer_id}/recordings/{archive_id}/hls/segments"
+    token_qs = f"?token={token}" if token else ""
+    lines = [f"{base}/{ln}{token_qs}" if ln.endswith(".ts") else ln for ln in raw.splitlines()]
+    body = "\n".join(lines) + "\n"
+
+    return Response(
+        content=body,
+        media_type="application/vnd.apple.mpegurl",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@router.get("/{printer_id}/recordings/{archive_id}/hls/segments/{segment_name}")
+async def get_recording_segment(
+    printer_id: int,
+    archive_id: int,
+    segment_name: str,
+    db: AsyncSession = Depends(get_db),
+    _: None = RequireCameraStreamTokenIfAuthEnabled,
+):
+    """Serves one .ts segment file. Same stream-token scheme as the playlist —
+    segment_name is only ever a name camera_hls.py itself wrote into the
+    playlist (seg_NNNNN.ts), never taken from the URL to build a path."""
+    await get_printer_or_404(printer_id, db)
+
+    if not segment_name.startswith("seg_") or not segment_name.endswith(".ts") or "/" in segment_name:
+        raise HTTPException(status_code=404, detail="Segment not found")
+
+    result = await db.execute(select(CameraRecordingSession).where(CameraRecordingSession.archive_id == archive_id))
+    session = result.scalar_one_or_none()
+    if session is None or not session.video_path:
+        raise HTTPException(status_code=404, detail="Recording not found")
+
+    segment_path = Path(session.video_path).parent / segment_name
+    if not segment_path.exists():
+        raise HTTPException(status_code=404, detail="Segment not found")
+
+    return FileResponse(segment_path, media_type="video/mp2t")
 
 
 @router.post("/{printer_id}/recordings/{archive_id}/keep-forever")

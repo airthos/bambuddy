@@ -197,6 +197,7 @@ export interface CameraRecordingSummary {
   stopped_at: string | null;
   frame_count: number;
   size_bytes: number;
+  video_status: 'none' | 'ready' | 'failed';
   keep_forever: boolean;
   file: string | null;
   print_name: string | null;
@@ -5173,6 +5174,8 @@ export const api = {
     request<{ seq: number; ts_ms: number }[]>(`/printers/${printerId}/recordings/${archiveId}/frames`),
   getRecordingFrameUrl: (printerId: number, archiveId: number, seq: number) =>
     withStreamToken(`${API_BASE}/printers/${printerId}/recordings/${archiveId}/frames/${seq}`),
+  getRecordingPlaylistUrl: (printerId: number, archiveId: number) =>
+    withStreamToken(`${API_BASE}/printers/${printerId}/recordings/${archiveId}/hls/playlist.m3u8`),
   setRecordingKeepForever: (printerId: number, archiveId: number, keep: boolean) =>
     request<{ archive_id: number; keep_forever: boolean }>(
       `/printers/${printerId}/recordings/${archiveId}/keep-forever?keep=${keep}`,

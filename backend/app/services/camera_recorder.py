@@ -41,6 +41,7 @@ from backend.app.core import database as _database
 from backend.app.core.config import settings as app_settings
 from backend.app.models.archive import PrintArchive
 from backend.app.models.camera_recording import CameraRecordingFrame, CameraRecordingSession
+from backend.app.services import camera_hls
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +66,7 @@ class RecordingSession:
     size_bytes: int = 0
     pump_task: asyncio.Task | None = None
     watchdog_task: asyncio.Task | None = None
+    hls_task: asyncio.Task | None = None
     stopping: bool = False
 
 
@@ -222,6 +224,7 @@ async def start_session(
     session.watchdog_task = asyncio.create_task(
         _watchdog(session, printer_id, archive_id), name=f"sentry-watchdog-{archive_id}"
     )
+    session.hls_task = asyncio.create_task(camera_hls.live_loop(session), name=f"sentry-hls-{archive_id}")
     logger.info("Sentry: started recording for archive %s (printer %s)", archive_id, printer_id)
     return True
 
@@ -266,6 +269,12 @@ async def _end_session(session: RecordingSession, status: str) -> None:
 
     if session.watchdog_task is not None:
         session.watchdog_task.cancel()
+    if session.hls_task is not None:
+        session.hls_task.cancel()
+        try:
+            await session.hls_task
+        except asyncio.CancelledError:
+            pass
     if session.pump_task is not None:
         session.pump_task.cancel()
         await session.pump_task  # the pump swallows its own CancelledError
@@ -293,6 +302,11 @@ async def _end_session(session: RecordingSession, status: str) -> None:
         status,
         session.frame_count,
         session.size_bytes,
+    )
+
+    asyncio.create_task(
+        camera_hls.finalize(session.archive_id, session.printer_id, str(session.file_path)),
+        name=f"sentry-hls-finalize-{session.archive_id}",
     )
 
 

@@ -1,13 +1,27 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
+import Hls from 'hls.js';
 import { Pause, Play, SkipBack, SkipForward, Star, Trash2 } from 'lucide-react';
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader } from '../Card';
 import { Button } from '../Button';
 import { formatDuration } from '../../utils/date';
 import { formatFileSize } from '../../utils/file';
-import { api } from '../../api/client';
+import { api, getStreamToken } from '../../api/client';
 import type { CameraRecordingSummary, Printer } from '../../api/client';
+
+// Swaps in the *current* stream token on every request hls.js makes (playlist
+// polls for a still-growing recording, and every segment fetch) -- the token
+// baked into the initial playlist/segment URLs can go stale for a long-running
+// live-watch session, and hls.js's own requests bypass the app's normal
+// Authorization-header auth entirely (same reason frame <img> tags need this).
+function withFreshToken(url: string): string {
+  const token = getStreamToken();
+  if (!token) return url;
+  const withoutToken = url.replace(/([?&])token=[^&]*(&|$)/, (_m, pre, post) => (post === '&' ? pre : pre === '?' ? '' : ''));
+  const sep = withoutToken.includes('?') ? '&' : '?';
+  return `${withoutToken}${sep}token=${encodeURIComponent(token)}`;
+}
 
 interface CameraTimelineViewProps {
   printers: Printer[];
@@ -27,10 +41,10 @@ interface JobBlock {
 type TimelineBlock = GapBlock | JobBlock;
 
 const SPEEDS = [
-  { key: 'slow', fps: 2 },
-  { key: 'normal', fps: 10 },
-  { key: 'fast', fps: 30 },
-  { key: 'veryFast', fps: 60 },
+  { key: 'slow', fps: 2, rate: 0.25 },
+  { key: 'normal', fps: 10, rate: 1 },
+  { key: 'fast', fps: 30, rate: 2 },
+  { key: 'veryFast', fps: 60, rate: 4 },
 ] as const;
 
 function recordingStart(r: CameraRecordingSummary): number {
@@ -81,7 +95,9 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   const [selectedArchiveId, setSelectedArchiveId] = useState<number | null>(null);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
-  const [fps, setFps] = useState<number>(2); // default to "Slow"
+  const [speedKey, setSpeedKey] = useState<(typeof SPEEDS)[number]['key']>('slow');
+  const speed = SPEEDS.find(s => s.key === speedKey) ?? SPEEDS[0];
+  const fps = speed.fps;
   const [liveFollow, setLiveFollow] = useState(false);
 
   const recordingQueries = useQueries({
@@ -109,15 +125,37 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   });
   const maxFrame = frameList && frameList.length > 0 ? frameList.length - 1 : 0;
 
+  // Once a recording has at least one HLS segment, play it as a real video —
+  // native decode/buffering/seeking instead of fetching individual JPEGs
+  // (which never cached or scrubbed smoothly no matter how much preloading
+  // was thrown at it). Still falls back to the JPEG viewer below until the
+  // first segment exists (segments land ~20s after enough frames accumulate,
+  // see camera_hls.py), and for any recording whose encode failed.
+  const useVideo = selectedRecording?.video_status === 'ready';
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const hlsRef = useRef<Hls | null>(null);
+
+  // Maps frame index -> seconds into the stitched HLS timeline. Frame i's
+  // start time in the concatenated segments is exactly the cumulative sum of
+  // every earlier frame's real captured duration, i.e. (ts_ms[i] - ts_ms[0]) —
+  // camera_hls.py builds each segment's per-frame durations from these same
+  // consecutive ts_ms deltas, so this lines up with the actual video exactly.
+  const frameTimes = useMemo(() => {
+    if (!frameList || frameList.length === 0) return [];
+    const t0 = frameList[0].ts_ms;
+    return frameList.map(f => (f.ts_ms - t0) / 1000);
+  }, [frameList]);
+
   // Preload every frame into the browser's HTTP cache as soon as a recording
   // is selected. Without this, the first playthrough visibly flickers/stalls
   // because <img src> only starts fetching a frame the instant playback
   // reaches it — a second playthrough is smooth only because everything's
   // already cached by then. Firing all the requests up front (the browser
   // queues them respecting its own per-host connection limit) gets that
-  // same smoothness on the very first play.
+  // same smoothness on the very first play. Not needed once video is ready —
+  // there are no individual frame JPEGs to preload for that path.
   useEffect(() => {
-    if (!frameList || selectedArchiveId == null) return;
+    if (useVideo || !frameList || selectedArchiveId == null) return;
     let cancelled = false;
     for (const f of frameList) {
       if (cancelled) break;
@@ -127,18 +165,20 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     return () => {
       cancelled = true;
     };
-  }, [frameList, selectedArchiveId, activePrinterId]);
+  }, [useVideo, frameList, selectedArchiveId, activePrinterId]);
 
   // Follow the newest frame while liveFollow is on and the session is still recording.
+  // Video mode has its own live-edge handling (see the durationchange effect below).
   useEffect(() => {
-    if (liveFollow && selectedRecording?.status === 'recording' && frameList) {
+    if (!useVideo && liveFollow && selectedRecording?.status === 'recording' && frameList) {
       setCurrentFrame(frameList.length > 0 ? frameList.length - 1 : 0);
     }
-  }, [frameList, liveFollow, selectedRecording]);
+  }, [useVideo, frameList, liveFollow, selectedRecording]);
 
-  // Playback loop
+  // Playback loop — JPEG mode only. Video mode uses the <video> element's own
+  // playback via play()/pause() and playbackRate (see the Play button below).
   useEffect(() => {
-    if (!playing || !frameList || frameList.length === 0) return;
+    if (useVideo || !playing || !frameList || frameList.length === 0) return;
     const id = setInterval(() => {
       setCurrentFrame(f => {
         if (f >= maxFrame) {
@@ -149,7 +189,71 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
       });
     }, 1000 / fps);
     return () => clearInterval(id);
-  }, [playing, fps, frameList, maxFrame]);
+  }, [useVideo, playing, fps, frameList, maxFrame]);
+
+  // Sets up hls.js (or native Safari HLS) against the playlist whenever a
+  // video-ready recording is selected, and tears it down on change/unmount.
+  useEffect(() => {
+    if (!useVideo || !selectedRecording || !videoRef.current) return;
+    const video = videoRef.current;
+    const url = api.getRecordingPlaylistUrl(activePrinterId, selectedRecording.archive_id);
+
+    if (Hls.isSupported()) {
+      const hls = new Hls({
+        xhrSetup: (xhr, requestUrl) => {
+          xhr.open('GET', withFreshToken(requestUrl), true);
+        },
+      });
+      hls.loadSource(url);
+      hls.attachMedia(video);
+      hlsRef.current = hls;
+      return () => {
+        hls.destroy();
+        hlsRef.current = null;
+      };
+    }
+    // Safari: native HLS support, no library needed.
+    video.src = url;
+    return () => {
+      video.removeAttribute('src');
+      video.load();
+    };
+  }, [useVideo, selectedRecording, activePrinterId]);
+
+  // Keeps the frame-index display (scrub label, prev/next) in sync while the
+  // video plays under its own steam.
+  useEffect(() => {
+    if (!useVideo || !videoRef.current || frameTimes.length === 0) return;
+    const video = videoRef.current;
+    function onTimeUpdate() {
+      const t = video.currentTime;
+      let idx = 0;
+      for (let i = 0; i < frameTimes.length; i++) {
+        if (frameTimes[i] <= t) idx = i;
+        else break;
+      }
+      setCurrentFrame(idx);
+    }
+    video.addEventListener('timeupdate', onTimeUpdate);
+    return () => video.removeEventListener('timeupdate', onTimeUpdate);
+  }, [useVideo, frameTimes]);
+
+  // Jump-to-live: once a new segment lands (duration grows), snap to the new
+  // edge while liveFollow is on -- the video equivalent of the JPEG-mode
+  // "follow the newest frame" effect above.
+  useEffect(() => {
+    if (!useVideo || !liveFollow || !videoRef.current) return;
+    const video = videoRef.current;
+    function onDurationChange() {
+      if (Number.isFinite(video.duration)) video.currentTime = video.duration;
+    }
+    video.addEventListener('durationchange', onDurationChange);
+    return () => video.removeEventListener('durationchange', onDurationChange);
+  }, [useVideo, liveFollow]);
+
+  useEffect(() => {
+    if (useVideo && videoRef.current) videoRef.current.playbackRate = speed.rate;
+  }, [useVideo, speed]);
 
   const keepForeverMutation = useMutation({
     mutationFn: ({ archiveId, keep }: { archiveId: number; keep: boolean }) =>
@@ -175,11 +279,20 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     setCurrentFrame(0); // corrected to the last frame once frameList loads, if live
   }
 
+  function seekToFrame(idx: number) {
+    const clamped = Math.max(0, Math.min(maxFrame, idx));
+    setCurrentFrame(clamped);
+    if (useVideo && videoRef.current && frameTimes[clamped] != null) {
+      videoRef.current.currentTime = frameTimes[clamped];
+    }
+  }
+
   function nudge(delta: number) {
     if (!frameList || frameList.length === 0) return;
     setPlaying(false);
     setLiveFollow(false);
-    setCurrentFrame(f => Math.max(0, Math.min(maxFrame, f + delta)));
+    if (useVideo && videoRef.current) videoRef.current.pause();
+    seekToFrame(currentFrame + delta);
   }
 
   useEffect(() => {
@@ -211,7 +324,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     setDisplayUrl(null); // don't show the previous recording's last frame while the new one loads
   }, [selectedArchiveId]);
   useEffect(() => {
-    if (!selectedRecording || currentSeq == null) return;
+    if (useVideo || !selectedRecording || currentSeq == null) return;
     const url = api.getRecordingFrameUrl(activePrinterId, selectedRecording.archive_id, currentSeq);
     let cancelled = false;
     const img = new Image();
@@ -222,7 +335,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     return () => {
       cancelled = true;
     };
-  }, [activePrinterId, selectedRecording, currentSeq]);
+  }, [useVideo, activePrinterId, selectedRecording, currentSeq]);
 
   return (
     <div className="flex flex-col gap-3 h-full min-h-0">
@@ -318,7 +431,17 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
               </Button>
             )}
 
-            {!frameList || frameList.length === 0 ? (
+            {useVideo ? (
+              <video
+                ref={videoRef}
+                className="w-full h-full object-contain"
+                muted
+                playsInline
+                onPlay={() => setPlaying(true)}
+                onPause={() => setPlaying(false)}
+                onEnded={() => setPlaying(false)}
+              />
+            ) : !frameList || frameList.length === 0 ? (
               <p className="text-bambu-gray text-sm">{t('settings.sentryNoRecordings')}</p>
             ) : displayUrl ? (
               <img src={displayUrl} alt="" className="w-full h-full object-contain" decoding="async" />
@@ -345,6 +468,19 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
             variant="primary"
             size="sm"
             onClick={() => {
+              if (useVideo && videoRef.current) {
+                const v = videoRef.current;
+                if (v.paused) {
+                  if (currentFrame >= maxFrame) {
+                    setLiveFollow(false);
+                    seekToFrame(0);
+                  }
+                  v.play();
+                } else {
+                  v.pause();
+                }
+                return;
+              }
               if (!playing && currentFrame >= maxFrame) {
                 setLiveFollow(false);
                 setCurrentFrame(0);
@@ -363,7 +499,12 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
             min={0}
             max={maxFrame}
             value={currentFrame}
-            onChange={e => { setPlaying(false); setLiveFollow(false); setCurrentFrame(Number(e.target.value)); }}
+            onChange={e => {
+              setPlaying(false);
+              setLiveFollow(false);
+              if (useVideo && videoRef.current) videoRef.current.pause();
+              seekToFrame(Number(e.target.value));
+            }}
             className="flex-1 min-w-[120px] accent-bambu-green"
           />
           <span className="text-xs text-bambu-gray w-24 text-right shrink-0">{currentFrame} / {maxFrame}</span>
@@ -371,9 +512,9 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
             {SPEEDS.map(s => (
               <button
                 key={s.key}
-                onClick={() => setFps(s.fps)}
+                onClick={() => setSpeedKey(s.key)}
                 className={`px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors ${
-                  fps === s.fps ? 'bg-bambu-green text-white' : 'bg-bambu-dark-tertiary text-bambu-gray hover:text-white'
+                  speedKey === s.key ? 'bg-bambu-green text-white' : 'bg-bambu-dark-tertiary text-bambu-gray hover:text-white'
                 }`}
               >
                 {t(`camera.timeline.speed.${s.key}`)}

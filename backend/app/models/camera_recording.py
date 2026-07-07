@@ -30,6 +30,15 @@ class CameraRecordingSession(Base):
     size_bytes: Mapped[int] = mapped_column(Integer, default=0)
     file_path: Mapped[str] = mapped_column(String(500))
 
+    # HLS playlist (all-intra H.264/MPEG-TS segments) incrementally transcoded
+    # from the packed JPEG frames as they're captured, for native <video>
+    # playback with frame-accurate seeking -- including scrubbing back
+    # through a still-recording session, not just finished ones. video_path
+    # is the playlist.m3u8 path; 'none' (no segments yet) | 'ready' (has at
+    # least one playable segment, may still be growing) | 'failed'.
+    video_path: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    video_status: Mapped[str] = mapped_column(String(20), default="none")
+
     # User-pinned — survives the retention sweeper regardless of age.
     keep_forever: Mapped[bool] = mapped_column(Boolean, default=False)
 

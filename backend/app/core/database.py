@@ -2027,6 +2027,12 @@ async def run_migrations(conn):
             conn, "ALTER TABLE oidc_providers ADD COLUMN auto_link_existing_accounts BOOLEAN DEFAULT false"
         )
 
+    # Migration: Add HLS playlist columns to camera_recording_sessions
+    # (Sentry mode — native <video> playback via incrementally-segmented HLS,
+    # replacing per-frame JPEG fetching, including for still-recording sessions)
+    await _safe_execute(conn, "ALTER TABLE camera_recording_sessions ADD COLUMN video_path VARCHAR(500)")
+    await _safe_execute(conn, "ALTER TABLE camera_recording_sessions ADD COLUMN video_status VARCHAR(20) DEFAULT 'none'")
+
     # Migration: Azure Entra ID support — configurable email claim and verification requirement
     await _safe_execute(conn, "ALTER TABLE oidc_providers ADD COLUMN email_claim VARCHAR(64) DEFAULT 'email'")
     # Postgres rejects `DEFAULT 1` for BOOLEAN columns.
