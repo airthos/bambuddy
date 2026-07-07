@@ -247,6 +247,12 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     if (!useVideo || !videoRef.current || frameTimes.length === 0) return;
     const video = videoRef.current;
     function onTimeUpdate() {
+      // While a seek is in flight, currentTime can still briefly reflect
+      // the *old* position (the browser hasn't finished decoding to the
+      // new spot yet) -- syncing off of that stale value is exactly what
+      // made the scrub bar visibly snap back to where it just was. Wait
+      // for the 'seeked' event below instead.
+      if (video.seeking) return;
       const t = video.currentTime;
       let idx = 0;
       for (let i = 0; i < frameTimes.length; i++) {
@@ -256,7 +262,11 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
       setCurrentFrame(idx);
     }
     video.addEventListener('timeupdate', onTimeUpdate);
-    return () => video.removeEventListener('timeupdate', onTimeUpdate);
+    video.addEventListener('seeked', onTimeUpdate);
+    return () => {
+      video.removeEventListener('timeupdate', onTimeUpdate);
+      video.removeEventListener('seeked', onTimeUpdate);
+    };
   }, [useVideo, frameTimes]);
 
   // Tracks how much of the stream has buffered, for the buffering bar below
@@ -280,12 +290,24 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     };
   }, [useVideo, selectedRecording]);
 
-  // Jump-to-live: once more of the stream buffers in, snap to the new edge
-  // while liveFollow is on -- the video equivalent of the JPEG-mode "follow
-  // the newest frame" effect above.
+  // Jump-to-live: a ONE-SHOT seek to whatever's buffered so far, the moment
+  // liveFollow is turned on (landing on a live recording, or clicking "Jump
+  // to Live"). This must not re-fire on every later bufferedEnd change --
+  // native <video> playback already advances and catches up on its own as
+  // more segments buffer in; re-seeking on every buffer tick fought that
+  // continuously, which looked like "won't pause and jumps all around"
+  // (pause just stops the play head advancing on its own -- it doesn't stop
+  // this effect from yanking currentTime forward on the next tick).
+  const hasJumpedToLiveRef = useRef(false);
   useEffect(() => {
-    if (!useVideo || !liveFollow || !videoRef.current || bufferedEnd <= 0) return;
+    if (!liveFollow) return;
+    hasJumpedToLiveRef.current = false;
+  }, [liveFollow, selectedArchiveId]);
+  useEffect(() => {
+    if (!useVideo || !liveFollow || !videoRef.current || bufferedEnd <= 0 || hasJumpedToLiveRef.current) return;
     videoRef.current.currentTime = bufferedEnd;
+    videoRef.current.play().catch(() => {});
+    hasJumpedToLiveRef.current = true;
   }, [useVideo, liveFollow, bufferedEnd]);
 
   useEffect(() => {
@@ -508,9 +530,9 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
             onClick={() => {
               if (useVideo && videoRef.current) {
                 const v = videoRef.current;
+                setLiveFollow(false); // manual play/pause always exits auto-follow-live
                 if (v.paused) {
                   if (currentFrame >= maxFrame) {
-                    setLiveFollow(false);
                     seekToFrame(0);
                   }
                   v.play();
@@ -532,11 +554,15 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
           <Button variant="secondary" size="sm" onClick={() => nudge(1)} title={t('camera.timeline.nextFrame')}>
             <SkipForward className="w-4 h-4" />
           </Button>
-          <div className="relative flex-1 min-w-[120px]">
+          <div className="relative flex-1 min-w-[120px] h-4 flex items-center">
             {useVideo && frameTimes.length > 0 && (
-              <div className="absolute left-0 top-1/2 -translate-y-1/2 h-1 w-full rounded-full bg-bambu-dark-tertiary overflow-hidden pointer-events-none">
+              // Sits directly behind the range input's own (transparent)
+              // track, YouTube-style: light-gray = downloaded/buffered,
+              // dark = not yet fetched. The green "played" portion up to the
+              // thumb is the browser's own accent-color fill on the input.
+              <div className="absolute left-0 h-1 w-full rounded-full bg-bambu-dark-tertiary overflow-hidden pointer-events-none">
                 <div
-                  className="h-full bg-bambu-gray-dark"
+                  className="h-full bg-bambu-gray-dark/70"
                   style={{ width: `${Math.min(100, (bufferedEnd / (frameTimes[frameTimes.length - 1] || 1)) * 100)}%` }}
                   title={t('camera.timeline.buffered')}
                 />
@@ -548,12 +574,14 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
               max={maxFrame}
               value={currentFrame}
               onChange={e => {
-                setPlaying(false);
+                // Dragging the scrub bar seeks -- it should not stop
+                // playback (a paused player that's already stopped just
+                // stays stopped; a playing one keeps playing from the new
+                // position, same as YouTube's scrub bar).
                 setLiveFollow(false);
-                if (useVideo && videoRef.current) videoRef.current.pause();
                 seekToFrame(Number(e.target.value));
               }}
-              className="relative w-full accent-bambu-green"
+              className="relative w-full h-1 appearance-none bg-transparent cursor-pointer accent-bambu-green [&::-webkit-slider-runnable-track]:bg-transparent [&::-moz-range-track]:bg-transparent"
             />
           </div>
           <span className="text-xs text-bambu-gray w-24 text-right shrink-0">{currentFrame} / {maxFrame}</span>

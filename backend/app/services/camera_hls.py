@@ -153,6 +153,12 @@ async def _write_segment(
             str(concat_path),
             "-vsync",
             "vfr",
+            # Half the original chamber-cam resolution -- halves the pixel
+            # count ffmpeg has to encode and the browser has to decode, for
+            # noticeably faster segment production and smoother playback.
+            # trunc(...)*2 keeps both dimensions even, which yuv420p requires.
+            "-vf",
+            "scale=trunc(iw*0.5/2)*2:trunc(ih*0.5/2)*2",
             "-pix_fmt",
             "yuv420p",
             "-c:v",
