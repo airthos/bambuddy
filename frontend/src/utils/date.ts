@@ -420,14 +420,19 @@ export function formatRelativeTime(
 }
 
 /**
- * Format seconds as MM:SS for media/video player display.
+ * Format seconds as MM:SS (or H:MM:SS past an hour) for media/video player display.
  *
  * @param seconds - Total seconds
- * @returns Formatted string (e.g., "2:05", "0:30")
+ * @returns Formatted string (e.g., "2:05", "0:30", "1:02:05")
  */
 export function formatMediaTime(seconds: number): string {
-  const mins = Math.floor(seconds / 60);
-  const secs = Math.floor(seconds % 60);
+  const total = Number.isFinite(seconds) && seconds > 0 ? Math.floor(seconds) : 0;
+  const hours = Math.floor(total / 3600);
+  const mins = Math.floor((total % 3600) / 60);
+  const secs = total % 60;
+  if (hours > 0) {
+    return `${hours}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
+  }
   return `${mins}:${secs.toString().padStart(2, '0')}`;
 }
 

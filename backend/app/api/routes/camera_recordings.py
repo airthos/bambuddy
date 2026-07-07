@@ -2,7 +2,10 @@
 retention for per-job camera recordings written by camera_recorder.py.
 """
 
+import asyncio
+import logging
 import os
+import tempfile
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -19,9 +22,16 @@ from backend.app.models.camera_recording import CameraIntervalSnapshot, CameraRe
 from backend.app.models.printer import Printer
 from backend.app.models.user import User
 from backend.app.services.camera_recording_purge import camera_recording_purge_service
+from backend.app.utils.http import build_content_disposition
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/printers", tags=["camera-recordings"])
 global_router = APIRouter(prefix="/camera-recordings", tags=["camera-recordings"])
+
+# Downloaded recordings are rendered as a normal fixed-fps timelapse, not a
+# frame-accurate copy -- see download_recording()'s docstring.
+_DOWNLOAD_FPS = 30
 
 
 def _session_to_dict(row: CameraRecordingSession, archive: PrintArchive | None) -> dict:
@@ -191,6 +201,91 @@ async def get_recording_segment(
         raise HTTPException(status_code=404, detail="Segment not found")
 
     return FileResponse(segment_path, media_type="video/mp2t")
+
+
+@router.get("/{printer_id}/recordings/{archive_id}/download")
+async def download_recording(
+    printer_id: int,
+    archive_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.CAMERA_VIEW),
+):
+    """Renders the recording's HLS segments into one downloadable timelapse MP4.
+
+    This is a re-encode, not a stream-copy: the in-app scrubber needs the
+    segments' current all-intra encoding (frame-accurate seeking, real-time
+    vfr playback), but a downloaded file doesn't -- it's a timelapse to
+    watch, not something to scrub frame-by-frame. Resampling to a fixed
+    output frame rate (dropping/duplicating source frames as needed, which
+    is fine here) lets a normal GOP structure kick in, which compresses a
+    mostly-static chamber-cam timelapse dramatically better than all-intra
+    ever could, and plays back at a normal watchable pace instead of real
+    time (sub-1fps captures spread over hours).
+    """
+    await get_printer_or_404(printer_id, db)
+
+    result = await db.execute(
+        select(CameraRecordingSession, PrintArchive)
+        .join(PrintArchive, PrintArchive.id == CameraRecordingSession.archive_id, isouter=True)
+        .where(CameraRecordingSession.archive_id == archive_id)
+    )
+    row = result.first()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Recording not found")
+    session, archive = row
+    if session.video_status != "ready" or not session.video_path:
+        raise HTTPException(status_code=404, detail="Video not available for download")
+
+    directory = Path(session.video_path).parent
+    try:
+        playlist_lines = Path(session.video_path).read_text().splitlines()
+    except OSError as e:
+        raise HTTPException(status_code=404, detail=f"Playlist unavailable: {e}") from e
+    segments = [directory / ln for ln in playlist_lines if ln.endswith(".ts")]
+    if not segments:
+        raise HTTPException(status_code=404, detail="No video segments found")
+
+    concat_input = "concat:" + "|".join(str(s) for s in segments)
+    with tempfile.TemporaryDirectory(prefix="sentry-download-") as tmp_dir:
+        out_path = Path(tmp_dir) / "recording.mp4"
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            concat_input,
+            "-vf",
+            f"fps={_DOWNLOAD_FPS}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "medium",
+            "-crf",
+            "23",
+            "-pix_fmt",
+            "yuv420p",
+            "-movflags",
+            "+faststart",
+            str(out_path),
+        ]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        _, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            logger.error(
+                "Sentry: download remux failed for archive %s: %s",
+                archive_id,
+                stderr.decode(errors="replace")[-2000:],
+            )
+            raise HTTPException(status_code=500, detail="Failed to prepare video for download")
+        data = out_path.read_bytes()
+
+    base_name = Path(archive.filename).stem if archive and archive.filename else f"recording_{archive_id}"
+    return Response(
+        content=data,
+        media_type="video/mp4",
+        headers={"Content-Disposition": build_content_disposition(f"{base_name}.mp4")},
+    )
 
 
 @router.post("/{printer_id}/recordings/{archive_id}/keep-forever")

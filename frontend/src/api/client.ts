@@ -5183,6 +5183,28 @@ export const api = {
     ),
   deleteRecording: (printerId: number, archiveId: number) =>
     request<{ deleted: boolean }>(`/printers/${printerId}/recordings/${archiveId}`, { method: 'DELETE' }),
+  downloadRecording: async (printerId: number, archiveId: number, filename?: string): Promise<void> => {
+    const headers: Record<string, string> = {};
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`;
+    }
+    const response = await fetch(`${API_BASE}/printers/${printerId}/recordings/${archiveId}/download`, { headers });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.detail || `HTTP ${response.status}`);
+    }
+    const disposition = response.headers.get('Content-Disposition');
+    const downloadFilename = parseContentDispositionFilename(disposition) || filename || `recording_${archiveId}.mp4`;
+    const blob = await response.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = downloadFilename;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+  },
   getRecordingStorage: () => request<RecordingStorageSummary>('/camera-recordings/storage'),
   clearRecordings: () => request<{ deleted: number }>('/camera-recordings/clear', { method: 'POST' }),
 
