@@ -361,7 +361,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   }, [useVideo, liveFollow, bufferedEnd]);
 
   useEffect(() => {
-    if (useVideo && videoRef.current) videoRef.current.playbackRate = speed.rate;
+    if (useVideo && videoRef.current) videoRef.current.playbackRate = Math.min(speed.rate, 4);
   }, [useVideo, speed]);
 
   const keepForeverMutation = useMutation({
