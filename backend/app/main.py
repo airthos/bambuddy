@@ -5419,6 +5419,12 @@ async def security_headers_middleware(request, call_next):
             "media-src 'self' blob:; "
             "connect-src 'self' ws: wss:; "
             "font-src 'self' data:; "
+            # hls.js (Sentry recording playback) spawns its TS-demuxing Web
+            # Worker from a blob: URL. Without worker-src, CSP falls back to
+            # script-src for worker scripts -- the nonce-based script-src
+            # above doesn't cover a blob: worker, so it would be silently
+            # blocked with no fragment ever loading and no visible error.
+            "worker-src 'self' blob:; "
             "object-src 'none'; "
             "base-uri 'self'; "
             "frame-src 'self' http: https:; " + _frame_ancestors("'none'")

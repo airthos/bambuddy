@@ -211,13 +211,9 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
         maxBufferLength: 10,
         liveSyncDurationCount: 1,
       });
-      // attachMedia before loadSource (rather than both at once) avoids a
-      // race hls.js documents explicitly: loading the source before the
-      // media element is confirmed attached can silently drop the load on
-      // some browsers/timings -- exactly the "works sometimes" symptom.
-      hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(url));
       hls.on(Hls.Events.ERROR, (_evt, data) => {
         if (!data.fatal) return;
+        console.error(`[sentry-hls] fatal ${data.type}: ${data.details}`);
         switch (data.type) {
           case Hls.ErrorTypes.NETWORK_ERROR:
             hls.startLoad();
@@ -229,6 +225,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
             hls.destroy();
         }
       });
+      hls.loadSource(url);
       hls.attachMedia(video);
       hlsRef.current = hls;
       return () => {
