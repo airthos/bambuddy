@@ -370,6 +370,92 @@ async def test_reconcile_resumes_session_without_duplicate_row(
         assert len(rows) == 1  # no duplicate row created
 
 
+async def test_reconcile_does_not_use_printer_manager_get_printer(
+    monkeypatch, db_session, printer_factory, archive_factory, tmp_path, recorder_session_maker
+):
+    """Regression test for a real production incident: reconcile_on_startup
+    used to resolve the printer via printer_manager.get_printer(), which
+    returns the in-memory PrinterInfo cache -- name/serial_number only, no
+    .model. start_session() needs .model for is_chamber_image_model(), so
+    every restart mid-print raised AttributeError and (since the loop had no
+    per-row error isolation either) silently stopped reconciling every OTHER
+    still-printing archive too, not just the one that failed. Fixed by
+    querying the real Printer DB row directly instead.
+
+    Asserting get_printer is never called at all is deliberately strict:
+    the whole point is that reconcile must not depend on it for the model.
+    """
+    monkeypatch.setattr(camera_routes, "generate_chamber_mjpeg_stream", _fake_chamber_stream([b"f1"]))
+    monkeypatch.setattr(printer_manager, "is_connected", lambda pid: True)
+    printer = await printer_factory(model="P1S")
+    archive = await archive_factory(printer.id, status="printing")
+    printer_id, archive_id = printer.id, archive.id
+
+    def _real_get_printer_has_no_model(pid):
+        raise AssertionError("reconcile_on_startup must not call printer_manager.get_printer() for the model")
+
+    monkeypatch.setattr(printer_manager, "get_printer", _real_get_printer_has_no_model)
+
+    stale_row = CameraRecordingSession(
+        archive_id=archive_id,
+        printer_id=printer_id,
+        status="recording",
+        file_path=str(tmp_path / "resumed.framelog"),
+    )
+    db_session.add(stale_row)
+    await db_session.commit()
+
+    await camera_recorder.reconcile_on_startup()
+
+    assert archive_id in camera_recorder._active_sessions
+
+
+async def test_reconcile_one_bad_row_does_not_abort_the_rest(
+    monkeypatch, db_session, printer_factory, archive_factory, tmp_path
+):
+    """A single row raising must not prevent every other still-printing
+    archive in the same reconcile pass from being resumed -- this is exactly
+    what let the printer.model bug silently stop recording for every active
+    print on a farm, not just the one whose row happened to be processed first."""
+    monkeypatch.setattr(camera_routes, "generate_chamber_mjpeg_stream", _fake_chamber_stream([b"f1"]))
+    monkeypatch.setattr(printer_manager, "is_connected", lambda pid: True)
+    bad_printer = await printer_factory(model="P1S")
+    bad_archive = await archive_factory(bad_printer.id, status="printing")
+    good_printer = await printer_factory(model="P1S")
+    good_archive = await archive_factory(good_printer.id, status="printing")
+
+    db_session.add_all(
+        [
+            CameraRecordingSession(
+                archive_id=bad_archive.id,
+                printer_id=bad_printer.id,
+                status="recording",
+                file_path=str(tmp_path / "bad.framelog"),
+            ),
+            CameraRecordingSession(
+                archive_id=good_archive.id,
+                printer_id=good_printer.id,
+                status="recording",
+                file_path=str(tmp_path / "good.framelog"),
+            ),
+        ]
+    )
+    await db_session.commit()
+
+    real_start_session = camera_recorder.start_session
+
+    async def _start_session_raises_for_bad_archive(printer, printer_id, archive_id, **kwargs):
+        if archive_id == bad_archive.id:
+            raise RuntimeError("simulated failure resuming this specific archive")
+        return await real_start_session(printer, printer_id, archive_id, **kwargs)
+
+    monkeypatch.setattr(camera_recorder, "start_session", _start_session_raises_for_bad_archive)
+
+    await camera_recorder.reconcile_on_startup()
+
+    assert good_archive.id in camera_recorder._active_sessions
+
+
 async def test_reconcile_does_not_orphan_session_already_started_by_print_callback(
     monkeypatch, db_session, printer_factory, archive_factory, tmp_path, recorder_session_maker
 ):

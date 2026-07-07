@@ -41,6 +41,7 @@ from backend.app.core import database as _database
 from backend.app.core.config import settings as app_settings
 from backend.app.models.archive import PrintArchive
 from backend.app.models.camera_recording import CameraRecordingFrame, CameraRecordingSession
+from backend.app.models.printer import Printer
 from backend.app.services import camera_hls
 
 logger = logging.getLogger(__name__)
@@ -498,43 +499,55 @@ async def reconcile_on_startup() -> None:
         stale_sessions = result.scalars().all()
 
         for row in stale_sessions:
-            archive_result = await db.execute(select(PrintArchive).where(PrintArchive.id == row.archive_id))
-            archive = archive_result.scalar_one_or_none()
-            still_printing = (
-                archive is not None
-                and archive.status == "printing"
-                and printer_manager.is_connected(row.printer_id)
-            )
-            if not still_printing:
-                row.status = "orphaned"
-                row.stopped_at = datetime.utcnow()
-                logger.info(
-                    "Sentry: closing orphaned recording for archive %s from a previous run (printer offline or job no longer printing)",
-                    row.archive_id,
+            try:
+                archive_result = await db.execute(select(PrintArchive).where(PrintArchive.id == row.archive_id))
+                archive = archive_result.scalar_one_or_none()
+                still_printing = (
+                    archive is not None
+                    and archive.status == "printing"
+                    and printer_manager.is_connected(row.printer_id)
                 )
-                continue
+                if not still_printing:
+                    row.status = "orphaned"
+                    row.stopped_at = datetime.utcnow()
+                    logger.info(
+                        "Sentry: closing orphaned recording for archive %s from a previous run (printer offline or job no longer printing)",
+                        row.archive_id,
+                    )
+                    continue
 
-            printer = printer_manager.get_printer(row.printer_id)
-            if printer is None:
-                row.status = "orphaned"
-                row.stopped_at = datetime.utcnow()
-                continue
+                # printer_manager.get_printer() returns the in-memory PrinterInfo
+                # cache (name/serial_number only, no .model) -- start_session()
+                # needs the real DB row for is_chamber_image_model(printer.model),
+                # the same object main.py's on_print_start callbacks pass it.
+                printer_result = await db.execute(select(Printer).where(Printer.id == row.printer_id))
+                printer = printer_result.scalar_one_or_none()
+                if printer is None:
+                    row.status = "orphaned"
+                    row.stopped_at = datetime.utcnow()
+                    continue
 
-            if row.archive_id in _active_sessions:
-                # A print-start callback (on_print_start / on_print_running_observed,
-                # which can fire before this runs) already brought the session back
-                # up for this same archive_id. start_session() would just return
-                # False here (its own idempotency guard) — treating that as failure
-                # would wrongly stomp a session that's already live and recording.
-                continue
+                if row.archive_id in _active_sessions:
+                    # A print-start callback (on_print_start / on_print_running_observed,
+                    # which can fire before this runs) already brought the session back
+                    # up for this same archive_id. start_session() would just return
+                    # False here (its own idempotency guard) — treating that as failure
+                    # would wrongly stomp a session that's already live and recording.
+                    continue
 
-            logger.info("Sentry: resuming recording for archive %s after restart", row.archive_id)
-            # resume_row=row is required here — without it, start_session()
-            # would try to INSERT a fresh CameraRecordingSession row and hit
-            # the archive_id UNIQUE constraint, since `row` already exists.
-            resumed = await start_session(printer, row.printer_id, row.archive_id, resume_row=row)
-            if not resumed:
-                row.status = "orphaned"
-                row.stopped_at = datetime.utcnow()
+                logger.info("Sentry: resuming recording for archive %s after restart", row.archive_id)
+                # resume_row=row is required here — without it, start_session()
+                # would try to INSERT a fresh CameraRecordingSession row and hit
+                # the archive_id UNIQUE constraint, since `row` already exists.
+                resumed = await start_session(printer, row.printer_id, row.archive_id, resume_row=row)
+                if not resumed:
+                    row.status = "orphaned"
+                    row.stopped_at = datetime.utcnow()
+            except Exception:
+                # One bad row must never abort reconciliation for every other
+                # still-printing archive in this loop -- an unrelated bug
+                # here once silently stopped recording for every OTHER active
+                # print too, not just the one that actually failed.
+                logger.exception("Sentry: failed to reconcile archive %s on startup", row.archive_id)
 
         await db.commit()
