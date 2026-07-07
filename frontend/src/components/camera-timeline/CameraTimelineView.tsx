@@ -52,6 +52,7 @@ const SPEEDS = [
   { key: 'normal', fps: 2, rate: 1 },
   { key: 'double', fps: 4, rate: 2 },
   { key: 'fiveX', fps: 10, rate: 5 },
+  { key: 'twentyX', fps: 30, rate: 20 },
 ] as const;
 
 function recordingStart(r: CameraRecordingSummary): number {

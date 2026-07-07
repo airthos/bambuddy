@@ -2758,6 +2758,7 @@ export default {
         normal: '1x',
         double: '2x',
         fiveX: '5x',
+        twentyX: '20x',
       },
     },
   },
