@@ -211,7 +211,16 @@ async def _write_segment(
 async def _drain(archive_id: int, framelog_path: str, directory: Path, *, finalize: bool) -> bool:
     """Encodes as many full segments as are currently available. If
     finalize, also flushes a final partial (< _FRAMES_PER_SEGMENT) batch.
-    Returns True if at least one segment was written."""
+    Returns True if at least one segment was written.
+
+    Marks the session ready after the *first* segment, not after the whole
+    call returns -- catching up a long backlog (e.g. a fresh re-encode of an
+    existing multi-thousand-frame recording) can mean hundreds of segments
+    in one call, which used to leave video_status stuck on "none" -- so the
+    player fell back to the old per-frame JPEG viewer -- for however long
+    the whole catch-up took, instead of going playable the moment there was
+    anything to play.
+    """
     wrote_any = False
     while True:
         state = _read_state(directory)
@@ -240,6 +249,7 @@ async def _drain(archive_id: int, framelog_path: str, directory: Path, *, finali
         state["next_segment"] = state.get("next_segment", 0) + 1
         state["cumulative_duration"] = state.get("cumulative_duration", 0.0) + segment_duration
         _write_state(directory, state)
+        await _mark_ready(archive_id, directory)
 
         if not remaining_after_chunk:
             return wrote_any
