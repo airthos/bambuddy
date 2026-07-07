@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import Hls from 'hls.js';
-import { Pause, Play, SkipBack, SkipForward, Star, Trash2 } from 'lucide-react';
+import { Loader2, Pause, Play, SkipBack, SkipForward, Star, Trash2 } from 'lucide-react';
 import { useMutation, useQueries, useQuery, useQueryClient } from '@tanstack/react-query';
 import { Card, CardContent, CardHeader } from '../Card';
 import { Button } from '../Button';
@@ -253,18 +253,26 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   }, [useVideo, selectedArchiveId, activePrinterId]);
 
   // Keeps the frame-index display (scrub label, prev/next) in sync while the
-  // video plays under its own steam.
+  // video plays under its own steam. Also tracks the raw currentTime, for
+  // the "buffered ahead" readout below (frame granularity is too coarse for
+  // that -- frames land 30-45s apart, currentTime is continuous).
+  const [currentTimeSec, setCurrentTimeSec] = useState(0);
   useEffect(() => {
     if (!useVideo || !videoRef.current || frameTimes.length === 0) return;
     const video = videoRef.current;
-    function onTimeUpdate() {
+    function onTimeUpdate(e: Event) {
       // While a seek is in flight, currentTime can still briefly reflect
       // the *old* position (the browser hasn't finished decoding to the
       // new spot yet) -- syncing off of that stale value is exactly what
       // made the scrub bar visibly snap back to where it just was. Wait
       // for the 'seeked' event below instead.
-      if (video.seeking) return;
+      if (video.seeking) {
+        console.log(`[sentry-seek] ${e.type} ignored (seeking), currentTime=${video.currentTime}`);
+        return;
+      }
       const t = video.currentTime;
+      console.log(`[sentry-seek] ${e.type}: currentTime=${t}`);
+      setCurrentTimeSec(t);
       let idx = 0;
       for (let i = 0; i < frameTimes.length; i++) {
         if (frameTimes[i] <= t) idx = i;
@@ -279,6 +287,27 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
       video.removeEventListener('seeked', onTimeUpdate);
     };
   }, [useVideo, frameTimes]);
+
+  // Buffering spinner: native <video> fires 'waiting' when playback stalls
+  // because it's run out of buffered data, and 'playing' once it resumes --
+  // exactly the "is it healthy right now" signal the buffered-ahead number
+  // alone doesn't convey (that number can be healthy while still stalled on
+  // a slow-to-decode frame).
+  const [isBuffering, setIsBuffering] = useState(false);
+  useEffect(() => {
+    if (!useVideo || !videoRef.current) return;
+    const video = videoRef.current;
+    const onWaiting = () => setIsBuffering(true);
+    const onPlaying = () => setIsBuffering(false);
+    video.addEventListener('waiting', onWaiting);
+    video.addEventListener('playing', onPlaying);
+    video.addEventListener('canplay', onPlaying);
+    return () => {
+      video.removeEventListener('waiting', onWaiting);
+      video.removeEventListener('playing', onPlaying);
+      video.removeEventListener('canplay', onPlaying);
+    };
+  }, [useVideo, selectedArchiveId]);
 
   // Tracks how much of the stream has buffered, for the buffering bar below
   // and for jump-to-live -- video.duration is Infinity for a still-growing
@@ -316,6 +345,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   }, [liveFollow, selectedArchiveId]);
   useEffect(() => {
     if (!useVideo || !liveFollow || !videoRef.current || bufferedEnd <= 0 || hasJumpedToLiveRef.current) return;
+    console.log(`[sentry-seek] jump-to-live effect: ${videoRef.current.currentTime} -> ${bufferedEnd}`);
     videoRef.current.currentTime = bufferedEnd;
     videoRef.current.play().catch(() => {});
     hasJumpedToLiveRef.current = true;
@@ -353,6 +383,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     const clamped = Math.max(0, Math.min(maxFrame, idx));
     setCurrentFrame(clamped);
     if (useVideo && videoRef.current && frameTimes[clamped] != null) {
+      console.log(`[sentry-seek] seekToFrame(${idx}): ${videoRef.current.currentTime} -> ${frameTimes[clamped]}`);
       videoRef.current.currentTime = frameTimes[clamped];
     }
   }
@@ -393,6 +424,8 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   useEffect(() => {
     setDisplayUrl(null); // don't show the previous recording's last frame while the new one loads
     setBufferedEnd(0);
+    setCurrentTimeSec(0);
+    setIsBuffering(false);
   }, [selectedArchiveId]);
   useEffect(() => {
     if (useVideo || !selectedRecording || currentSeq == null) return;
@@ -503,15 +536,25 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
             )}
 
             {useVideo ? (
-              <video
-                ref={videoRef}
-                className="w-full h-full object-contain"
-                muted
-                playsInline
-                onPlay={() => setPlaying(true)}
-                onPause={() => setPlaying(false)}
-                onEnded={() => setPlaying(false)}
-              />
+              <>
+                <video
+                  ref={videoRef}
+                  className="w-full h-full object-contain"
+                  muted
+                  playsInline
+                  onPlay={() => setPlaying(true)}
+                  onPause={() => setPlaying(false)}
+                  onEnded={() => setPlaying(false)}
+                />
+                {isBuffering && (
+                  <div className="absolute inset-0 flex items-center justify-center bg-bambu-dark/40 pointer-events-none">
+                    <div className="flex items-center gap-2 bg-bambu-dark/90 text-white text-xs px-3 py-1.5 rounded-full">
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      {t('camera.timeline.buffering')}
+                    </div>
+                  </div>
+                )}
+              </>
             ) : !frameList || frameList.length === 0 ? (
               <p className="text-bambu-gray text-sm">{t('settings.sentryNoRecordings')}</p>
             ) : displayUrl ? (
@@ -596,6 +639,14 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
             />
           </div>
           <span className="text-xs text-bambu-gray w-24 text-right shrink-0">{currentFrame} / {maxFrame}</span>
+          {useVideo && (
+            <span
+              className="text-xs text-bambu-gray shrink-0 whitespace-nowrap"
+              title={t('camera.timeline.bufferedAheadTitle')}
+            >
+              {t('camera.timeline.bufferedAhead', { seconds: Math.max(0, Math.round(bufferedEnd - currentTimeSec)) })}
+            </span>
+          )}
           <div className="flex gap-1">
             {SPEEDS.map(s => (
               <button
