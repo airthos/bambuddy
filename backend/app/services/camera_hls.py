@@ -57,11 +57,13 @@ def hls_dir(printer_id: int, archive_id: int) -> Path:
 def _read_state(directory: Path) -> dict:
     state_path = directory / _STATE_FILE
     if not state_path.exists():
-        return {"last_seq": -1, "next_segment": 0, "finalized": False}
+        return {"last_seq": -1, "next_segment": 0, "finalized": False, "cumulative_duration": 0.0}
     try:
-        return json.loads(state_path.read_text())
+        state = json.loads(state_path.read_text())
     except (OSError, ValueError):
-        return {"last_seq": -1, "next_segment": 0, "finalized": False}
+        return {"last_seq": -1, "next_segment": 0, "finalized": False, "cumulative_duration": 0.0}
+    state.setdefault("cumulative_duration", 0.0)
+    return state
 
 
 def _write_state(directory: Path, state: dict) -> None:
@@ -112,8 +114,22 @@ async def _write_segment(
     chunk: list[CameraRecordingFrame],
     next_ts_ms: int | None,
     segment_index: int,
+    ts_offset: float,
 ) -> float:
-    """Encodes one batch of frames into the next .ts segment. Returns its duration in seconds."""
+    """Encodes one batch of frames into the next .ts segment. Returns its duration in seconds.
+
+    Each segment is its own ffmpeg process, so its internal media
+    timestamps start fresh near 0 by default -- even though the m3u8's
+    EXTINF durations describe a continuous playlist-level timeline, the
+    *actual* PTS values baked into consecutive .ts files were not
+    continuous. hls.js/MSE ultimately keys off those real timestamps when
+    deciding what's buffered, so this showed up as gaps in video.buffered
+    once several segments were appended: seeking into a spot the UI drew as
+    "buffered" (computed from the playlist-level durations) could actually
+    land in a real gap, stall, and snap back. -output_ts_offset shifts this
+    segment's own timestamps to continue exactly where the previous one's
+    encoded content ended, making the actual media timeline continuous.
+    """
     output_path = directory / f"seg_{segment_index:05d}.ts"
 
     with tempfile.TemporaryDirectory(prefix="sentry-hls-") as tmp_dir:
@@ -173,6 +189,8 @@ async def _write_segment(
             "1",
             "-sc_threshold",
             "0",
+            "-output_ts_offset",
+            f"{ts_offset:.3f}",
             "-f",
             "mpegts",
             str(output_path),
@@ -208,11 +226,19 @@ async def _drain(archive_id: int, framelog_path: str, directory: Path, *, finali
         next_ts_ms = remaining_after_chunk[0].ts_ms if remaining_after_chunk else None
 
         _write_playlist_header(directory)
-        await _write_segment(framelog_path, directory, chunk, next_ts_ms, state.get("next_segment", 0))
+        segment_duration = await _write_segment(
+            framelog_path,
+            directory,
+            chunk,
+            next_ts_ms,
+            state.get("next_segment", 0),
+            state.get("cumulative_duration", 0.0),
+        )
         wrote_any = True
 
         state["last_seq"] = chunk[-1].seq
         state["next_segment"] = state.get("next_segment", 0) + 1
+        state["cumulative_duration"] = state.get("cumulative_duration", 0.0) + segment_duration
         _write_state(directory, state)
 
         if not remaining_after_chunk:
