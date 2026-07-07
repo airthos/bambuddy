@@ -46,6 +46,7 @@ const SPEEDS = [
   { key: 'fast', fps: 30, rate: 2 },
   { key: 'veryFast', fps: 60, rate: 4 },
 ] as const;
+const MAX_PLAYBACK_RATE = Math.max(...SPEEDS.map(s => s.rate));
 
 function recordingStart(r: CameraRecordingSummary): number {
   return r.started_at ? new Date(r.started_at).getTime() : Date.now();
@@ -173,7 +174,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     if (!useVideo && liveFollow && selectedRecording?.status === 'recording' && frameList) {
       setCurrentFrame(frameList.length > 0 ? frameList.length - 1 : 0);
     }
-  }, [useVideo, frameList, liveFollow, selectedRecording]);
+  }, [useVideo, frameList, liveFollow, selectedRecording?.status]);
 
   // Playback loop — JPEG mode only. Video mode uses the <video> element's own
   // playback via play()/pause() and playbackRate (see the Play button below).
@@ -203,12 +204,16 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
         xhrSetup: (xhr, requestUrl) => {
           xhr.open('GET', withFreshToken(requestUrl), true);
         },
-        // Our segments are large (30 frames, all-intra) and infrequent
-        // compared to typical live TV -- a low buffer target means playback
-        // can start after just one segment lands instead of waiting to
-        // prefetch several, which is most of what "inconsistent load time"
-        // came down to.
-        maxBufferLength: 10,
+        // At the fastest playback rate (SPEEDS' veryFast, 4x), burning
+        // through a second of *video* only takes 0.25 real seconds -- so
+        // keeping a 30-real-second safety cushion against ever catching up
+        // to the buffered edge means holding ~120 seconds of video ahead of
+        // playback, not 30. hls.js stops prefetching once EITHER
+        // maxBufferLength or maxBufferSize is hit, so raise the byte cap
+        // too -- otherwise a run of larger-than-usual segments could hit
+        // the default 60MB size cap well before 120s of buffer is reached.
+        maxBufferLength: 30 * MAX_PLAYBACK_RATE,
+        maxBufferSize: 200 * 1000 * 1000,
         liveSyncDurationCount: 1,
       });
       hls.on(Hls.Events.ERROR, (_evt, data) => {
@@ -239,7 +244,13 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
       video.removeAttribute('src');
       video.load();
     };
-  }, [useVideo, selectedRecording, activePrinterId]);
+    // selectedRecording is a *new object* every time recordingQueries
+    // refetches (every 5s) even when nothing meaningful changed -- depending
+    // on it directly tore the whole hls.js instance down and rebuilt it
+    // every 5 seconds, which is what was resetting playback to the start.
+    // archive_id is the only thing that actually needs to trigger a rebuild.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [useVideo, selectedArchiveId, activePrinterId]);
 
   // Keeps the frame-index display (scrub label, prev/next) in sync while the
   // video plays under its own steam.
@@ -288,7 +299,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
       video.removeEventListener('progress', onProgress);
       video.removeEventListener('loadedmetadata', onProgress);
     };
-  }, [useVideo, selectedRecording]);
+  }, [useVideo, selectedArchiveId]);
 
   // Jump-to-live: a ONE-SHOT seek to whatever's buffered so far, the moment
   // liveFollow is turned on (landing on a live recording, or clicking "Jump
