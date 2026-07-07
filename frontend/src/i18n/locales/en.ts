@@ -2739,6 +2739,7 @@ export default {
       frameLabel: 'Frame #{{n}}',
       prevFrame: 'Previous frame',
       nextFrame: 'Next frame',
+      buffered: 'Buffered',
       retentionNote: 'Last 7 days · shaded blocks = footage past {{days}}-day retention',
       rawTimeline: 'Raw timeline (time-proportional)',
       eventsTimeline: 'Events (one tick per job, idle time compressed)',

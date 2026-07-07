@@ -888,7 +888,7 @@ export function Layout() {
 
       {/* Main content */}
       <main className={`flex-1 bg-bambu-dark overflow-auto transition-all duration-300 ${
-        isSidebarCompact ? 'mt-14' : sidebarExpanded ? 'ml-64' : 'ml-16'
+        isSidebarCompact ? 'h-[calc(100vh-3.5rem)] mt-14' : `h-screen ${sidebarExpanded ? 'ml-64' : 'ml-16'}`
       }`}>
         {/* Debug logging indicator */}
         {debugLoggingState?.enabled && (

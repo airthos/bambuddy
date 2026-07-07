@@ -203,8 +203,32 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
         xhrSetup: (xhr, requestUrl) => {
           xhr.open('GET', withFreshToken(requestUrl), true);
         },
+        // Our segments are large (30 frames, all-intra) and infrequent
+        // compared to typical live TV -- a low buffer target means playback
+        // can start after just one segment lands instead of waiting to
+        // prefetch several, which is most of what "inconsistent load time"
+        // came down to.
+        maxBufferLength: 10,
+        liveSyncDurationCount: 1,
       });
-      hls.loadSource(url);
+      // attachMedia before loadSource (rather than both at once) avoids a
+      // race hls.js documents explicitly: loading the source before the
+      // media element is confirmed attached can silently drop the load on
+      // some browsers/timings -- exactly the "works sometimes" symptom.
+      hls.on(Hls.Events.MEDIA_ATTACHED, () => hls.loadSource(url));
+      hls.on(Hls.Events.ERROR, (_evt, data) => {
+        if (!data.fatal) return;
+        switch (data.type) {
+          case Hls.ErrorTypes.NETWORK_ERROR:
+            hls.startLoad();
+            break;
+          case Hls.ErrorTypes.MEDIA_ERROR:
+            hls.recoverMediaError();
+            break;
+          default:
+            hls.destroy();
+        }
+      });
       hls.attachMedia(video);
       hlsRef.current = hls;
       return () => {
@@ -238,18 +262,34 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     return () => video.removeEventListener('timeupdate', onTimeUpdate);
   }, [useVideo, frameTimes]);
 
-  // Jump-to-live: once a new segment lands (duration grows), snap to the new
-  // edge while liveFollow is on -- the video equivalent of the JPEG-mode
-  // "follow the newest frame" effect above.
+  // Tracks how much of the stream has buffered, for the buffering bar below
+  // and for jump-to-live -- video.duration is Infinity for a still-growing
+  // (PLAYLIST-TYPE:EVENT, no #EXT-X-ENDLIST) playlist, so it can never be
+  // used to find "the live edge"; the end of the buffered range is the only
+  // reliable signal for that regardless of whether duration is finite yet.
+  const [bufferedEnd, setBufferedEnd] = useState(0);
   useEffect(() => {
-    if (!useVideo || !liveFollow || !videoRef.current) return;
+    if (!useVideo || !videoRef.current) return;
     const video = videoRef.current;
-    function onDurationChange() {
-      if (Number.isFinite(video.duration)) video.currentTime = video.duration;
+    function onProgress() {
+      if (video.buffered.length > 0) setBufferedEnd(video.buffered.end(video.buffered.length - 1));
     }
-    video.addEventListener('durationchange', onDurationChange);
-    return () => video.removeEventListener('durationchange', onDurationChange);
-  }, [useVideo, liveFollow]);
+    video.addEventListener('progress', onProgress);
+    video.addEventListener('loadedmetadata', onProgress);
+    onProgress();
+    return () => {
+      video.removeEventListener('progress', onProgress);
+      video.removeEventListener('loadedmetadata', onProgress);
+    };
+  }, [useVideo, selectedRecording]);
+
+  // Jump-to-live: once more of the stream buffers in, snap to the new edge
+  // while liveFollow is on -- the video equivalent of the JPEG-mode "follow
+  // the newest frame" effect above.
+  useEffect(() => {
+    if (!useVideo || !liveFollow || !videoRef.current || bufferedEnd <= 0) return;
+    videoRef.current.currentTime = bufferedEnd;
+  }, [useVideo, liveFollow, bufferedEnd]);
 
   useEffect(() => {
     if (useVideo && videoRef.current) videoRef.current.playbackRate = speed.rate;
@@ -322,6 +362,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   const [displayUrl, setDisplayUrl] = useState<string | null>(null);
   useEffect(() => {
     setDisplayUrl(null); // don't show the previous recording's last frame while the new one loads
+    setBufferedEnd(0);
   }, [selectedArchiveId]);
   useEffect(() => {
     if (useVideo || !selectedRecording || currentSeq == null) return;
@@ -494,19 +535,30 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
           <Button variant="secondary" size="sm" onClick={() => nudge(1)} title={t('camera.timeline.nextFrame')}>
             <SkipForward className="w-4 h-4" />
           </Button>
-          <input
-            type="range"
-            min={0}
-            max={maxFrame}
-            value={currentFrame}
-            onChange={e => {
-              setPlaying(false);
-              setLiveFollow(false);
-              if (useVideo && videoRef.current) videoRef.current.pause();
-              seekToFrame(Number(e.target.value));
-            }}
-            className="flex-1 min-w-[120px] accent-bambu-green"
-          />
+          <div className="relative flex-1 min-w-[120px]">
+            {useVideo && frameTimes.length > 0 && (
+              <div className="absolute left-0 top-1/2 -translate-y-1/2 h-1 w-full rounded-full bg-bambu-dark-tertiary overflow-hidden pointer-events-none">
+                <div
+                  className="h-full bg-bambu-gray-dark"
+                  style={{ width: `${Math.min(100, (bufferedEnd / (frameTimes[frameTimes.length - 1] || 1)) * 100)}%` }}
+                  title={t('camera.timeline.buffered')}
+                />
+              </div>
+            )}
+            <input
+              type="range"
+              min={0}
+              max={maxFrame}
+              value={currentFrame}
+              onChange={e => {
+                setPlaying(false);
+                setLiveFollow(false);
+                if (useVideo && videoRef.current) videoRef.current.pause();
+                seekToFrame(Number(e.target.value));
+              }}
+              className="relative w-full accent-bambu-green"
+            />
+          </div>
           <span className="text-xs text-bambu-gray w-24 text-right shrink-0">{currentFrame} / {maxFrame}</span>
           <div className="flex gap-1">
             {SPEEDS.map(s => (
