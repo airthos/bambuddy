@@ -64,6 +64,10 @@ const SPEEDS = [
 // its own keyframe -- see camera_hls.py's all-intra encoding).
 const MAX_NATIVE_PLAYBACK_RATE = 4;
 
+// A large but *finite* stand-in for "buffer the whole recording" -- see the
+// hls.js config below for why literal Infinity silently breaks this.
+const HLS_MAX_BUFFER_SECONDS = 7 * 24 * 3600;
+
 // The backend sends naive UTC timestamps with no 'Z'/offset (e.g.
 // "2026-07-07T17:27:59") -- plain `new Date(...)` parses that as *local*
 // time, not UTC. On a browser whose local zone isn't UTC, that silently
@@ -257,8 +261,23 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
         // whatever's closest to the current position. Bounded by
         // maxBufferSize (segments are small post-halved-resolution, so even
         // a multi-hour recording comfortably fits under this).
-        maxBufferLength: Infinity,
-        maxMaxBufferLength: Infinity,
+        //
+        // MUST be a finite number, not literal Infinity -- this was the
+        // actual cause of "playback freezes forever after loading almost
+        // nothing, with no error". Our HLS media playlist has no bitrate
+        // info (single-level, not a multi-bitrate master playlist), so
+        // hls.js's StreamController.getMaxBufferLength() falls through to
+        // `Math.min(config.maxBufferLength, config.maxMaxBufferLength)`
+        // directly. Infinity there gets normalized to null somewhere in
+        // hls.js's config handling, and `Math.min(null, null)` evaluates to
+        // 0 (null coerces to 0 in numeric context) -- so the stream
+        // controller's "is buffered-ahead length already >= target?" check
+        // (bufferLen >= maxBufLen, i.e. 0 >= 0) was true from the very
+        // first tick, and it never issued a single fragment request. Live
+        // console verification: patching this to a finite number on an
+        // already-stuck player made it immediately start loading segments.
+        maxBufferLength: HLS_MAX_BUFFER_SECONDS,
+        maxMaxBufferLength: HLS_MAX_BUFFER_SECONDS,
         maxBufferSize: 1000 * 1000 * 1000,
         liveSyncDurationCount: 1,
       });
