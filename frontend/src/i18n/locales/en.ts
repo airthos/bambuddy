@@ -2741,7 +2741,7 @@ export default {
       nextFrame: 'Next frame',
       buffered: 'Buffered',
       buffering: 'Buffering…',
-      download: 'Download recording',
+      download: 'Download 50x timelapse (MP4)',
       retentionNote: 'Last 7 days · shaded blocks = footage past {{days}}-day retention',
       rawTimeline: 'Raw timeline (time-proportional)',
       eventsTimeline: 'Events (one tick per job, idle time compressed)',

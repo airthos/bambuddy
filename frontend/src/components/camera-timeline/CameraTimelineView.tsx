@@ -338,7 +338,8 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   // because it's run out of buffered data, and 'playing' once it resumes --
   // exactly the "is it healthy right now" signal the buffered-ahead number
   // alone doesn't convey (that number can be healthy while still stalled on
-  // a slow-to-decode frame).
+  // a slow-to-decode frame). This alone isn't fully reliable, though -- see
+  // the stall watchdog below -- so isBuffering is also driven from there.
   const [isBuffering, setIsBuffering] = useState(false);
   useEffect(() => {
     if (!useVideo || !videoRef.current) return;
@@ -355,17 +356,24 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     };
   }, [useVideo, selectedArchiveId]);
 
-  // Tracks how much of the stream has buffered, for the buffering bar below
-  // and for jump-to-live -- video.duration is Infinity for a still-growing
-  // (PLAYLIST-TYPE:EVENT, no #EXT-X-ENDLIST) playlist, so it can never be
-  // used to find "the live edge"; the end of the buffered range is the only
-  // reliable signal for that regardless of whether duration is finite yet.
-  const [bufferedEnd, setBufferedEnd] = useState(0);
+  // Tracks *every* buffered range, not just the outermost one, for the
+  // buffering bar below and for jump-to-live -- video.duration is Infinity
+  // for a still-growing (PLAYLIST-TYPE:EVENT, no #EXT-X-ENDLIST) playlist,
+  // so it can never be used to find "the live edge". Taking only
+  // buffered.end(buffered.length - 1) here was actively misleading: MSE can
+  // (and does) end up with disjoint ranges -- e.g. [0, 120] and [125, 400] --
+  // and that approach reports the whole span as "buffered" even though
+  // there's a real hole at 120-125 that playback can stall dead in.
+  const [bufferedRanges, setBufferedRanges] = useState<{ start: number; end: number }[]>([]);
   useEffect(() => {
     if (!useVideo || !videoRef.current) return;
     const video = videoRef.current;
     function onProgress() {
-      if (video.buffered.length > 0) setBufferedEnd(video.buffered.end(video.buffered.length - 1));
+      const ranges: { start: number; end: number }[] = [];
+      for (let i = 0; i < video.buffered.length; i++) {
+        ranges.push({ start: video.buffered.start(i), end: video.buffered.end(i) });
+      }
+      setBufferedRanges(ranges);
     }
     video.addEventListener('progress', onProgress);
     video.addEventListener('loadedmetadata', onProgress);
@@ -375,6 +383,50 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
       video.removeEventListener('loadedmetadata', onProgress);
     };
   }, [useVideo, selectedArchiveId]);
+  const bufferedEnd = bufferedRanges.length > 0 ? bufferedRanges[bufferedRanges.length - 1].end : 0;
+
+  // Stall watchdog: recovers from playback silently sticking on one frame
+  // even though `buffered` claims the area is covered. This happens at
+  // small gaps between segments (or an occasional stuck decode) that don't
+  // reliably fire the video element's own 'waiting' event -- exactly what
+  // manually seeking a bit further along was already working around by
+  // hand. Detects "currentTime hasn't moved in ~2s while it should be
+  // playing" and either jumps straight to the next known-buffered range (a
+  // real gap) or nudges forward with escalating small seeks (a stuck
+  // decode inside an already-buffered range) -- either way, this is exactly
+  // what a manual nearby seek was already doing, just automatic.
+  const stallRef = useRef({ time: 0, count: 0, attempts: 0 });
+  useEffect(() => {
+    if (!useVideo || !useNativeRate || !playing || !videoRef.current) return;
+    const video = videoRef.current;
+    stallRef.current = { time: video.currentTime, count: 0, attempts: 0 };
+    const id = setInterval(() => {
+      if (video.paused || video.seeking) return;
+      const t = video.currentTime;
+      if (Math.abs(t - stallRef.current.time) > 0.05) {
+        stallRef.current = { time: t, count: 0, attempts: 0 };
+        return;
+      }
+      stallRef.current.count += 1;
+      if (stallRef.current.count < 2) return;
+      if (stallRef.current.attempts >= 15) return; // stop auto-correcting; spinner stays up for a manual seek
+
+      setIsBuffering(true);
+      let nextStart: number | null = null;
+      for (let i = 0; i < video.buffered.length; i++) {
+        const start = video.buffered.start(i);
+        if (start > t + 0.05 && (nextStart === null || start < nextStart)) nextStart = start;
+      }
+      const target =
+        nextStart !== null && nextStart - t < 30
+          ? nextStart + 0.05
+          : t + Math.min(5, 0.25 * 2 ** (stallRef.current.count - 2));
+      console.log(`[sentry-stall] stuck at ${t.toFixed(2)}, nudging to ${target.toFixed(2)}`);
+      video.currentTime = target;
+      stallRef.current = { time: target, count: 0, attempts: stallRef.current.attempts + 1 };
+    }, 1000);
+    return () => clearInterval(id);
+  }, [useVideo, useNativeRate, playing, selectedArchiveId]);
 
   // Jump-to-live: a ONE-SHOT seek to whatever's buffered so far, the moment
   // liveFollow is turned on (landing on a live recording, or clicking "Jump
@@ -494,7 +546,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   const [displayUrl, setDisplayUrl] = useState<string | null>(null);
   useEffect(() => {
     setDisplayUrl(null); // don't show the previous recording's last frame while the new one loads
-    setBufferedEnd(0);
+    setBufferedRanges([]);
     setCurrentTimeSec(0);
     setIsBuffering(false);
   }, [selectedArchiveId]);
@@ -709,12 +761,23 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
               // track, YouTube-style: light-gray = downloaded/buffered,
               // dark = not yet fetched. The green "played" portion up to the
               // thumb is the browser's own accent-color fill on the input.
+              // Drawn from every disjoint buffered range, not just the
+              // outermost one -- a single bar to bufferedEnd would paint
+              // real gaps as "buffered" too.
               <div className="absolute left-0 h-1 w-full rounded-full bg-bambu-dark-tertiary overflow-hidden pointer-events-none">
-                <div
-                  className="h-full bg-bambu-gray-dark/70"
-                  style={{ width: `${Math.min(100, (bufferedEnd / (frameTimes[frameTimes.length - 1] || 1)) * 100)}%` }}
-                  title={t('camera.timeline.buffered')}
-                />
+                {bufferedRanges.map((r, i) => {
+                  const total = frameTimes[frameTimes.length - 1] || 1;
+                  const left = Math.min(100, (r.start / total) * 100);
+                  const width = Math.min(100 - left, ((r.end - r.start) / total) * 100);
+                  return (
+                    <div
+                      key={i}
+                      className="absolute h-full bg-bambu-gray-dark/70"
+                      style={{ left: `${left}%`, width: `${width}%` }}
+                      title={t('camera.timeline.buffered')}
+                    />
+                  );
+                })}
               </div>
             )}
             <input

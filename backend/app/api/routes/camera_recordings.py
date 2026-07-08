@@ -29,8 +29,10 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/printers", tags=["camera-recordings"])
 global_router = APIRouter(prefix="/camera-recordings", tags=["camera-recordings"])
 
-# Downloaded recordings are rendered as a normal fixed-fps timelapse, not a
-# frame-accurate copy -- see download_recording()'s docstring.
+# Downloaded recordings are always rendered as a 50x-real-time timelapse at a
+# normal fixed frame rate, not a frame-accurate copy -- see
+# download_recording()'s docstring.
+_DOWNLOAD_SPEED = 50
 _DOWNLOAD_FPS = 30
 
 
@@ -210,17 +212,19 @@ async def download_recording(
     db: AsyncSession = Depends(get_db),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.CAMERA_VIEW),
 ):
-    """Renders the recording's HLS segments into one downloadable timelapse MP4.
+    """Renders the recording's HLS segments into one downloadable timelapse MP4,
+    always sped up _DOWNLOAD_SPEED (50x) real time.
 
     This is a re-encode, not a stream-copy: the in-app scrubber needs the
     segments' current all-intra encoding (frame-accurate seeking, real-time
     vfr playback), but a downloaded file doesn't -- it's a timelapse to
-    watch, not something to scrub frame-by-frame. Resampling to a fixed
-    output frame rate (dropping/duplicating source frames as needed, which
-    is fine here) lets a normal GOP structure kick in, which compresses a
-    mostly-static chamber-cam timelapse dramatically better than all-intra
-    ever could, and plays back at a normal watchable pace instead of real
-    time (sub-1fps captures spread over hours).
+    watch, not something to scrub frame-by-frame. `setpts` compresses the
+    segments' real (continuous, thanks to camera_hls.py's -output_ts_offset)
+    timestamps by 50x, then `fps` resamples that compressed timeline to a
+    normal fixed rate -- dropping/duplicating frames as needed, which is
+    fine here. That also lets a normal GOP structure kick in, which
+    compresses a mostly-static chamber-cam timelapse dramatically better
+    than the scrubber's all-intra encoding ever could.
     """
     await get_printer_or_404(printer_id, db)
 
@@ -254,7 +258,7 @@ async def download_recording(
             "-i",
             concat_input,
             "-vf",
-            f"fps={_DOWNLOAD_FPS}",
+            f"setpts=PTS/{_DOWNLOAD_SPEED},fps={_DOWNLOAD_FPS}",
             "-c:v",
             "libx264",
             "-preset",
