@@ -64,9 +64,12 @@ const SPEEDS = [
 // its own keyframe -- see camera_hls.py's all-intra encoding).
 const MAX_NATIVE_PLAYBACK_RATE = 4;
 
-// A large but *finite* stand-in for "buffer the whole recording" -- see the
-// hls.js config below for why literal Infinity silently breaks this.
-const HLS_MAX_BUFFER_SECONDS = 7 * 24 * 3600;
+// How far ahead of the playhead to buffer, in *video* seconds -- since
+// playback runs at real elapsed time (rate: 1 == real-time, see SPEEDS
+// above), this is also ~how many seconds of real print time stay buffered
+// ahead. See the hls.js config below for why this must be a bounded finite
+// number, not literal Infinity ("buffer everything").
+const HLS_MAX_BUFFER_SECONDS = 20 * 60;
 
 // The backend sends naive UTC timestamps with no 'Z'/offset (e.g.
 // "2026-07-07T17:27:59") -- plain `new Date(...)` parses that as *local*
@@ -252,33 +255,44 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
         xhrSetup: (xhr, requestUrl) => {
           xhr.open('GET', withFreshToken(requestUrl), true);
         },
-        // Buffer the *entire* recording eagerly on selection, not just N
-        // seconds ahead -- seeking into a not-yet-buffered spot ("buffering
-        // forever") is what happens when the fetch-on-demand path doesn't
-        // keep up; buffering everything up front sidesteps that class of
-        // bug outright, and hls.js already fills forward from wherever the
-        // playhead currently is, so this also naturally prioritizes
-        // whatever's closest to the current position. Bounded by
-        // maxBufferSize (segments are small post-halved-resolution, so even
-        // a multi-hour recording comfortably fits under this).
+        // Buffer a generous window ahead of the playhead -- NOT the whole
+        // recording. An earlier version of this tried to eagerly buffer the
+        // *entire* recording on selection (to sidestep "seeking into a
+        // not-yet-buffered spot buffers forever"), which sounds harmless
+        // but isn't: these segments are all-intra (every frame is its own
+        // keyframe, for exact scrub seeking -- see camera_hls.py), which
+        // means zero inter-frame compression, which means a multi-hour
+        // recording can easily be 500-700MB. Trying to fetch and decode
+        // that much video in one uncapped burst is exactly what was hanging
+        // the tab (verified live: after fixing the Infinity/maxBufferLength
+        // bug below so segments actually started loading, the very next
+        // thing that happened was the renderer locking up hard enough that
+        // even DevTools screenshot commands timed out, on a 617MB/429-segment
+        // recording). A bounded forward window is what every normal HLS
+        // player does, keeps memory/network bounded regardless of
+        // recording length, and still buffers minutes ahead of real-time
+        // 1x playback -- re-seeking elsewhere just pulls in a few fresh
+        // nearby segments (~1-2MB each), not the whole file. backBufferLength
+        // similarly bounds how much *already-played* buffer sticks around
+        // during a long viewing session.
         //
-        // MUST be a finite number, not literal Infinity -- this was the
-        // actual cause of "playback freezes forever after loading almost
-        // nothing, with no error". Our HLS media playlist has no bitrate
-        // info (single-level, not a multi-bitrate master playlist), so
-        // hls.js's StreamController.getMaxBufferLength() falls through to
+        // maxBufferLength/maxMaxBufferLength MUST be finite, not literal
+        // Infinity -- that was a separate, earlier bug ("playback freezes
+        // forever after loading almost nothing, with no error"). Our HLS
+        // media playlist has no bitrate info (single-level, not a
+        // multi-bitrate master playlist), so hls.js's
+        // StreamController.getMaxBufferLength() falls through to
         // `Math.min(config.maxBufferLength, config.maxMaxBufferLength)`
         // directly. Infinity there gets normalized to null somewhere in
         // hls.js's config handling, and `Math.min(null, null)` evaluates to
         // 0 (null coerces to 0 in numeric context) -- so the stream
         // controller's "is buffered-ahead length already >= target?" check
         // (bufferLen >= maxBufLen, i.e. 0 >= 0) was true from the very
-        // first tick, and it never issued a single fragment request. Live
-        // console verification: patching this to a finite number on an
-        // already-stuck player made it immediately start loading segments.
+        // first tick, and it never issued a single fragment request.
         maxBufferLength: HLS_MAX_BUFFER_SECONDS,
         maxMaxBufferLength: HLS_MAX_BUFFER_SECONDS,
-        maxBufferSize: 1000 * 1000 * 1000,
+        maxBufferSize: 150 * 1000 * 1000,
+        backBufferLength: 5 * 60,
         liveSyncDurationCount: 1,
       });
       hls.on(Hls.Events.ERROR, (_evt, data) => {
