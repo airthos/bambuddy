@@ -30,7 +30,7 @@ import tempfile
 from pathlib import Path
 
 from PIL import Image
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.config import settings as app_settings
@@ -49,7 +49,7 @@ _QUALITY = 80
 # Cap idle gaps in the downloaded timelapse the same way playback does, so a
 # long capture gap (printer offline / paused) doesn't become a multi-second
 # frozen hold in the exported video.
-_DOWNLOAD_SPEED = 50
+_DOWNLOAD_SPEED = 100
 _DOWNLOAD_FPS = 30
 _MAX_GAP_SECONDS = 4.0
 
@@ -58,11 +58,11 @@ def pack_dir(printer_id: int, archive_id: int) -> Path:
     return Path(app_settings.base_dir) / RECORDINGS_DIR_NAME / str(printer_id) / f"{archive_id}_pack"
 
 
-def _downscale(data: bytes) -> bytes:
+def _downscale(data: bytes, scale: float = _SCALE) -> bytes:
     im = Image.open(io.BytesIO(data))
     w, h = im.size
-    nw = max(2, (int(w * _SCALE) // 2) * 2)
-    nh = max(2, (int(h * _SCALE) // 2) * 2)
+    nw = max(2, (int(w * scale) // 2) * 2)
+    nh = max(2, (int(h * scale) // 2) * 2)
     im = im.convert("RGB").resize((nw, nh), Image.Resampling.BILINEAR)
     buf = io.BytesIO()
     im.save(buf, format="JPEG", quality=_QUALITY)
@@ -125,9 +125,71 @@ async def get_chunk(db: AsyncSession, session: CameraRecordingSession, chunk: in
     return data
 
 
+# Small quarter-res still used as the timeline's per-job preview tile.
+_THUMB_SCALE = 0.25
+
+
+async def get_thumbnail(db: AsyncSession, session: CameraRecordingSession) -> bytes | None:
+    """A single small representative frame (the middle one by ordinal) for use
+    as a timeline preview tile. Built on demand and cached to disk for finished
+    recordings; a live recording rebuilds each time since its midpoint moves.
+    Returns None if the recording has no frames."""
+    count = session.frame_count or 0
+    if count <= 0:
+        # frame_count may lag for very fresh sessions -- fall back to a count query.
+        result = await db.execute(
+            select(func.count()).select_from(CameraRecordingFrame).where(
+                CameraRecordingFrame.archive_id == session.archive_id
+            )
+        )
+        count = result.scalar_one() or 0
+    if count <= 0:
+        return None
+
+    mid = count // 2
+    result = await db.execute(
+        select(CameraRecordingFrame.offset, CameraRecordingFrame.length)
+        .where(CameraRecordingFrame.archive_id == session.archive_id)
+        .order_by(CameraRecordingFrame.seq)
+        .offset(mid)
+        .limit(1)
+    )
+    row = result.first()
+    if row is None:
+        return None
+
+    is_live = session.status == "recording"
+    cache_path = pack_dir(session.printer_id, session.archive_id) / "thumb.jpg"
+    if not is_live and cache_path.exists():
+        try:
+            return cache_path.read_bytes()
+        except OSError:
+            pass
+
+    def _build() -> bytes:
+        with open(session.file_path, "rb") as fh:
+            fh.seek(row.offset)
+            data = fh.read(row.length)
+        try:
+            return _downscale(data, _THUMB_SCALE)
+        except Exception:
+            return data
+
+    data = await asyncio.to_thread(_build)
+    if not is_live:
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = cache_path.with_suffix(".tmp")
+            tmp.write_bytes(data)
+            os.replace(tmp, cache_path)
+        except OSError as e:
+            logger.warning("Sentry: failed to cache thumbnail for archive %s: %s", session.archive_id, e)
+    return data
+
+
 async def render_timelapse(session: CameraRecordingSession) -> bytes | None:
     """Render the recording's framelog into a downloadable MP4 timelapse at
-    _DOWNLOAD_SPEED real-time. Inter-frame gaps are capped so idle periods
+    _DOWNLOAD_SPEED (100x) real-time. Inter-frame gaps are capped so idle periods
     don't become long frozen holds. Returns None if there are no frames."""
     async with _database().async_session() as db:  # type: ignore[misc]
         result = await db.execute(

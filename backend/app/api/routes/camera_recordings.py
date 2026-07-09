@@ -4,6 +4,7 @@ retention for per-job camera recordings written by camera_recorder.py.
 
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -153,6 +154,30 @@ async def get_frame_pack(
     return Response(content=data, media_type="application/octet-stream", headers={"Cache-Control": "no-cache"})
 
 
+@router.get("/{printer_id}/recordings/{archive_id}/thumbnail")
+async def get_recording_thumbnail(
+    printer_id: int,
+    archive_id: int,
+    db: AsyncSession = Depends(get_db),
+    _: None = RequireCameraStreamTokenIfAuthEnabled,
+):
+    """A single small representative JPEG for the recording, used as the timeline's
+    per-job preview tile. Loaded via <img src>, so stream-token auth (same as the
+    per-frame/snapshot endpoints), not full session auth."""
+    await get_printer_or_404(printer_id, db)
+
+    result = await db.execute(select(CameraRecordingSession).where(CameraRecordingSession.archive_id == archive_id))
+    session = result.scalar_one_or_none()
+    if session is None:
+        raise HTTPException(status_code=404, detail="Recording not found")
+
+    data = await camera_frame_pack.get_thumbnail(db, session)
+    if data is None:
+        raise HTTPException(status_code=404, detail="No frames to thumbnail")
+
+    return Response(content=data, media_type="image/jpeg", headers={"Cache-Control": "max-age=3600"})
+
+
 @router.get("/{printer_id}/recordings/{archive_id}/download")
 async def download_recording(
     printer_id: int,
@@ -161,7 +186,7 @@ async def download_recording(
     _: User | None = RequirePermissionIfAuthEnabled(Permission.CAMERA_VIEW),
 ):
     """Renders the recording's framelog into one downloadable timelapse MP4,
-    sped up 50x real time (see camera_frame_pack.render_timelapse).
+    sped up 100x real time (see camera_frame_pack.render_timelapse).
 
     This is a re-encode to a normal GOP structure: the in-app scrubber needs
     frame-accurate all-intra playback, but a download is watched, not scrubbed,
@@ -235,18 +260,26 @@ async def delete_recording(
 async def list_snapshots(
     printer_id: int,
     limit: int = 100,
+    since: str | None = None,
     db: AsyncSession = Depends(get_db),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.CAMERA_VIEW),
 ):
-    """Most recent interval snapshots for a printer (independent of print jobs)."""
+    """Interval snapshots for a printer (independent of print jobs), most recent
+    first. `since` (ISO-8601, naive UTC) bounds the window — the timeline uses it
+    to pull just the visible range and lifts the limit so a dense ambient log
+    isn't silently truncated mid-window."""
     await get_printer_or_404(printer_id, db)
 
-    result = await db.execute(
-        select(CameraIntervalSnapshot)
-        .where(CameraIntervalSnapshot.printer_id == printer_id)
-        .order_by(CameraIntervalSnapshot.captured_at.desc())
-        .limit(min(limit, 500))
-    )
+    query = select(CameraIntervalSnapshot).where(CameraIntervalSnapshot.printer_id == printer_id)
+    if since:
+        try:
+            since_dt = datetime.fromisoformat(since)
+        except ValueError as e:
+            raise HTTPException(status_code=422, detail=f"Invalid 'since' timestamp: {e}") from e
+        query = query.where(CameraIntervalSnapshot.captured_at >= since_dt)
+
+    cap = 2000 if since else 500
+    result = await db.execute(query.order_by(CameraIntervalSnapshot.captured_at.desc()).limit(min(limit, cap)))
     return [
         {"id": row.id, "captured_at": row.captured_at.isoformat(), "size_bytes": row.size_bytes}
         for row in result.scalars().all()

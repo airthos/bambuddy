@@ -205,6 +205,12 @@ export interface CameraRecordingSummary {
   archive_status: string | null;
 }
 
+export interface CameraSnapshotSummary {
+  id: number;
+  captured_at: string;
+  size_bytes: number;
+}
+
 export interface RecordingStorageCategory {
   key: string;
   label: string;
@@ -5176,6 +5182,36 @@ export const api = {
   // Built fresh per fetch so it always carries the current stream token.
   getRecordingPackUrl: (printerId: number, archiveId: number, chunk: number) =>
     withStreamToken(`${API_BASE}/printers/${printerId}/recordings/${archiveId}/frames/pack/${chunk}`),
+  // Full-resolution single frame by seq (the packed chunks the player draws are
+  // half-res; this pulls the original JPEG straight from the framelog).
+  getRecordingFrameUrl: (printerId: number, archiveId: number, seq: number) =>
+    withStreamToken(`${API_BASE}/printers/${printerId}/recordings/${archiveId}/frames/${seq}`),
+  // Small representative frame for a recording — the timeline's per-job preview tile.
+  getRecordingThumbnailUrl: (printerId: number, archiveId: number) =>
+    withStreamToken(`${API_BASE}/printers/${printerId}/recordings/${archiveId}/thumbnail`),
+  // Interval (ambient) snapshots — used to fill the timeline between jobs.
+  listSnapshots: (printerId: number, since?: string, limit = 2000) => {
+    const params = new URLSearchParams({ limit: String(limit) });
+    if (since) params.set('since', since);
+    return request<CameraSnapshotSummary[]>(`/printers/${printerId}/snapshots?${params.toString()}`);
+  },
+  getSnapshotImageUrl: (printerId: number, snapshotId: number) =>
+    withStreamToken(`${API_BASE}/printers/${printerId}/snapshots/${snapshotId}/image`),
+  downloadFrameSnapshot: async (printerId: number, archiveId: number, seq: number, filename?: string): Promise<void> => {
+    const response = await fetch(
+      withStreamToken(`${API_BASE}/printers/${printerId}/recordings/${archiveId}/frames/${seq}`)
+    );
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const blob = await response.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || `recording_${archiveId}_frame_${seq}.jpg`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+  },
   setRecordingKeepForever: (printerId: number, archiveId: number, keep: boolean) =>
     request<{ archive_id: number; keep_forever: boolean }>(
       `/printers/${printerId}/recordings/${archiveId}/keep-forever?keep=${keep}`,
