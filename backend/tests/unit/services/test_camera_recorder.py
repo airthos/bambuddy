@@ -17,7 +17,7 @@ from backend.app.api.routes import camera as camera_routes
 from backend.app.core.config import settings as app_settings
 from backend.app.models.camera_recording import CameraRecordingFrame, CameraRecordingSession
 from backend.app.models.settings import Settings
-from backend.app.services import camera_fanout, camera_hls, camera_recorder
+from backend.app.services import camera_fanout, camera_recorder
 from backend.app.services.printer_manager import printer_manager
 
 pytestmark = pytest.mark.asyncio
@@ -36,22 +36,6 @@ async def recorder_session_maker(monkeypatch, test_engine, tmp_path):
     monkeypatch.setattr("backend.app.core.database.async_session", test_async_session)
     monkeypatch.setattr(app_settings, "base_dir", tmp_path)
 
-    # HLS encoding (camera_hls.py) has its own dedicated test file that mocks
-    # the ffmpeg subprocess call directly. Here it's a no-op so these
-    # recorder-pipeline tests don't spawn real ffmpeg processes (not
-    # installed on every dev machine) or leak background tasks across tests.
-    async def _noop_live_loop(session):
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            pass
-
-    async def _noop_finalize(archive_id, printer_id, framelog_path):
-        pass
-
-    monkeypatch.setattr(camera_hls, "live_loop", _noop_live_loop)
-    monkeypatch.setattr(camera_hls, "finalize", _noop_finalize)
-
     return test_async_session
 
 
@@ -66,10 +50,10 @@ async def _cancel_leftover_sessions():
     sessions = list(camera_recorder._active_sessions.values())
     camera_recorder._active_sessions.clear()
     for session in sessions:
-        for task in (session.watchdog_task, session.pump_task, session.hls_task):
+        for task in (session.watchdog_task, session.pump_task):
             if task is not None and not task.done():
                 task.cancel()
-        for task in (session.watchdog_task, session.pump_task, session.hls_task):
+        for task in (session.watchdog_task, session.pump_task):
             if task is not None:
                 try:
                     await task

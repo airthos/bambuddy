@@ -46,7 +46,6 @@ class CameraRecordingPurgeService:
             logger.info("Stopped Sentry recording retention sweeper")
 
     async def _scheduler_loop(self):
-        from backend.app.services import camera_hls
         from backend.app.services.camera_interval_capture import camera_interval_capture_service
 
         while True:
@@ -60,7 +59,6 @@ class CameraRecordingPurgeService:
                     deleted_snapshots = await camera_interval_capture_service.purge_expired(db)
                     if deleted_snapshots:
                         logger.info("Sentry retention sweep: deleted %d expired interval snapshot(s)", deleted_snapshots)
-                await camera_hls.encode_backlog()
             except asyncio.CancelledError:
                 break
             except Exception as e:  # pragma: no cover - defensive
@@ -69,15 +67,14 @@ class CameraRecordingPurgeService:
 
     @staticmethod
     def _delete_row_files(row: CameraRecordingSession) -> None:
-        from backend.app.services import camera_hls
+        from backend.app.services import camera_frame_pack
 
         try:
             Path(row.file_path).unlink(missing_ok=True)
         except OSError as e:
             logger.warning("Sentry: failed to delete framelog for archive %s: %s", row.archive_id, e)
-        # video_path is the playlist inside the {archive_id}_hls directory —
-        # remove the whole directory so segments + state.json go with it too.
-        shutil.rmtree(camera_hls.hls_dir(row.printer_id, row.archive_id), ignore_errors=True)
+        # Remove the cached half-res playback chunks ({archive_id}_pack/) too.
+        shutil.rmtree(camera_frame_pack.pack_dir(row.printer_id, row.archive_id), ignore_errors=True)
 
     async def _delete_rows(self, db: AsyncSession, rows: list[CameraRecordingSession]) -> int:
         for row in rows:

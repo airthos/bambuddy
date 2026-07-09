@@ -5172,10 +5172,10 @@ export const api = {
     request<CameraRecordingSummary[]>(`/printers/${printerId}/recordings`),
   getRecordingFrames: (printerId: number, archiveId: number) =>
     request<{ seq: number; ts_ms: number }[]>(`/printers/${printerId}/recordings/${archiveId}/frames`),
-  getRecordingFrameUrl: (printerId: number, archiveId: number, seq: number) =>
-    withStreamToken(`${API_BASE}/printers/${printerId}/recordings/${archiveId}/frames/${seq}`),
-  getRecordingPlaylistUrl: (printerId: number, archiveId: number) =>
-    withStreamToken(`${API_BASE}/printers/${printerId}/recordings/${archiveId}/hls/playlist.m3u8`),
+  // Half-res packed chunk of consecutive frames for image-sequence playback.
+  // Built fresh per fetch so it always carries the current stream token.
+  getRecordingPackUrl: (printerId: number, archiveId: number, chunk: number) =>
+    withStreamToken(`${API_BASE}/printers/${printerId}/recordings/${archiveId}/frames/pack/${chunk}`),
   setRecordingKeepForever: (printerId: number, archiveId: number, keep: boolean) =>
     request<{ archive_id: number; keep_forever: boolean }>(
       `/printers/${printerId}/recordings/${archiveId}/keep-forever?keep=${keep}`,
