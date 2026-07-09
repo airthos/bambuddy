@@ -100,6 +100,55 @@ as a local uncommitted diff.
   it's not this feature's fault — but also verify they haven't been fixed/removed since,
   rather than assuming this note is still accurate.
 
+## 1d. Sequential-Wrap Spool Order + Cross-Restart Persistence
+
+Extends 1b. Added 2026-07-09. Rides on the **same** `prefer_recently_used_filament`
+toggle — no new setting (per the 1c lesson). Two changes:
+
+- **True sequential-wrap order.** When the currently-drained spool depletes, the next
+  slot is chosen by clockwise distance *to the right* of it, wrapping past the top slot
+  back to the lowest — i.e. starting on spool 2 the order is **2 → 3 → 4 → 1**, not the
+  old ascending-from-slot-1 fallback (which gave 2 → 1). The preferred slot itself still
+  floats to the front (distance 0) so a spool is drained fully before moving on.
+  - **Backend:** `PrintScheduler._prefer_recent_sort_key` now returns
+    `((gtid - preferred_tray) % _AMS_SLOT_COUNT, slot_order)` when both are in the regular
+    AMS range, else the old `(0 if is_preferred else 1, slot_order)` fallback.
+  - **`_AMS_SLOT_COUNT = 4`** — assumes the farm's single 4-slot AMS. Slots outside 0–3
+    (AMS-HT ≥128, external 254, multi-AMS) skip the wrap and use the plain fallback. If
+    the farm ever runs multiple AMS units, this modulus needs revisiting.
+- **Persistence across jobs *and* restarts.** The active spool is persisted so a fresh
+  job resumes on it. New `printers.active_spool_tray` column (nullable int, global tray
+  id). Mirrors the `awaiting_plate_clear` persistence path exactly:
+  `printer_manager.set_active_spool_tray` (writes on change only) /
+  `get_active_spool_tray` / `_persist_active_spool_tray` (via `run_with_retry`) /
+  `load_active_spool_tray_from_db` (called from `main.py` startup next to
+  `load_awaiting_plate_clear_from_db`). Migration: `ALTER TABLE printers ADD COLUMN
+  active_spool_tray INTEGER` in `run_migrations`.
+  - **Where it's captured:** primarily `main.on_printer_status_change` — every status
+    push, if `state.last_loaded_tray` is a valid physical tray, calls
+    `set_active_spool_tray` (which no-ops unless it changed). So a **mid-print AMS
+    auto-switch** (runout fallback) updates the persisted pointer to whatever slot the AMS
+    chose, promptly, not just at the next dispatch. `_compute_ams_mapping_for_printer`
+    also persists the live tray at dispatch (belt-and-suspenders) and, when the live tray
+    is unknown (idle/fresh after a restart), seeds `preferred_tray` from the persisted
+    pointer instead. Together these fix the old "resets on service restart" caveat from 1b.
+- **Design intent (per Brendan, 2026-07-09):** we deliberately do *not* try to control
+  which slot the AMS switches to mid-print — that's the firmware's call and that's fine.
+  The only requirement is that when the AMS *does* switch, our "last used spool" tracks
+  what it chose. The per-push capture above is what satisfies that.
+- **Known limitation (unchanged from 1b):** BamBuddy still only *chooses* spool order at
+  **job-dispatch boundaries** (via the wrap sort key). The strict 2→3→4→1 order is a
+  dispatch-time choice; a mid-print fallback slot is the AMS firmware's pick — we just
+  follow and persist it. On all-identical non-RFID spools the firmware treats the slots as
+  interchangeable, so mid-print hops won't follow "to the right" — by design, we don't care.
+- **Tests:** `TestPreferRecentlyUsedFilament` (wrap-advances-right, wrap-top-to-first,
+  full 2→3→4→1 cycle, holds-current-when-loaded) in `test_scheduler_ams_mapping.py`;
+  `TestActiveSpoolTrayPersistence` (in-memory + DB round-trip + restart rehydrate) in
+  `test_scheduler_clear_plate.py`.
+- **Live state at ship time:** `prefer_recently_used_filament = true` on airtho-server
+  (`/opt/bambuddy/data/bambuddy.db`); farm printers 3DP 2/3/4. Not yet deployed as of
+  this doc update — verify the column exists after the next deploy.
+
 ## 2. `scripts/farm_process.py` — Farm Loop End Sequence
 
 Cherry-picked from `airthos/print-farm`, adds the farm's end-of-print loop sequence.

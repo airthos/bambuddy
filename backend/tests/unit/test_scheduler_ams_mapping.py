@@ -526,9 +526,7 @@ class TestPreferRecentlyUsedFilament:
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 2, "ams_id": 0, "tray_id": 2},
         ]
 
-        result = scheduler._match_filaments_to_slots(
-            required, loaded, prefer_recent=True, preferred_tray=2
-        )
+        result = scheduler._match_filaments_to_slots(required, loaded, prefer_recent=True, preferred_tray=2)
         assert result == [2]  # last-loaded tray 2 wins over lower-slot tray 0
 
     def test_prefer_recent_disabled_picks_first(self, scheduler):
@@ -539,9 +537,7 @@ class TestPreferRecentlyUsedFilament:
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 2, "ams_id": 0, "tray_id": 2},
         ]
 
-        result = scheduler._match_filaments_to_slots(
-            required, loaded, prefer_recent=False, preferred_tray=2
-        )
+        result = scheduler._match_filaments_to_slots(required, loaded, prefer_recent=False, preferred_tray=2)
         assert result == [0]  # default lowest-slot pick
 
     def test_prefer_recent_unknown_tray_falls_back_to_slot_order(self, scheduler):
@@ -552,9 +548,7 @@ class TestPreferRecentlyUsedFilament:
             {"type": "PLA", "color": "#FF0000", "global_tray_id": 2, "ams_id": 0, "tray_id": 2},
         ]
 
-        result = scheduler._match_filaments_to_slots(
-            required, loaded, prefer_recent=True, preferred_tray=None
-        )
+        result = scheduler._match_filaments_to_slots(required, loaded, prefer_recent=True, preferred_tray=None)
         assert result == [0]  # no preference → lowest slot
 
     def test_prefer_recent_follows_auto_switch(self, scheduler):
@@ -566,22 +560,32 @@ class TestPreferRecentlyUsedFilament:
             {"type": "PETG", "color": "#000000", "global_tray_id": 2, "ams_id": 0, "tray_id": 2},
         ]
 
-        result = scheduler._match_filaments_to_slots(
-            required, loaded, prefer_recent=True, preferred_tray=2
-        )
+        result = scheduler._match_filaments_to_slots(required, loaded, prefer_recent=True, preferred_tray=2)
         assert result == [2]
 
     def test_prefer_recent_within_tray_info_idx_subset(self, scheduler):
         """Should also float the preferred tray within a non-unique tray_info_idx subset."""
         required = [{"slot_id": 1, "type": "PLA", "color": "#FFFFFF", "tray_info_idx": "GFA00"}]
         loaded = [
-            {"type": "PLA", "color": "#FFFFFF", "global_tray_id": 0, "ams_id": 0, "tray_id": 0, "tray_info_idx": "GFA00"},
-            {"type": "PLA", "color": "#FFFFFF", "global_tray_id": 2, "ams_id": 0, "tray_id": 2, "tray_info_idx": "GFA00"},
+            {
+                "type": "PLA",
+                "color": "#FFFFFF",
+                "global_tray_id": 0,
+                "ams_id": 0,
+                "tray_id": 0,
+                "tray_info_idx": "GFA00",
+            },
+            {
+                "type": "PLA",
+                "color": "#FFFFFF",
+                "global_tray_id": 2,
+                "ams_id": 0,
+                "tray_id": 2,
+                "tray_info_idx": "GFA00",
+            },
         ]
 
-        result = scheduler._match_filaments_to_slots(
-            required, loaded, prefer_recent=True, preferred_tray=2
-        )
+        result = scheduler._match_filaments_to_slots(required, loaded, prefer_recent=True, preferred_tray=2)
         assert result == [2]
 
     def test_prefer_recent_only_among_compatible_slots(self, scheduler):
@@ -594,9 +598,7 @@ class TestPreferRecentlyUsedFilament:
         ]
 
         # preferred_tray=2 is PETG (incompatible); the PLA slot 0 is the only match.
-        result = scheduler._match_filaments_to_slots(
-            required, loaded, prefer_recent=True, preferred_tray=2
-        )
+        result = scheduler._match_filaments_to_slots(required, loaded, prefer_recent=True, preferred_tray=2)
         assert result == [0]
 
     def test_prefer_recent_takes_precedence_over_lowest(self, scheduler):
@@ -612,6 +614,78 @@ class TestPreferRecentlyUsedFilament:
             required, loaded, prefer_lowest=True, prefer_recent=True, preferred_tray=2
         )
         assert result == [2]
+
+    # --- Sequential-wrap order once the preferred spool is depleted (§1d) ---
+    # global_tray_id 0/1/2/3 == physical AMS spools 1/2/3/4. Starting on spool 2
+    # (gtid 1) the order must advance to the right and wrap: 2 → 3 → 4 → 1.
+
+    def test_sequential_wrap_advances_right_when_preferred_depleted(self, scheduler):
+        """Preferred spool 2 (gtid 1) is gone from the AMS → next pick is spool 3 (gtid 2),
+        not the lower-position spool 1 (gtid 0)."""
+        required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
+        loaded = [
+            {"type": "PLA", "color": "#FF0000", "global_tray_id": 0, "ams_id": 0, "tray_id": 0},
+            {"type": "PLA", "color": "#FF0000", "global_tray_id": 2, "ams_id": 0, "tray_id": 2},
+            {"type": "PLA", "color": "#FF0000", "global_tray_id": 3, "ams_id": 0, "tray_id": 3},
+        ]
+        result = scheduler._match_filaments_to_slots(required, loaded, prefer_recent=True, preferred_tray=1)
+        assert result == [2]  # to the right of the depleted spool 2, not back to spool 1
+
+    def test_sequential_wrap_loops_top_slot_back_to_first(self, scheduler):
+        """Preferred spool 4 (gtid 3) is gone → wraps back to spool 1 (gtid 0)."""
+        required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
+        loaded = [
+            {"type": "PLA", "color": "#FF0000", "global_tray_id": 0, "ams_id": 0, "tray_id": 0},
+            {"type": "PLA", "color": "#FF0000", "global_tray_id": 1, "ams_id": 0, "tray_id": 1},
+        ]
+        result = scheduler._match_filaments_to_slots(required, loaded, prefer_recent=True, preferred_tray=3)
+        assert result == [0]  # 4 → wrap → 1
+
+    def test_sequential_wrap_full_cycle_2_3_4_1(self, scheduler):
+        """Walk the whole depletion cycle starting at spool 2: 2 → 3 → 4 → 1."""
+        required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
+        all_slots = [
+            {"type": "PLA", "color": "#FF0000", "global_tray_id": g, "ams_id": 0, "tray_id": g} for g in range(4)
+        ]
+
+        # Fresh start on spool 2 (gtid 1): while still loaded, it stays put.
+        assert scheduler._match_filaments_to_slots(required, all_slots, prefer_recent=True, preferred_tray=1) == [1]
+
+        # Spool 2 depletes (drop gtid 1): anchor still 1 → advance to spool 3 (gtid 2).
+        assert scheduler._match_filaments_to_slots(
+            required,
+            [s for s in all_slots if s["global_tray_id"] != 1],
+            prefer_recent=True,
+            preferred_tray=1,
+        ) == [2]
+
+        # Spool 3 depletes (drop 1,2): anchor 2 → advance to spool 4 (gtid 3).
+        assert scheduler._match_filaments_to_slots(
+            required,
+            [s for s in all_slots if s["global_tray_id"] not in (1, 2)],
+            prefer_recent=True,
+            preferred_tray=2,
+        ) == [3]
+
+        # Spool 4 depletes (only gtid 0 left): anchor 3 → wrap to spool 1 (gtid 0).
+        assert scheduler._match_filaments_to_slots(
+            required,
+            [s for s in all_slots if s["global_tray_id"] == 0],
+            prefer_recent=True,
+            preferred_tray=3,
+        ) == [0]
+
+    def test_sequential_wrap_holds_current_spool_when_still_loaded(self, scheduler):
+        """The scenario Brendan described: job starts on spool 2, spool 1 gets refilled
+        between jobs — the next job must resume on spool 2, not jump to the freshly
+        refilled lower-position spool 1."""
+        required = [{"slot_id": 1, "type": "PLA", "color": "#FF0000"}]
+        loaded = [
+            {"type": "PLA", "color": "#FF0000", "global_tray_id": 0, "ams_id": 0, "tray_id": 0},  # refilled spool 1
+            {"type": "PLA", "color": "#FF0000", "global_tray_id": 1, "ams_id": 0, "tray_id": 1},  # current spool 2
+        ]
+        result = scheduler._match_filaments_to_slots(required, loaded, prefer_recent=True, preferred_tray=1)
+        assert result == [1]  # stays on spool 2
 
 
 class TestPreferLowestInventoryOverride:

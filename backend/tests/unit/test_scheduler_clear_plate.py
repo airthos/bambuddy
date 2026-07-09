@@ -173,6 +173,123 @@ class TestAwaitingPlateClearPersistence:
         await engine.dispose()
 
 
+class TestActiveSpoolTrayPersistence:
+    """Verify the active-spool-tray pointer round-trips through the DB so sequential
+    spool order survives a Bambuddy restart (§1d)."""
+
+    def test_get_returns_none_when_unset(self):
+        manager = PrinterManager()
+        assert manager.get_active_spool_tray(1) is None
+
+    def test_set_and_get_in_memory(self):
+        manager = PrinterManager()
+        manager.set_active_spool_tray(1, 2)
+        assert manager.get_active_spool_tray(1) == 2
+        assert manager.get_active_spool_tray(2) is None
+
+    def test_mid_print_switch_updates_pointer(self):
+        """The core requirement: when the AMS auto-switches spool mid-print, the tracked
+        "last used spool" follows whatever slot the AMS chose. Modelled as the per-push
+        capture in on_printer_status_change would drive it: feeding spool 2 (gtid 1),
+        then the AMS falls back to spool 3 (gtid 2)."""
+        manager = PrinterManager()
+        manager.set_active_spool_tray(1, 1)
+        assert manager.get_active_spool_tray(1) == 1
+        manager.set_active_spool_tray(1, 2)  # AMS chose a different slot mid-print
+        assert manager.get_active_spool_tray(1) == 2
+
+    @pytest.mark.asyncio
+    async def test_load_rehydrates_pointer_from_db(self):
+        """A persisted active_spool_tray must reappear in memory on startup so the next
+        job resumes on the same spool after a restart."""
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+        import backend.app.models  # noqa: F401
+        from backend.app.core.database import Base
+        from backend.app.models.printer import Printer
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+        async with session_maker() as db:
+            db.add_all(
+                [
+                    Printer(
+                        id=1, name="P1", serial_number="S1", ip_address="1.1.1.1", access_code="x", active_spool_tray=1
+                    ),  # currently draining spool 2
+                    Printer(
+                        id=2,
+                        name="P2",
+                        serial_number="S2",
+                        ip_address="2.2.2.2",
+                        access_code="y",
+                        active_spool_tray=None,
+                    ),  # never established
+                ]
+            )
+            await db.commit()
+
+        manager = PrinterManager()
+        with patch("backend.app.core.database.async_session", session_maker):
+            await manager.load_active_spool_tray_from_db()
+
+        assert manager.get_active_spool_tray(1) == 1
+        assert manager.get_active_spool_tray(2) is None
+        await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_persist_writes_pointer_to_db(self):
+        from sqlalchemy import select
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+        import backend.app.models  # noqa: F401
+        from backend.app.core.database import Base
+        from backend.app.models.printer import Printer
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+        async with session_maker() as db:
+            db.add(
+                Printer(
+                    id=1, name="P1", serial_number="S1", ip_address="1.1.1.1", access_code="x", active_spool_tray=None
+                )
+            )
+            await db.commit()
+
+        manager = PrinterManager()
+        with patch("backend.app.core.database.async_session", session_maker):
+            await manager._persist_active_spool_tray(1, 3)
+
+        async with session_maker() as db:
+            row = (await db.execute(select(Printer).where(Printer.id == 1))).scalar_one()
+            assert row.active_spool_tray == 3
+
+        await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_persist_missing_printer_does_not_raise(self):
+        from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+
+        import backend.app.models  # noqa: F401
+        from backend.app.core.database import Base
+
+        engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+        session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+
+        manager = PrinterManager()
+        with patch("backend.app.core.database.async_session", session_maker):
+            await manager._persist_active_spool_tray(999, 1)
+
+        await engine.dispose()
+
+
 class TestSchedulerIdleCheckWithPlateCleared:
     """Test _is_printer_idle interactions with the awaiting-plate-clear flag (#961)."""
 
@@ -251,9 +368,7 @@ class TestSchedulerIdleCheckWithPlateCleared:
         assert scheduler._is_printer_idle(1) is False
 
     @patch("backend.app.services.print_scheduler.printer_manager")
-    def test_finish_state_not_idle_when_awaiting_even_if_require_plate_clear_disabled(
-        self, mock_pm, scheduler
-    ):
+    def test_finish_state_not_idle_when_awaiting_even_if_require_plate_clear_disabled(self, mock_pm, scheduler):
         """The awaiting flag blocks dispatch even with require_plate_clear=False.
 
         In farm mode the flag is only raised for prints that ended without
@@ -266,18 +381,14 @@ class TestSchedulerIdleCheckWithPlateCleared:
         assert scheduler._is_printer_idle(1, require_plate_clear=False) is False
 
     @patch("backend.app.services.print_scheduler.printer_manager")
-    def test_failed_state_not_idle_when_awaiting_even_if_require_plate_clear_disabled(
-        self, mock_pm, scheduler
-    ):
+    def test_failed_state_not_idle_when_awaiting_even_if_require_plate_clear_disabled(self, mock_pm, scheduler):
         mock_pm.is_connected.return_value = True
         mock_pm.get_status.return_value = MagicMock(state="FAILED")
         mock_pm.is_awaiting_plate_clear.return_value = True
         assert scheduler._is_printer_idle(1, require_plate_clear=False) is False
 
     @patch("backend.app.services.print_scheduler.printer_manager")
-    def test_finish_state_idle_when_not_awaiting_and_require_plate_clear_disabled(
-        self, mock_pm, scheduler
-    ):
+    def test_finish_state_idle_when_not_awaiting_and_require_plate_clear_disabled(self, mock_pm, scheduler):
         """Farm-mode happy path: completed prints don't raise the flag, so FINISH dispatches."""
         mock_pm.is_connected.return_value = True
         mock_pm.get_status.return_value = MagicMock(state="FINISH")

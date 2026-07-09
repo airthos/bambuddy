@@ -1835,6 +1835,10 @@ async def run_migrations(conn):
     # Migration: Add awaiting_plate_clear column to printers (#961)
     await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN awaiting_plate_clear BOOLEAN DEFAULT FALSE NOT NULL")
 
+    # Migration: Add active_spool_tray column to printers — persists the spool the farm is
+    # currently draining so "prefer recently-used spool" sequential order survives a restart.
+    await _safe_execute(conn, "ALTER TABLE printers ADD COLUMN active_spool_tray INTEGER")
+
     # Migration: Add REST/Webhook smart plug fields
     await _safe_execute(conn, "ALTER TABLE smart_plugs ADD COLUMN rest_on_url VARCHAR(500)")
     await _safe_execute(conn, "ALTER TABLE smart_plugs ADD COLUMN rest_on_body TEXT")

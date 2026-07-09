@@ -916,6 +916,15 @@ class PrintScheduler:
             elif (0 <= tn <= 15) or (128 <= tn <= 135) or tn == 254:
                 preferred_tray = tn
 
+            if preferred_tray is not None:
+                # Live signal available — persist it so the sequential order survives a
+                # Bambuddy restart and the next job resumes on the same spool (§1d).
+                printer_manager.set_active_spool_tray(printer_id, preferred_tray)
+            else:
+                # No live signal (e.g. idle/fresh after a restart) — fall back to the
+                # persisted pointer so we resume on the spool the farm was last draining.
+                preferred_tray = printer_manager.get_active_spool_tray(printer_id)
+
         # Compute mapping: match required filaments to available slots
         return self._match_filaments_to_slots(
             filament_reqs,
@@ -1245,19 +1254,39 @@ class PrintScheduler:
         remain = f.get("remain", -1)
         return (1, float(remain) if remain is not None and remain >= 0 else 101.0, slot_order)
 
+    # Physical slot count of a single AMS unit — the modulus for the sequential-wrap
+    # spool order (spool 4 → back to spool 1). Assumes the farm's single 4-slot AMS;
+    # slots outside the regular AMS range (AMS-HT / external) skip the wrap and use
+    # the plain float-preferred-then-slot-order fallback below.
+    _AMS_SLOT_COUNT = 4
+
     @staticmethod
     def _prefer_recent_sort_key(f: dict, preferred_tray: int | None) -> tuple[int, int]:
         """Sort key for the "Prefer Recently-Used Spool" preference.
 
-        Floats the slot the printer most recently fed from (``preferred_tray`` =
-        the printer's ``last_loaded_tray``/``tray_now``) to the front so the farm
-        keeps draining one spool before starting another. Everything else keeps
-        the deterministic AMS slot-position order via ``_slot_priority``, so when
-        there's no known preference (e.g. fresh after a service restart) behaviour
-        is identical to the pre-existing lowest-slot pick.
+        Sequential-wrap behaviour, anchored on ``preferred_tray`` (the printer's
+        ``last_loaded_tray``/``tray_now``, or the persisted ``active_spool_tray``):
+
+        - The preferred slot itself floats to the front (distance 0), so the farm
+          keeps draining the current spool before starting another.
+        - Once the preferred spool is gone (depleted / removed, so it's no longer a
+          candidate), remaining slots are ranked by clockwise distance *to the right*
+          of the preferred slot, wrapping past the top slot back to the lowest —
+          e.g. starting on slot 2 gives 2 → 3 → 4 → 1, not 2 → 1.
+
+        Falls back to plain slot-position order (via ``_slot_priority``) when there's
+        no known preference (e.g. fresh after a service restart with no persisted
+        anchor) or when the slots aren't a single regular 4-slot AMS — identical to
+        the pre-existing lowest-slot pick.
         """
         gtid = f.get("global_tray_id")
         slot_order = PrintScheduler._slot_priority(f.get("ams_id"), f.get("tray_id"))
+        n = PrintScheduler._AMS_SLOT_COUNT
+        # Sequential wrap only applies within a single regular 4-slot AMS (gtids 0..3).
+        if preferred_tray is not None and 0 <= preferred_tray < n and gtid is not None and 0 <= gtid < n:
+            distance = (gtid - preferred_tray) % n
+            return (distance, slot_order)
+        # Fallback: float an exact preferred match, else deterministic slot order.
         is_preferred = preferred_tray is not None and preferred_tray >= 0 and gtid == preferred_tray
         return (0 if is_preferred else 1, slot_order)
 

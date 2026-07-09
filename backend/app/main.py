@@ -745,6 +745,15 @@ _nozzle_count_updated: set[int] = set()
 
 async def on_printer_status_change(printer_id: int, state: PrinterState):
     """Handle printer status changes - broadcast via WebSocket."""
+    # Track the spool the printer is actively feeding from (§1d "prefer recently-used
+    # spool"). Capturing it on every status push — not just at queue dispatch — means a
+    # mid-print AMS auto-switch (runout fallback) updates our persisted "last used spool"
+    # to whatever slot the AMS chose, so the next job resumes on it even across a restart.
+    # set_active_spool_tray only writes to the DB on change, so this is cheap per push.
+    lt = state.last_loaded_tray
+    if lt is not None and ((0 <= lt <= 15) or (128 <= lt <= 135) or lt == 254):
+        printer_manager.set_active_spool_tray(printer_id, lt)
+
     # Only broadcast if something meaningful changed (reduce WebSocket spam)
     # Include rounded temperatures to detect meaningful temp changes (within 1 degree)
     temps = state.temperatures or {}
@@ -4880,6 +4889,10 @@ async def lifespan(app: FastAPI):
 
     # Rehydrate persisted awaiting-plate-clear gate (#961) so prompts survive restarts
     await printer_manager.load_awaiting_plate_clear_from_db()
+
+    # Rehydrate persisted active spool tray so "prefer recently-used spool" sequential
+    # order resumes on the same spool after a restart (docs/airtho features §1d)
+    await printer_manager.load_active_spool_tray_from_db()
 
     # Layer change callback for external camera timelapse
     async def on_layer_change(printer_id: int, layer_num: int):

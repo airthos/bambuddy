@@ -182,6 +182,11 @@ class PrinterManager:
         # Persisted to DB (printers.awaiting_plate_clear) so the gate survives restarts/power
         # cycles — see issue #961. Loaded into this set at startup via load_awaiting_plate_clear_from_db().
         self._awaiting_plate_clear: set[int] = set()
+        # "Prefer recently-used spool": the global tray id each printer is currently draining.
+        # Persisted to DB (printers.active_spool_tray) so sequential spool order survives a
+        # Bambuddy restart — see docs/airtho features §1d. Loaded at startup via
+        # load_active_spool_tray_from_db().
+        self._active_spool_tray: dict[int, int] = {}
 
     def get_printer(self, printer_id: int) -> PrinterInfo | None:
         """Get printer info by ID."""
@@ -269,6 +274,59 @@ class PrinterManager:
                 printer_id,
                 e,
             )
+
+    def get_active_spool_tray(self, printer_id: int) -> int | None:
+        """Return the global tray id the farm last drained on this printer, or None.
+
+        Used by the scheduler as the "prefer recently-used spool" anchor when the live
+        printer status has no known tray (e.g. fresh after a service restart), so the
+        next job resumes on the same spool instead of falling back to slot-1 order.
+        """
+        return self._active_spool_tray.get(printer_id)
+
+    def set_active_spool_tray(self, printer_id: int, tray: int):
+        """Record the spool the farm is actively draining and persist it (#… sequential spool use).
+
+        Only writes on change so a busy queue poll doesn't hammer the DB. Persisted to
+        printers.active_spool_tray so sequential order survives a Bambuddy restart —
+        mirrors the awaiting_plate_clear persistence path.
+        """
+        if self._active_spool_tray.get(printer_id) == tray:
+            return
+        self._active_spool_tray[printer_id] = tray
+        # Only create the coroutine when there is a loop to run it on — otherwise Python
+        # emits "coroutine was never awaited" warnings (e.g. in sync unit tests).
+        if self._loop and self._loop.is_running():
+            self._schedule_async(self._persist_active_spool_tray(printer_id, tray))
+
+    async def _persist_active_spool_tray(self, printer_id: int, tray: int):
+        from backend.app.core.database import run_with_retry
+
+        async def _do(db):
+            printer = await db.get(Printer, printer_id)
+            if printer is not None:
+                printer.active_spool_tray = tray
+                await db.commit()
+
+        try:
+            await run_with_retry(_do, label=f"persist active_spool_tray printer={printer_id}")
+        except Exception as e:
+            logger.warning("Failed to persist active_spool_tray for printer %d: %s", printer_id, e)
+
+    async def load_active_spool_tray_from_db(self):
+        """Rehydrate the active-spool-tray map from the printers table on startup."""
+        from backend.app.core.database import async_session
+
+        try:
+            async with async_session() as db:
+                result = await db.execute(
+                    select(Printer.id, Printer.active_spool_tray).where(Printer.active_spool_tray.is_not(None))
+                )
+                self._active_spool_tray = {row[0]: row[1] for row in result.all()}
+                if self._active_spool_tray:
+                    logger.info("Loaded active spool tray for %d printer(s)", len(self._active_spool_tray))
+        except Exception as e:
+            logger.warning("Failed to load active_spool_tray from DB: %s", e)
 
     async def _persist_awaiting_plate_clear(self, printer_id: int, awaiting: bool):
         from backend.app.core.database import run_with_retry

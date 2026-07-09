@@ -44,6 +44,11 @@ class Printer(Base):
     # Queue: True after a print finishes/fails, until user acknowledges the plate is cleared.
     # Persisted so the gate survives crashes and power cycles (issue #961).
     awaiting_plate_clear: Mapped[bool] = mapped_column(Boolean, default=False)
+    # "Prefer recently-used spool": the global tray id (0-3 on a single 4-slot AMS) the
+    # farm is currently draining. Persisted so sequential spool order survives a Bambuddy
+    # restart — the next job resumes on the same spool instead of falling back to slot-1
+    # order. NULL until the first print establishes a spool. See docs/airtho features §1d.
+    active_spool_tray: Mapped[int | None] = mapped_column(default=None, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), onupdate=func.now())
 
