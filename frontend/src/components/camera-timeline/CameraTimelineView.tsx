@@ -103,9 +103,14 @@ function buildTimeline(recordings: CameraRecordingSummary[]): TimelineBlock[] {
   const sorted = [...recordings].sort((a, b) => recordingStart(a) - recordingStart(b));
   const blocks: TimelineBlock[] = [];
   let cursor: number | null = null;
-  for (const r of sorted) {
+  for (let i = 0; i < sorted.length; i++) {
+    const r = sorted[i];
     const start = recordingStart(r);
-    const end = recordingEnd(r);
+    // Guard against a bad/late stopped_at (e.g. a session the restart sweep
+    // closed hours after its last frame): never let a block overrun the next
+    // job's start, and never render into the future.
+    const nextStart = i + 1 < sorted.length ? recordingStart(sorted[i + 1]) : Infinity;
+    const end = Math.max(start, Math.min(recordingEnd(r), nextStart));
     if (cursor !== null && start > cursor) {
       blocks.push({ type: 'gap', start: cursor, end: start });
     }
@@ -115,16 +120,35 @@ function buildTimeline(recordings: CameraRecordingSummary[]): TimelineBlock[] {
   return blocks;
 }
 
+// Color by the *print outcome* (what the user cares about), not the recording
+// lifecycle. An 'orphaned' recording is flagged separately with a subtle marker
+// (see isOrphaned) rather than an alarming color -- the print itself usually
+// finished fine; only the recording didn't close cleanly.
 function jobClass(r: CameraRecordingSummary): string {
   if (r.status === 'recording') return 'bg-bambu-green text-white';
   if (r.archive_status === 'failed') return 'bg-red-900/80 text-red-200';
   if (r.archive_status === 'cancelled' || r.archive_status === 'aborted') return 'bg-yellow-700/80 text-yellow-100';
-  if (r.status === 'orphaned') return 'bg-orange-800/80 text-orange-100';
   return 'bg-blue-600/70 text-white';
+}
+
+// A recording that didn't close cleanly (watchdog/restart-swept) -- shown with
+// a small amber marker so a truncated recording is distinguishable without
+// making a completed print look failed.
+function isOrphaned(r: CameraRecordingSummary): boolean {
+  return r.status === 'orphaned';
 }
 
 function jobLabel(r: CameraRecordingSummary): string {
   return r.file ?? r.print_name ?? `#${r.archive_id}`;
+}
+
+function LegendItem({ swatch, label }: { swatch: string; label: string }) {
+  return (
+    <span className="flex items-center gap-1.5">
+      <span className={`w-2.5 h-2.5 rounded-sm ${swatch}`} />
+      {label}
+    </span>
+  );
 }
 
 function StatRow({ label, value }: { label: string; value: string }) {
@@ -245,6 +269,9 @@ function FilmstripBlock({
         <div className={`absolute top-0 left-0 right-0 ${thickCap ? 'h-1' : 'h-[3px]'} ${jobClass(block.recording)}`} />
       ) : (
         <div className="absolute top-0 left-0 right-0 h-[2px] bg-bambu-gray-dark/50" />
+      )}
+      {isJob && isOrphaned(block.recording) && (
+        <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-amber-400 ring-1 ring-black/50 z-10" />
       )}
       {isJob && jobFooter && (
         <div className="absolute inset-x-0 bottom-0 h-[18px] flex items-center px-1.5 bg-gradient-to-t from-black/80 to-transparent text-[10px] leading-none font-medium text-white truncate">
@@ -1133,6 +1160,18 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
                   );
                 })}
               </div>
+            </div>
+          )}
+          {activeTimeline.length > 0 && (
+            <div className="flex flex-wrap gap-x-4 gap-y-1 mt-2 text-[10px] text-bambu-gray">
+              <LegendItem swatch="bg-bambu-green" label={t('camera.timeline.statusRecording')} />
+              <LegendItem swatch="bg-blue-600/70" label={t('camera.timeline.statusCompleted')} />
+              <LegendItem swatch="bg-yellow-700/80" label={t('camera.timeline.statusCancelled')} />
+              <LegendItem swatch="bg-red-900/80" label={t('camera.timeline.statusFailed')} />
+              <span className="flex items-center gap-1.5">
+                <span className="w-2 h-2 rounded-full bg-amber-400 ring-1 ring-black/50" />
+                {t('camera.timeline.incompleteRecording')}
+              </span>
             </div>
           )}
         </CardContent>

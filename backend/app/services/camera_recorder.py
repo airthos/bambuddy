@@ -35,7 +35,7 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from backend.app.core import database as _database
 from backend.app.core.config import settings as app_settings
@@ -262,6 +262,22 @@ async def _stop_after_tail(session: RecordingSession, tail_seconds: int) -> None
     await _end_session(session, status="completed")
 
 
+async def _last_frame_dt(db, archive_id: int) -> datetime | None:
+    """Capture time of the session's last frame — the true end of a recording.
+
+    Orphaned/watchdog closes must derive stopped_at from this rather than
+    ``datetime.utcnow()``: a session closed hours later by the restart sweep
+    would otherwise get a stopped_at far past its final frame, inflating the
+    displayed duration to many hours (and overrunning later jobs on the
+    timeline). Returns None when the session captured no frames.
+    """
+    result = await db.execute(
+        select(func.max(CameraRecordingFrame.ts_ms)).where(CameraRecordingFrame.archive_id == archive_id)
+    )
+    ms = result.scalar_one_or_none()
+    return datetime.utcfromtimestamp(ms / 1000) if ms else None
+
+
 async def _end_session(session: RecordingSession, status: str) -> None:
     _active_sessions.pop(session.archive_id, None)
 
@@ -276,14 +292,26 @@ async def _end_session(session: RecordingSession, status: str) -> None:
     except Exception:
         logger.exception("Sentry: error unsubscribing archive %s", session.archive_id)
 
+    final_status = status
     async with _database.async_session() as db:
         result = await db.execute(
             select(CameraRecordingSession).where(CameraRecordingSession.archive_id == session.archive_id)
         )
         row = result.scalar_one_or_none()
         if row is not None:
-            row.status = status
-            row.stopped_at = datetime.utcnow()
+            # A watchdog orphan (never-running / disconnected) is only a *real*
+            # orphan if the print itself didn't finish. If the archive already
+            # reached a terminal state and we captured frames, the recording ran
+            # to the end -- record it as completed, not a scary "orphaned" (the
+            # printer commonly just drops offline right after the last frame).
+            if status == "orphaned" and session.frame_count > 0:
+                archive_row = (
+                    await db.execute(select(PrintArchive).where(PrintArchive.id == session.archive_id))
+                ).scalar_one_or_none()
+                if archive_row is not None and archive_row.status and archive_row.status != "printing":
+                    final_status = "completed"
+            row.status = final_status
+            row.stopped_at = (await _last_frame_dt(db, session.archive_id)) or row.started_at or datetime.utcnow()
             row.frame_count = session.frame_count
             row.size_bytes = session.size_bytes
             await db.commit()
@@ -291,7 +319,7 @@ async def _end_session(session: RecordingSession, status: str) -> None:
     logger.info(
         "Sentry: ended recording for archive %s (status=%s, frames=%s, bytes=%s)",
         session.archive_id,
-        status,
+        final_status,
         session.frame_count,
         session.size_bytes,
     )
@@ -494,11 +522,17 @@ async def reconcile_on_startup() -> None:
                     and printer_manager.is_connected(row.printer_id)
                 )
                 if not still_printing:
-                    row.status = "orphaned"
-                    row.stopped_at = datetime.utcnow()
+                    # Distinguish "the print finished, we just never got the
+                    # clean close" (record as completed) from "printer vanished
+                    # mid-print" (a genuinely truncated/orphaned recording).
+                    last_dt = await _last_frame_dt(db, row.archive_id)
+                    archive_done = archive is not None and archive.status and archive.status != "printing"
+                    row.status = "completed" if (archive_done and last_dt is not None) else "orphaned"
+                    row.stopped_at = last_dt or row.started_at
                     logger.info(
-                        "Sentry: closing orphaned recording for archive %s from a previous run (printer offline or job no longer printing)",
+                        "Sentry: closing leftover recording for archive %s as %s (printer offline or job no longer printing)",
                         row.archive_id,
+                        row.status,
                     )
                     continue
 
@@ -510,7 +544,7 @@ async def reconcile_on_startup() -> None:
                 printer = printer_result.scalar_one_or_none()
                 if printer is None:
                     row.status = "orphaned"
-                    row.stopped_at = datetime.utcnow()
+                    row.stopped_at = (await _last_frame_dt(db, row.archive_id)) or row.started_at
                     continue
 
                 if row.archive_id in _active_sessions:
@@ -528,7 +562,7 @@ async def reconcile_on_startup() -> None:
                 resumed = await start_session(printer, row.printer_id, row.archive_id, resume_row=row)
                 if not resumed:
                     row.status = "orphaned"
-                    row.stopped_at = datetime.utcnow()
+                    row.stopped_at = (await _last_frame_dt(db, row.archive_id)) or row.started_at
             except Exception:
                 # One bad row must never abort reconciliation for every other
                 # still-printing archive in this loop -- an unrelated bug
