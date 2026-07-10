@@ -445,6 +445,15 @@ export function SettingsPage() {
   });
   const sentryStorage = sentryStorageRaw ?? { total_bytes: 0, kept_forever_bytes: 0, categories: [] };
 
+  // Disk capacity, so recording storage can be shown against the whole drive.
+  const { data: systemInfo } = useQuery({
+    queryKey: ['system-info'],
+    queryFn: api.getSystemInfo,
+    enabled: activeTab === 'sentry',
+    staleTime: 30000,
+    refetchOnWindowFocus: false,
+  });
+
   const sentryRecordingQueries = useQueries({
     queries: sentryPrinters.map(p => ({
       queryKey: ['recordings', p.id],
@@ -6164,6 +6173,45 @@ export function SettingsPage() {
                 <p className="text-xs text-bambu-gray mt-1">{t('settings.sentryStorageDescription')}</p>
               </CardHeader>
               <CardContent>
+                {systemInfo && systemInfo.storage.disk_total_bytes > 0 && (() => {
+                  const disk = systemInfo.storage;
+                  const rec = sentryStorage.total_bytes;
+                  const recPct = (rec / disk.disk_total_bytes) * 100;
+                  const otherUsedPct = Math.max(0, (disk.disk_used_bytes - rec) / disk.disk_total_bytes * 100);
+                  return (
+                    <div className="mb-5">
+                      <div className="w-full h-3 bg-bambu-dark rounded-full overflow-hidden flex" title={t('settings.sentryDiskBarTitle')}>
+                        <div className="bg-bambu-green h-full" style={{ width: `${recPct}%` }} />
+                        <div className="bg-bambu-gray-dark/60 h-full" style={{ width: `${otherUsedPct}%` }} />
+                      </div>
+                      <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-xs">
+                        <div className="flex items-center gap-2">
+                          <span className="w-3 h-3 rounded-full bg-bambu-green" />
+                          <span className="text-bambu-gray">{t('settings.sentryDiskRecordings')}</span>
+                          <span className="text-white">{formatFileSize(rec)}</span>
+                          <span className="text-bambu-gray">({recPct.toFixed(1)}%)</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="w-3 h-3 rounded-full bg-bambu-gray-dark/60" />
+                          <span className="text-bambu-gray">{t('settings.sentryDiskOtherUsed')}</span>
+                          <span className="text-white">{formatFileSize(Math.max(0, disk.disk_used_bytes - rec))}</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <span className="w-3 h-3 rounded-full bg-bambu-dark border border-bambu-dark-tertiary" />
+                          <span className="text-bambu-gray">{t('settings.sentryDiskFree')}</span>
+                          <span className="text-white">{disk.disk_free_formatted}</span>
+                        </div>
+                      </div>
+                      <div className="mt-2 text-xs text-bambu-gray">
+                        {t('settings.sentryDiskCaption', {
+                          used: disk.disk_used_formatted,
+                          total: disk.disk_total_formatted,
+                          percent: disk.disk_percent_used.toFixed(0),
+                        })}
+                      </div>
+                    </div>
+                  );
+                })()}
                 {sentryStorage.categories.length === 0 ? (
                   <p className="text-sm text-bambu-gray">{t('settings.sentryNoRecordings')}</p>
                 ) : (
