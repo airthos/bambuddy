@@ -5197,6 +5197,19 @@ export const api = {
   },
   getSnapshotImageUrl: (printerId: number, snapshotId: number) =>
     withStreamToken(`${API_BASE}/printers/${printerId}/snapshots/${snapshotId}/image`),
+  downloadSnapshot: async (printerId: number, snapshotId: number, filename?: string): Promise<void> => {
+    const response = await fetch(withStreamToken(`${API_BASE}/printers/${printerId}/snapshots/${snapshotId}/image`));
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    const blob = await response.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename || `snapshot_${snapshotId}.jpg`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+  },
   downloadFrameSnapshot: async (printerId: number, archiveId: number, seq: number, filename?: string): Promise<void> => {
     const response = await fetch(
       withStreamToken(`${API_BASE}/printers/${printerId}/recordings/${archiveId}/frames/${seq}`)

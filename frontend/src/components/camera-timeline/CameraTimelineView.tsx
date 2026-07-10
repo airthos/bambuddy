@@ -16,6 +16,11 @@ import type { CameraRecordingSummary, Printer } from '../../api/client';
 // ImageBitmaps, and draws them to a <canvas> on a timer. No codec, no
 // MediaSource buffer -- so there is nothing that can stall "buffered but
 // frozen" the way the old all-intra HLS pipeline did.
+//
+// The same player also scrubs *standby clips*: the idle stretches between
+// jobs, played from the ambient interval snapshots (one JPEG each, fetched
+// per frame) instead of packed recording chunks. The clock/scrub/speed logic
+// is source-agnostic; only "get frame i's bytes" differs by mode.
 
 // Must match camera_frame_pack.CHUNK_FRAMES on the backend.
 const CHUNK_FRAMES = 50;
@@ -27,14 +32,19 @@ const BACK_CHUNKS = 2;
 // Decoded-bitmap window within loaded chunks.
 const BMP_AHEAD = 120;
 const BMP_BACK = 20;
+// Standby-clip frames are individual snapshot JPEGs, not packed chunks, so the
+// buffer window is counted in frames. Gaps hold few snapshots (one every N
+// minutes) so a generous window still costs little.
+const SNAP_AHEAD = 40;
+const SNAP_BACK = 10;
 // Real-time playback reproduces the true seconds between frames, but capture
 // has big idle gaps (printer offline / paused). Playing those out in real time
 // looks like a dead freeze on one frame; cap the per-frame dwell so idle time
 // is skipped fast instead of stalling.
 const MAX_GAP_SECONDS = 4;
-// Retries per chunk before giving up. A failed fetch must NEVER propagate into
-// the playback clock (that was the original freeze) -- loadChunk resolves to
-// null on give-up and the clock keeps ticking regardless.
+// Retries per chunk/snapshot before giving up. A failed fetch must NEVER
+// propagate into the playback clock (that was the original freeze) -- the
+// loader resolves to null on give-up and the clock keeps ticking regardless.
 const CHUNK_MAX_RETRIES = 6;
 
 const SPEEDS = [
@@ -72,6 +82,12 @@ interface JobBlock {
 }
 type TimelineBlock = GapBlock | JobBlock;
 
+// What the player is currently pointed at: a recording (packed chunks) or a
+// standby gap (interval snapshots in a time range).
+type Selection =
+  | { kind: 'recording'; archiveId: number }
+  | { kind: 'gap'; start: number; end: number };
+
 // The backend sends naive UTC timestamps with no 'Z'/offset -- parseUTCDate is
 // the app's standard fix (see utils/date.ts) so elapsed/duration readouts don't
 // silently shift by the local UTC offset.
@@ -107,6 +123,10 @@ function jobClass(r: CameraRecordingSummary): string {
   return 'bg-blue-600/70 text-white';
 }
 
+function jobLabel(r: CameraRecordingSummary): string {
+  return r.file ?? r.print_name ?? `#${r.archive_id}`;
+}
+
 function StatRow({ label, value }: { label: string; value: string }) {
   return (
     <div className="flex justify-between gap-3 mb-1">
@@ -134,7 +154,8 @@ function parseChunk(buf: ArrayBuffer): ParsedChunk {
 // A snapshot reduced to what the timeline needs: its id (for the image URL) and
 // its capture time in ms. Interval snapshots are an ambient log captured for
 // every active printer regardless of print state, so they exist during jobs and
-// in the idle gaps between them -- which is exactly what fills the filmstrip.
+// in the idle gaps between them -- which is what both fills the filmstrip and
+// makes the standby stretches scrubbable.
 interface SnapPoint {
   id: number;
   ms: number;
@@ -143,6 +164,9 @@ interface SnapPoint {
 // Naive-UTC ISO (no 'Z'/offset) to match how the backend stores/compares
 // captured_at; the 'since' query param is parsed as naive UTC there.
 const toNaiveUtcIso = (ms: number) => new Date(ms).toISOString().slice(0, 19);
+
+const shortTime = (ms: number) =>
+  new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 
 // Pick at most n items spread evenly across arr (keeps first & last). Used to
 // fit a span's snapshots into however many tiles its on-screen width allows
@@ -156,16 +180,19 @@ function sampleEvenly<T>(arr: T[], n: number): T[] {
   return out;
 }
 
-// One timeline block rendered as a strip of preview thumbnails with a thin
-// status bar on top. Gaps show the interval snapshots captured during them;
-// jobs show their in-window snapshots too, falling back to the recording's own
-// representative frame when a job is too short to contain a snapshot.
+// One timeline block rendered as a strip of preview thumbnails. Jobs stay
+// full-color under a colored status cap (thick on the main timeline) and get an
+// optional filename footer; idle gaps are desaturated and dimmed so recordings
+// read as distinct events, with an optional snapshot-count pill. Gaps that hold
+// snapshots are clickable to scrub as a standby clip.
 function FilmstripBlock({
   printerId,
   block,
   snaps,
   maxTiles,
-  showLabel,
+  thickCap,
+  jobFooter,
+  gapPill,
   selected,
   onClick,
   title,
@@ -176,7 +203,9 @@ function FilmstripBlock({
   block: TimelineBlock;
   snaps: SnapPoint[];
   maxTiles: number;
-  showLabel?: boolean;
+  thickCap?: boolean;
+  jobFooter?: string;
+  gapPill?: string;
   selected?: boolean;
   onClick?: () => void;
   title?: string;
@@ -194,13 +223,10 @@ function FilmstripBlock({
         ? [{ key: `t${block.recording.archive_id}`, src: api.getRecordingThumbnailUrl(printerId, block.recording.archive_id) }]
         : [];
 
-  const statusCls = isJob ? jobClass(block.recording) : 'bg-bambu-dark-tertiary';
-  const durLabel = formatDuration((block.end - block.start) / 1000);
-
   const inner = (
     <>
       {imgs.length > 0 && (
-        <div className="absolute inset-0 flex">
+        <div className="absolute inset-0 flex" style={isJob ? undefined : { filter: 'grayscale(0.7) brightness(0.55)' }}>
           {imgs.map(im => (
             <img
               key={im.key}
@@ -215,10 +241,19 @@ function FilmstripBlock({
           ))}
         </div>
       )}
-      <div className={`absolute top-0 left-0 right-0 h-1 ${statusCls}`} />
-      {showLabel && (
-        <span className="absolute bottom-0.5 left-0.5 text-[10px] leading-none text-white bg-bambu-dark/70 rounded px-1 py-0.5">
-          {durLabel}
+      {isJob ? (
+        <div className={`absolute top-0 left-0 right-0 ${thickCap ? 'h-1' : 'h-[3px]'} ${jobClass(block.recording)}`} />
+      ) : (
+        <div className="absolute top-0 left-0 right-0 h-[2px] bg-bambu-gray-dark/50" />
+      )}
+      {isJob && jobFooter && (
+        <div className="absolute inset-x-0 bottom-0 h-[18px] flex items-center px-1.5 bg-gradient-to-t from-black/80 to-transparent text-[10px] leading-none font-medium text-white truncate">
+          {jobFooter}
+        </div>
+      )}
+      {!isJob && gapPill && (
+        <span className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 text-[9px] font-mono text-bambu-gray bg-black/55 border border-bambu-dark-tertiary rounded-full px-1.5 py-0.5 whitespace-nowrap">
+          {gapPill}
         </span>
       )}
     </>
@@ -239,6 +274,69 @@ function FilmstripBlock({
   );
 }
 
+// Compact per-printer timeline in the camera picker: mirrors the main timeline
+// but time-proportional over the last 24h, with a hard NOW edge on the right so
+// a running print always butts up against it. Leads with the last job's file
+// preview (the same plate render bambuddy shows in Archives/Calendar).
+function MiniTimeline({
+  printerId,
+  blocks,
+  snaps,
+  dayAgo,
+  now,
+}: {
+  printerId: number;
+  blocks: TimelineBlock[];
+  snaps: SnapPoint[];
+  dayAgo: number;
+  now: number;
+}) {
+  const lastJob = [...blocks].reverse().find((b): b is JobBlock => b.type === 'job');
+  return (
+    <div className="flex gap-2">
+      <div className="w-11 h-11 shrink-0 rounded-md overflow-hidden border border-bambu-dark-tertiary bg-bambu-dark">
+        {lastJob && (
+          <img
+            src={api.getArchiveThumbnail(lastJob.recording.archive_id)}
+            alt=""
+            className="w-full h-full object-cover"
+            onError={e => {
+              e.currentTarget.style.visibility = 'hidden';
+            }}
+          />
+        )}
+      </div>
+      <div className="flex-1 min-w-0">
+        <div className="relative flex h-9 rounded overflow-hidden bg-bambu-dark-tertiary">
+          {blocks.map((b, i) => {
+            const clampedStart = Math.max(b.start, dayAgo);
+            const width = ((b.end - clampedStart) / (now - dayAgo)) * 100;
+            const approxPx = (width / 100) * 180;
+            const maxTiles = Math.max(1, Math.min(8, Math.floor(approxPx / 18)));
+            return (
+              <FilmstripBlock
+                key={i}
+                printerId={printerId}
+                block={{ ...b, start: clampedStart }}
+                snaps={snaps}
+                maxTiles={maxTiles}
+                className="h-full"
+                style={{ width: `${width}%` }}
+              />
+            );
+          })}
+          {/* Hard NOW edge — a live print's block ends here, so it reads as current. */}
+          <div className="absolute right-0 top-0 bottom-0 w-0.5 bg-white z-20" />
+        </div>
+        <div className="flex justify-between text-[10px] font-mono text-bambu-gray mt-1">
+          <span>-24h</span>
+          <span>now</span>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 interface CameraTimelineViewProps {
   printers: Printer[];
 }
@@ -247,7 +345,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
   const [activePrinterId, setActivePrinterId] = useState<number>(printers[0]?.id ?? 0);
-  const [selectedArchiveId, setSelectedArchiveId] = useState<number | null>(null);
+  const [selection, setSelection] = useState<Selection | null>(null);
   const [currentFrame, setCurrentFrame] = useState(0);
   const [playing, setPlaying] = useState(false);
   const [isBuffering, setIsBuffering] = useState(false);
@@ -255,6 +353,9 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   const [speedKey, setSpeedKey] = useState<(typeof SPEEDS)[number]['key']>('normal');
   const speed = SPEEDS.find(s => s.key === speedKey) ?? SPEEDS[1];
   const [liveFollow, setLiveFollow] = useState(false);
+
+  const selectedArchiveId = selection?.kind === 'recording' ? selection.archiveId : null;
+  const isGap = selection?.kind === 'gap';
 
   const recordingQueries = useQueries({
     queries: printers.map(p => ({
@@ -270,9 +371,9 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   }, [printers, recordingQueries]);
 
   // Ambient interval snapshots per printer over the retention window, used to
-  // fill the timelines with previews (see FilmstripBlock). Fetched once for the
-  // whole 7-day range so both the per-printer strip (24h slice) and the full
-  // active-printer timeline can slice out whatever range they show.
+  // fill the timelines with previews and to play back standby clips. Fetched
+  // once for the whole 7-day range so both the per-printer strip (24h slice)
+  // and the full active-printer timeline can slice out whatever range they show.
   const snapshotsSince = useMemo(() => toNaiveUtcIso(Date.now() - 7 * 24 * 3600000), []);
   const snapshotQueries = useQueries({
     queries: printers.map(p => ({
@@ -305,21 +406,38 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     enabled: selectedArchiveId != null,
     refetchInterval: isLiveRecording ? 2000 : false,
   });
-  const maxFrame = frameList && frameList.length > 0 ? frameList.length - 1 : 0;
 
-  // Frame i's start time in seconds from the recording's first frame; the delta
+  // The snapshots that make up the selected standby clip (gap mode).
+  const gapSnaps = useMemo(() => {
+    if (selection?.kind !== 'gap') return [];
+    return activeSnaps.filter(s => s.ms >= selection.start && s.ms <= selection.end);
+  }, [selection, activeSnaps]);
+
+  // Unified frame list the controls/scrub bar read, regardless of source.
+  const clipFrames: FrameMeta[] = useMemo(() => {
+    if (selection?.kind === 'recording') return frameList ?? [];
+    if (selection?.kind === 'gap') return gapSnaps.map((s, i) => ({ seq: i, ts_ms: s.ms }));
+    return [];
+  }, [selection, frameList, gapSnaps]);
+  const maxFrame = clipFrames.length > 0 ? clipFrames.length - 1 : 0;
+
+  // Frame i's start time in seconds from the clip's first frame; the delta
   // between consecutive entries is the real captured gap the playback clock
   // reproduces (capped by MAX_GAP_SECONDS).
   const frameTimes = useMemo(() => {
-    if (!frameList || frameList.length === 0) return [];
-    const t0 = frameList[0].ts_ms;
-    return frameList.map(f => (f.ts_ms - t0) / 1000);
-  }, [frameList]);
+    if (clipFrames.length === 0) return [];
+    const t0 = clipFrames[0].ts_ms;
+    return clipFrames.map(f => (f.ts_ms - t0) / 1000);
+  }, [clipFrames]);
 
   // --- Imperative player state (refs so the clock closure always sees latest) ---
   const canvasRef = useRef<HTMLCanvasElement>(null);
+  const modeRef = useRef<'recording' | 'gap'>('recording');
   const chunkCacheRef = useRef(new Map<number, ParsedChunk>());
   const chunkInflightRef = useRef(new Map<number, Promise<ParsedChunk | null>>());
+  const snapBlobRef = useRef(new Map<number, Blob>()); // gap: fetched JPEG per frame index
+  const snapInflightRef = useRef(new Map<number, Promise<Blob | null>>());
+  const snapIdsRef = useRef<number[]>([]); // gap: snapshot id per frame index
   const bmpRef = useRef(new Map<number, ImageBitmap>());
   const bmpDecodingRef = useRef(new Set<number>());
   const timerRef = useRef<number | undefined>(undefined);
@@ -375,7 +493,42 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     [updateBufferedBar]
   );
 
+  // Standby-clip counterpart of loadChunk: fetch one snapshot's JPEG for frame
+  // index i. Never throws -- resolves to null on give-up so the clock survives.
+  const loadSnapBlob = useCallback((i: number): Promise<Blob | null> => {
+    if (i < 0 || i >= snapIdsRef.current.length) return Promise.resolve(null);
+    const cached = snapBlobRef.current.get(i);
+    if (cached) return Promise.resolve(cached);
+    const inflight = snapInflightRef.current.get(i);
+    if (inflight) return inflight;
+
+    const { printerId } = idsRef.current;
+    const id = snapIdsRef.current[i];
+    const p = (async () => {
+      for (let tryN = 0; ; tryN++) {
+        try {
+          const r = await fetch(api.getSnapshotImageUrl(printerId, id));
+          if (!r.ok) throw new Error(`HTTP ${r.status}`);
+          const blob = await r.blob();
+          snapBlobRef.current.set(i, blob);
+          snapInflightRef.current.delete(i);
+          return blob;
+        } catch (e) {
+          console.warn(`[sentry] snapshot ${id} fetch failed (try ${tryN})`, e);
+          if (tryN >= CHUNK_MAX_RETRIES) {
+            snapInflightRef.current.delete(i);
+            return null;
+          }
+          await sleep(Math.min(2000, 150 * 2 ** tryN));
+        }
+      }
+    })();
+    snapInflightRef.current.set(i, p);
+    return p;
+  }, []);
+
   const frameBlob = useCallback((i: number): Blob | null => {
+    if (modeRef.current === 'gap') return snapBlobRef.current.get(i) ?? null;
     const chunk = chunkCacheRef.current.get(Math.floor(i / CHUNK_FRAMES));
     if (!chunk) return null;
     const local = i % CHUNK_FRAMES;
@@ -387,7 +540,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     async (i: number) => {
       if (bmpRef.current.has(i) || bmpDecodingRef.current.has(i)) return;
       const blob = frameBlob(i);
-      if (!blob) return; // chunk not resident yet
+      if (!blob) return; // bytes not resident yet
       bmpDecodingRef.current.add(i);
       try {
         bmpRef.current.set(i, await createImageBitmap(blob));
@@ -399,35 +552,53 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     [frameBlob]
   );
 
-  const evict = useCallback((centerFrame: number) => {
-    const centerChunk = Math.floor(centerFrame / CHUNK_FRAMES);
-    for (const ci of chunkCacheRef.current.keys()) {
-      if (ci < centerChunk - BACK_CHUNKS || ci > centerChunk + AHEAD_CHUNKS) chunkCacheRef.current.delete(ci);
-    }
-    for (const [i, b] of bmpRef.current) {
-      if (i < centerFrame - BMP_BACK || i > centerFrame + BMP_AHEAD || !chunkCacheRef.current.has(Math.floor(i / CHUNK_FRAMES))) {
-        b.close?.();
-        bmpRef.current.delete(i);
-      }
-    }
-  }, []);
-
   const prefetch = useCallback(
     (centerFrame: number) => {
+      if (modeRef.current === 'gap') {
+        for (let d = 0; d <= SNAP_AHEAD; d++) {
+          const j = centerFrame + d;
+          if (j < framesRef.current.length) loadSnapBlob(j).then(() => decodeFrame(j));
+        }
+        for (let d = 1; d <= SNAP_BACK; d++) {
+          const j = centerFrame - d;
+          if (j >= 0) loadSnapBlob(j).then(() => decodeFrame(j));
+        }
+        for (const i of snapBlobRef.current.keys()) {
+          if (i < centerFrame - SNAP_BACK || i > centerFrame + SNAP_AHEAD) snapBlobRef.current.delete(i);
+        }
+        for (const [i, b] of bmpRef.current) {
+          if (i < centerFrame - SNAP_BACK || i > centerFrame + SNAP_AHEAD) {
+            b.close?.();
+            bmpRef.current.delete(i);
+          }
+        }
+        return;
+      }
       const ci = Math.floor(centerFrame / CHUNK_FRAMES);
       for (let d = 0; d <= AHEAD_CHUNKS; d++) loadChunk(ci + d);
       for (let d = 1; d <= BACK_CHUNKS; d++) loadChunk(ci - d);
-      evict(centerFrame);
+      const centerChunk = Math.floor(centerFrame / CHUNK_FRAMES);
+      for (const c of chunkCacheRef.current.keys()) {
+        if (c < centerChunk - BACK_CHUNKS || c > centerChunk + AHEAD_CHUNKS) chunkCacheRef.current.delete(c);
+      }
+      for (const [i, b] of bmpRef.current) {
+        if (i < centerFrame - BMP_BACK || i > centerFrame + BMP_AHEAD || !chunkCacheRef.current.has(Math.floor(i / CHUNK_FRAMES))) {
+          b.close?.();
+          bmpRef.current.delete(i);
+        }
+      }
       updateBufferedBar();
     },
-    [loadChunk, evict, updateBufferedBar]
+    [loadChunk, loadSnapBlob, decodeFrame, updateBufferedBar]
   );
 
   const decodeWindow = useCallback(
     (center: number) => {
-      for (let d = 0; d <= BMP_AHEAD; d++) {
+      const ahead = modeRef.current === 'gap' ? SNAP_AHEAD : BMP_AHEAD;
+      const back = modeRef.current === 'gap' ? SNAP_BACK : BMP_BACK;
+      for (let d = 0; d <= ahead; d++) {
         if (center + d < framesRef.current.length) decodeFrame(center + d);
-        if (d <= BMP_BACK && center - d >= 0) decodeFrame(center - d);
+        if (d <= back && center - d >= 0) decodeFrame(center - d);
       }
     },
     [decodeFrame]
@@ -444,7 +615,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   }, []);
 
   // Renders frame i and keeps the buffer/decode windows filled around it.
-  // Never throws: if the chunk can't load it just holds the current frame, so
+  // Never throws: if the bytes can't load it just holds the current frame, so
   // the playback clock (scheduleNext) can never be killed by it.
   const showFrame = useCallback(
     async (i: number) => {
@@ -454,14 +625,25 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
       currentRef.current = i;
       let bmp = bmpRef.current.get(i);
       if (!bmp) {
-        const ci = Math.floor(i / CHUNK_FRAMES);
-        if (!chunkCacheRef.current.has(ci)) {
-          setIsBuffering(true);
-          await loadChunk(ci);
-        }
-        if (chunkCacheRef.current.has(ci)) {
-          await decodeFrame(i);
-          bmp = bmpRef.current.get(i);
+        if (modeRef.current === 'gap') {
+          if (!snapBlobRef.current.has(i)) {
+            setIsBuffering(true);
+            await loadSnapBlob(i);
+          }
+          if (snapBlobRef.current.has(i)) {
+            await decodeFrame(i);
+            bmp = bmpRef.current.get(i);
+          }
+        } else {
+          const ci = Math.floor(i / CHUNK_FRAMES);
+          if (!chunkCacheRef.current.has(ci)) {
+            setIsBuffering(true);
+            await loadChunk(ci);
+          }
+          if (chunkCacheRef.current.has(ci)) {
+            await decodeFrame(i);
+            bmp = bmpRef.current.get(i);
+          }
         }
       }
       setIsBuffering(false);
@@ -470,7 +652,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
       prefetch(i);
       decodeWindow(i);
     },
-    [loadChunk, decodeFrame, drawFrame, prefetch, decodeWindow]
+    [loadChunk, loadSnapBlob, decodeFrame, drawFrame, prefetch, decodeWindow]
   );
 
   const stopPlayback = useCallback(() => {
@@ -527,11 +709,21 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     [stopPlayback, showFrame]
   );
 
-  // Reset the whole player when the selected recording (or printer) changes.
+  // Key that changes exactly when the player must reset (new clip or printer).
+  const clipKey = selection
+    ? selection.kind === 'recording'
+      ? `r:${selection.archiveId}`
+      : `g:${selection.start}:${selection.end}`
+    : null;
+
+  // Reset the whole player when the selected clip (or printer) changes.
   useEffect(() => {
     stopPlayback();
     chunkCacheRef.current.clear();
     chunkInflightRef.current.clear();
+    snapBlobRef.current.clear();
+    snapInflightRef.current.clear();
+    snapIdsRef.current = [];
     bmpRef.current.forEach(b => b.close?.());
     bmpRef.current.clear();
     bmpDecodingRef.current.clear();
@@ -541,30 +733,35 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     setBufferedChunks([]);
     setIsBuffering(false);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedArchiveId, activePrinterId]);
+  }, [clipKey, activePrinterId]);
 
   // Sync the latest frame data into the player refs; render the first frame
   // once frames arrive, and keep pinned to the live edge while following.
   useEffect(() => {
-    if (!frameList || selectedArchiveId == null) return;
-    framesRef.current = frameList;
-    frameTimesRef.current = frameList.length > 0 ? frameList.map(f => (f.ts_ms - frameList[0].ts_ms) / 1000) : [];
-    idsRef.current = { printerId: activePrinterId, archiveId: selectedArchiveId };
-    chunkCountRef.current = Math.ceil(frameList.length / CHUNK_FRAMES);
-    // The trailing chunk of a still-recording session grows -- drop it from the
-    // cache so it refetches with the newest frames.
-    if (isLiveRecording && chunkCountRef.current > 0) {
-      chunkCacheRef.current.delete(chunkCountRef.current - 1);
+    if (selection == null || clipFrames.length === 0) return;
+    modeRef.current = selection.kind === 'gap' ? 'gap' : 'recording';
+    framesRef.current = clipFrames;
+    frameTimesRef.current = clipFrames.map(f => (f.ts_ms - clipFrames[0].ts_ms) / 1000);
+    idsRef.current = { printerId: activePrinterId, archiveId: selectedArchiveId ?? 0 };
+    if (selection.kind === 'gap') {
+      snapIdsRef.current = gapSnaps.map(s => s.id);
+      chunkCountRef.current = 0;
+    } else {
+      chunkCountRef.current = Math.ceil(clipFrames.length / CHUNK_FRAMES);
+      // The trailing chunk of a still-recording session grows -- drop it from
+      // the cache so it refetches with the newest frames.
+      if (isLiveRecording && chunkCountRef.current > 0) {
+        chunkCacheRef.current.delete(chunkCountRef.current - 1);
+      }
     }
-    if (frameList.length === 0) return;
     if (!firstRenderRef.current) {
       firstRenderRef.current = true;
-      showFrame(liveFollow && isLiveRecording ? frameList.length - 1 : 0);
+      showFrame(liveFollow && isLiveRecording ? clipFrames.length - 1 : 0);
     } else if (liveFollow && isLiveRecording && !playingRef.current) {
-      showFrame(frameList.length - 1);
+      showFrame(clipFrames.length - 1);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [frameList, activePrinterId, selectedArchiveId]);
+  }, [clipFrames, activePrinterId, selection]);
 
   // Teardown on unmount.
   useEffect(() => {
@@ -577,13 +774,13 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
 
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
-      if (selectedArchiveId == null) return;
+      if (selection == null) return;
       if (e.key === 'ArrowLeft') nudge(-1);
       if (e.key === 'ArrowRight') nudge(1);
     }
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [selectedArchiveId, nudge]);
+  }, [selection, nudge]);
 
   const keepForeverMutation = useMutation({
     mutationFn: ({ archiveId, keep }: { archiveId: number; keep: boolean }) =>
@@ -597,12 +794,15 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     mutationFn: ({ archiveId, seq }: { archiveId: number; seq: number }) =>
       api.downloadFrameSnapshot(activePrinterId, archiveId, seq),
   });
+  const downloadSnapshotMutation = useMutation({
+    mutationFn: (snapshotId: number) => api.downloadSnapshot(activePrinterId, snapshotId),
+  });
   const deleteMutation = useMutation({
     mutationFn: (archiveId: number) => api.deleteRecording(activePrinterId, archiveId),
     onSuccess: (_data, archiveId) => {
       queryClient.invalidateQueries({ queryKey: ['recordings', activePrinterId] });
       if (selectedArchiveId === archiveId) {
-        setSelectedArchiveId(null);
+        setSelection(null);
         stopPlayback();
       }
     },
@@ -610,72 +810,60 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
 
   function selectRecording(r: CameraRecordingSummary) {
     stopPlayback();
-    setSelectedArchiveId(r.archive_id);
+    setSelection({ kind: 'recording', archiveId: r.archive_id });
     setLiveFollow(r.status === 'recording');
+  }
+  function selectGap(start: number, end: number) {
+    stopPlayback();
+    setSelection({ kind: 'gap', start, end });
+    setLiveFollow(false);
   }
 
   const now = Date.now();
   const dayAgo = now - 24 * 3600000;
-  const currentTsMs = frameList?.[currentFrame]?.ts_ms;
+  const currentTsMs = clipFrames[currentFrame]?.ts_ms;
   const playheadSec = frameTimes[currentFrame] ?? 0;
   const totalSec = frameTimes.length > 0 ? frameTimes[frameTimes.length - 1] : 0;
   const remainingSec = Math.max(0, totalSec - playheadSec);
+  const hasClip = selection != null && clipFrames.length > 0;
+  const downloadFramePending = downloadFrameMutation.isPending || downloadSnapshotMutation.isPending;
+
+  // Widths (px) for the main timeline blocks; shared by the rail and the strip
+  // so the boundary ticks line up with the block edges.
+  const blockWidths = activeTimeline.map(b => Math.max(44, Math.min(360, ((b.end - b.start) / 3600000) * 90)));
 
   return (
     <div className="flex flex-col gap-3 h-full min-h-0">
-      {/* Printer strip — 24h preview per printer: raw (time-proportional) + events (one tick per job) */}
+      {/* Printer picker — a mini mirror of the main timeline per printer */}
       <div className="flex gap-3 overflow-x-auto pb-1 shrink-0">
         {printers.map(p => {
           const recs = (recordingsByPrinter.get(p.id) ?? []).filter(r => recordingEnd(r) > dayAgo);
           const isLive = recs.some(r => r.status === 'recording');
           const blocks = buildTimeline(recs);
-          const jobBlocks = blocks.filter((b): b is JobBlock => b.type === 'job');
           return (
             <button
               key={p.id}
-              onClick={() => { setActivePrinterId(p.id); setSelectedArchiveId(null); }}
-              className={`shrink-0 w-56 text-left rounded-xl border p-3 transition-colors bg-bambu-dark-secondary ${
+              onClick={() => {
+                setActivePrinterId(p.id);
+                setSelection(null);
+              }}
+              className={`shrink-0 w-64 text-left rounded-xl border p-3 transition-colors bg-bambu-dark-secondary ${
                 activePrinterId === p.id ? 'border-bambu-green' : 'border-bambu-dark-tertiary hover:border-bambu-gray-dark'
               }`}
             >
-              <div className="flex items-center justify-between text-sm mb-2">
+              <div className="flex items-center gap-2 mb-2">
                 <span className="font-medium text-white truncate">{p.name}</span>
-                <span className={isLive ? 'text-bambu-green text-xs font-semibold shrink-0' : 'text-bambu-gray text-xs shrink-0'}>
+                <span
+                  className={`ml-auto shrink-0 text-[10px] font-semibold px-2 py-0.5 rounded-full border ${
+                    isLive
+                      ? 'bg-bambu-green/15 text-bambu-green border-bambu-green/40'
+                      : 'bg-bambu-dark-tertiary text-bambu-gray border-bambu-dark-tertiary'
+                  }`}
+                >
                   {isLive ? t('camera.timeline.printing') : t('camera.timeline.idle')}
                 </span>
               </div>
-              <div className="flex h-10 rounded overflow-hidden bg-bambu-dark-tertiary" title={t('camera.timeline.rawTimeline')}>
-                {blocks.map((b, i) => {
-                  const clampedStart = Math.max(b.start, dayAgo);
-                  const width = ((b.end - clampedStart) / (now - dayAgo)) * 100;
-                  const approxPx = (width / 100) * 200; // card content ≈ 200px wide
-                  const maxTiles = Math.max(1, Math.min(8, Math.floor(approxPx / 20)));
-                  return (
-                    <FilmstripBlock
-                      key={i}
-                      printerId={p.id}
-                      block={{ ...b, start: clampedStart }}
-                      snaps={snapshotsByPrinter.get(p.id) ?? []}
-                      maxTiles={maxTiles}
-                      className="h-full"
-                      style={{ width: `${width}%` }}
-                    />
-                  );
-                })}
-              </div>
-              <div className="flex justify-between text-[10px] text-bambu-gray mt-1 mb-1.5">
-                <span>{t('camera.timeline.hoursAgo', { count: 24 })}</span>
-                <span>{t('camera.timeline.now')}</span>
-              </div>
-              <div className="flex gap-0.5 h-1.5" title={t('camera.timeline.eventsTimeline')}>
-                {jobBlocks.length === 0 ? (
-                  <div className="flex-1 rounded-full bg-bambu-dark-tertiary opacity-40" />
-                ) : (
-                  jobBlocks.map((b, i) => (
-                    <div key={i} className={`flex-1 rounded-full ${jobClass(b.recording)}`} />
-                  ))
-                )}
-              </div>
+              <MiniTimeline printerId={p.id} blocks={blocks} snaps={snapshotsByPrinter.get(p.id) ?? []} dayAgo={dayAgo} now={now} />
             </button>
           );
         })}
@@ -684,34 +872,65 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
       {/* Viewport + stats overlay. min-h-0 lets flex-1 size this box to the
           remaining space rather than the canvas's intrinsic size. */}
       <Card className="relative flex-1 min-h-0 flex items-center justify-center overflow-hidden">
-        {!selectedRecording ? (
+        {!selection ? (
           <p className="text-bambu-gray text-sm px-6 text-center">{t('camera.timeline.selectPrompt')}</p>
         ) : (
           <>
-            <div className="absolute top-3 left-3 bg-bambu-dark/90 border border-bambu-dark-tertiary rounded-lg p-3 text-xs min-w-[190px] z-10">
-              <p className="text-white font-medium mb-2 truncate">{selectedRecording.file ?? selectedRecording.print_name ?? `#${selectedRecording.archive_id}`}</p>
-              <StatRow label={t('camera.timeline.stats.printer')} value={printers.find(p => p.id === selectedRecording.printer_id)?.name ?? '—'} />
-              <StatRow label={t('camera.timeline.stats.filament')} value={selectedRecording.filament_type ?? '—'} />
-              <StatRow
-                label={t('camera.timeline.stats.start')}
-                value={parseUTCDate(selectedRecording.started_at)?.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) ?? '—'}
-              />
-              <StatRow
-                label={isLiveRecording ? t('camera.timeline.stats.elapsed') : t('camera.timeline.stats.duration')}
-                value={formatDuration((recordingEnd(selectedRecording) - recordingStart(selectedRecording)) / 1000)}
-              />
-              <StatRow label={t('settings.sentryFrames')} value={String(selectedRecording.frame_count)} />
-              <span className={`inline-block mt-2 px-2 py-0.5 rounded text-[10px] font-semibold ${jobClass(selectedRecording)}`}>
-                {(selectedRecording.archive_status ?? selectedRecording.status).toUpperCase()}
-              </span>
-            </div>
+            {isGap ? (
+              <div className="absolute top-3 left-3 bg-bambu-dark/90 border border-bambu-dark-tertiary rounded-lg p-3 text-xs min-w-[190px] z-10">
+                <p className="text-white font-medium mb-2">{t('camera.timeline.standby')}</p>
+                <StatRow label={t('camera.timeline.stats.printer')} value={printers.find(p => p.id === activePrinterId)?.name ?? '—'} />
+                <StatRow label={t('camera.timeline.stats.start')} value={selection.kind === 'gap' ? shortTime(selection.start) : '—'} />
+                <StatRow
+                  label={t('camera.timeline.stats.duration')}
+                  value={selection.kind === 'gap' ? formatDuration((selection.end - selection.start) / 1000) : '—'}
+                />
+                <StatRow label={t('camera.timeline.snapshots')} value={String(clipFrames.length)} />
+                <span className="inline-block mt-2 px-2 py-0.5 rounded text-[10px] font-semibold bg-bambu-dark-tertiary text-bambu-gray">
+                  {t('camera.timeline.standby').toUpperCase()}
+                </span>
+              </div>
+            ) : (
+              selectedRecording && (
+                <div className="absolute top-3 left-3 bg-bambu-dark/90 border border-bambu-dark-tertiary rounded-lg p-3 text-xs min-w-[190px] z-10">
+                  <div className="flex gap-2 items-center mb-2">
+                    <img
+                      src={api.getArchiveThumbnail(selectedRecording.archive_id)}
+                      alt=""
+                      className="w-11 h-11 shrink-0 rounded object-cover border border-bambu-dark-tertiary bg-bambu-dark"
+                      onError={e => {
+                        e.currentTarget.style.display = 'none';
+                      }}
+                    />
+                    <p className="text-white font-medium truncate">{jobLabel(selectedRecording)}</p>
+                  </div>
+                  <StatRow label={t('camera.timeline.stats.printer')} value={printers.find(p => p.id === selectedRecording.printer_id)?.name ?? '—'} />
+                  <StatRow label={t('camera.timeline.stats.filament')} value={selectedRecording.filament_type ?? '—'} />
+                  <StatRow
+                    label={t('camera.timeline.stats.start')}
+                    value={parseUTCDate(selectedRecording.started_at)?.toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) ?? '—'}
+                  />
+                  <StatRow
+                    label={isLiveRecording ? t('camera.timeline.stats.elapsed') : t('camera.timeline.stats.duration')}
+                    value={formatDuration((recordingEnd(selectedRecording) - recordingStart(selectedRecording)) / 1000)}
+                  />
+                  <StatRow label={t('settings.sentryFrames')} value={String(selectedRecording.frame_count)} />
+                  <span className={`inline-block mt-2 px-2 py-0.5 rounded text-[10px] font-semibold ${jobClass(selectedRecording)}`}>
+                    {(selectedRecording.archive_status ?? selectedRecording.status).toUpperCase()}
+                  </span>
+                </div>
+              )
+            )}
 
             {isLiveRecording && !liveFollow && (
               <Button
                 variant="primary"
                 size="sm"
                 className="absolute top-3 right-3 z-10"
-                onClick={() => { setLiveFollow(true); if (maxFrame > 0) showFrame(maxFrame); }}
+                onClick={() => {
+                  setLiveFollow(true);
+                  if (maxFrame > 0) showFrame(maxFrame);
+                }}
               >
                 {t('camera.timeline.jumpToLive')}
               </Button>
@@ -737,7 +956,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
                     </div>
                   </div>
                 )}
-                {(!frameList || frameList.length === 0) && (
+                {clipFrames.length === 0 && (
                   <p className="absolute text-bambu-gray text-sm">{t('settings.sentryNoRecordings')}</p>
                 )}
               </>
@@ -758,17 +977,12 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
       </Card>
 
       {/* Playback controls */}
-      {selectedRecording && (
+      {selection && (
         <div className="flex flex-wrap items-center gap-3 shrink-0">
           <Button variant="secondary" size="sm" onClick={() => nudge(-1)} title={t('camera.timeline.prevFrame')}>
             <SkipBack className="w-4 h-4" />
           </Button>
-          <Button
-            variant="primary"
-            size="sm"
-            onClick={() => (playing ? stopPlayback() : startPlayback())}
-            disabled={!frameList || frameList.length === 0}
-          >
+          <Button variant="primary" size="sm" onClick={() => (playing ? stopPlayback() : startPlayback())} disabled={!hasClip}>
             {playing ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4" />}
           </Button>
           <Button variant="secondary" size="sm" onClick={() => nudge(1)} title={t('camera.timeline.nextFrame')}>
@@ -776,7 +990,7 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
           </Button>
           <span className="font-mono text-xs text-bambu-gray shrink-0 tabular-nums">{formatMediaTime(playheadSec)}</span>
           <div className="relative flex-1 min-w-[120px] h-4 flex items-center">
-            {frameTimes.length > 0 && (
+            {!isGap && frameTimes.length > 0 && (
               // Light-gray = resident (buffered) chunks behind the scrub thumb.
               <div className="absolute left-0 h-1 w-full rounded-full bg-bambu-dark-tertiary overflow-hidden pointer-events-none">
                 {bufferedChunks.map(ci => {
@@ -822,43 +1036,51 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
             ))}
           </select>
           <button
-            onClick={() =>
-              frameList &&
-              downloadFrameMutation.mutate({ archiveId: selectedRecording.archive_id, seq: frameList[currentFrame].seq })
-            }
+            onClick={() => {
+              if (selection.kind === 'gap') {
+                const s = gapSnaps[currentFrame];
+                if (s) downloadSnapshotMutation.mutate(s.id);
+              } else if (selectedRecording && clipFrames[currentFrame]) {
+                downloadFrameMutation.mutate({ archiveId: selectedRecording.archive_id, seq: clipFrames[currentFrame].seq });
+              }
+            }}
             title={t('camera.timeline.downloadFrame')}
             className="text-bambu-gray hover:text-white disabled:opacity-50"
-            disabled={downloadFrameMutation.isPending || !frameList || frameList.length === 0}
+            disabled={downloadFramePending || !hasClip}
           >
-            {downloadFrameMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <ImageDown className="w-4 h-4" />}
+            {downloadFramePending ? <Loader2 className="w-4 h-4 animate-spin" /> : <ImageDown className="w-4 h-4" />}
           </button>
-          <button
-            onClick={() => downloadMutation.mutate(selectedRecording.archive_id)}
-            title={t('camera.timeline.download')}
-            className="text-bambu-gray hover:text-white disabled:opacity-50"
-            disabled={downloadMutation.isPending || !frameList || frameList.length === 0}
-          >
-            {downloadMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
-          </button>
-          <button
-            onClick={() => keepForeverMutation.mutate({ archiveId: selectedRecording.archive_id, keep: !selectedRecording.keep_forever })}
-            title={t('settings.sentryKeepForever')}
-            className={selectedRecording.keep_forever ? 'text-bambu-green' : 'text-bambu-gray hover:text-white'}
-          >
-            <Star className="w-4 h-4" fill={selectedRecording.keep_forever ? 'currentColor' : 'none'} />
-          </button>
-          <button
-            onClick={() => deleteMutation.mutate(selectedRecording.archive_id)}
-            title={t('settings.sentryDeleteRecording')}
-            className="text-bambu-gray hover:text-red-400"
-            disabled={isLiveRecording}
-          >
-            <Trash2 className="w-4 h-4" />
-          </button>
+          {selection.kind === 'recording' && selectedRecording && (
+            <>
+              <button
+                onClick={() => downloadMutation.mutate(selectedRecording.archive_id)}
+                title={t('camera.timeline.download')}
+                className="text-bambu-gray hover:text-white disabled:opacity-50"
+                disabled={downloadMutation.isPending || !hasClip}
+              >
+                {downloadMutation.isPending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+              </button>
+              <button
+                onClick={() => keepForeverMutation.mutate({ archiveId: selectedRecording.archive_id, keep: !selectedRecording.keep_forever })}
+                title={t('settings.sentryKeepForever')}
+                className={selectedRecording.keep_forever ? 'text-bambu-green' : 'text-bambu-gray hover:text-white'}
+              >
+                <Star className="w-4 h-4" fill={selectedRecording.keep_forever ? 'currentColor' : 'none'} />
+              </button>
+              <button
+                onClick={() => deleteMutation.mutate(selectedRecording.archive_id)}
+                title={t('settings.sentryDeleteRecording')}
+                className="text-bambu-gray hover:text-red-400"
+                disabled={isLiveRecording}
+              >
+                <Trash2 className="w-4 h-4" />
+              </button>
+            </>
+          )}
         </div>
       )}
 
-      {/* Full timeline for the active printer — raw/time-proportional */}
+      {/* Full timeline for the active printer — time rail + boundary ticks (Option C) */}
       <Card className="shrink-0">
         <CardHeader className="flex items-center justify-between text-xs text-bambu-gray" dense>
           <span className="text-white font-medium">{printers.find(p => p.id === activePrinterId)?.name}</span>
@@ -868,30 +1090,49 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
           {activeTimeline.length === 0 ? (
             <p className="text-sm text-bambu-gray">{t('settings.sentryNoRecordings')}</p>
           ) : (
-            <div className="flex h-20 min-w-max">
-              {activeTimeline.map((b, i) => {
-                const durMs = b.end - b.start;
-                const widthPx = Math.max(44, Math.min(360, (durMs / 3600000) * 90));
-                const maxTiles = Math.max(1, Math.min(16, Math.floor(widthPx / 28)));
-                const isJob = b.type === 'job';
-                const title = isJob
-                  ? `${b.recording.file ?? ''} — ${formatDuration(durMs / 1000)} — ${b.recording.archive_status ?? b.recording.status} — ${formatFileSize(b.recording.size_bytes)}`
-                  : `${t('camera.timeline.idle')} — ${formatDuration(durMs / 1000)}`;
-                return (
-                  <FilmstripBlock
-                    key={i}
-                    printerId={activePrinterId}
-                    block={b}
-                    snaps={activeSnaps}
-                    maxTiles={maxTiles}
-                    showLabel
-                    title={title}
-                    selected={isJob && selectedArchiveId === b.recording.archive_id}
-                    onClick={isJob ? () => selectRecording(b.recording) : undefined}
-                    style={{ width: widthPx }}
-                  />
-                );
-              })}
+            <div className="min-w-max">
+              {/* Boundary rail: a tick + timestamp at the start of each block. */}
+              <div className="flex h-5">
+                {activeTimeline.map((b, i) => (
+                  <div key={i} style={{ width: blockWidths[i] }} className="relative shrink-0">
+                    <div className="absolute left-0 top-3 h-2 w-px bg-bambu-gray-dark" />
+                    {blockWidths[i] >= 46 && (
+                      <span className="absolute left-1 top-0 text-[9px] font-mono text-bambu-gray whitespace-nowrap">{shortTime(b.start)}</span>
+                    )}
+                  </div>
+                ))}
+              </div>
+              <div className="flex h-20">
+                {activeTimeline.map((b, i) => {
+                  const durMs = b.end - b.start;
+                  const widthPx = blockWidths[i];
+                  const maxTiles = Math.max(1, Math.min(16, Math.floor(widthPx / 28)));
+                  const isJob = b.type === 'job';
+                  const inRange = isJob ? [] : activeSnaps.filter(s => s.ms >= b.start && s.ms <= b.end);
+                  const title = isJob
+                    ? `${jobLabel(b.recording)} — ${formatDuration(durMs / 1000)} — ${b.recording.archive_status ?? b.recording.status} — ${formatFileSize(b.recording.size_bytes)}`
+                    : `${t('camera.timeline.standby')} — ${formatDuration(durMs / 1000)} — ${inRange.length} ${t('camera.timeline.snapsLabel')}`;
+                  const selected = isJob
+                    ? selection?.kind === 'recording' && selection.archiveId === b.recording.archive_id
+                    : selection?.kind === 'gap' && selection.start === b.start && selection.end === b.end;
+                  return (
+                    <FilmstripBlock
+                      key={i}
+                      printerId={activePrinterId}
+                      block={b}
+                      snaps={activeSnaps}
+                      maxTiles={maxTiles}
+                      thickCap
+                      jobFooter={isJob ? jobLabel(b.recording) : undefined}
+                      gapPill={!isJob ? `${inRange.length} ${t('camera.timeline.snapsLabel')}` : undefined}
+                      selected={selected}
+                      title={title}
+                      onClick={isJob ? () => selectRecording(b.recording) : inRange.length > 0 ? () => selectGap(b.start, b.end) : undefined}
+                      style={{ width: widthPx }}
+                    />
+                  );
+                })}
+              </div>
             </div>
           )}
         </CardContent>
