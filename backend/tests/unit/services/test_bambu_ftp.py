@@ -21,6 +21,7 @@ import pytest
 from backend.app.services.bambu_ftp import (
     BambuFTPClient,
     FileNotOnPrinterError,
+    UploadRejectedError,
     cache_3mf_download,
     clear_3mf_cache,
     delete_file_async,
@@ -384,6 +385,31 @@ class TestUpload:
         client.connect()
         result = client.upload_file(local, "/cache/test.bin")
         assert result is False
+        client.disconnect()
+
+    def test_upload_550_raises_when_raise_on_reject(self, ftp_client_factory, ftp_server, tmp_path):
+        """With raise_on_reject, a STOR rejected by a connected printer raises
+        UploadRejectedError so the dispatch layer can reconnect the printer,
+        instead of the ambiguous False that looks like any other failure."""
+        ftp_server.inject_failure("STOR", 550, "Permission denied.")
+        local = tmp_path / "test.bin"
+        local.write_bytes(b"data")
+        client = ftp_client_factory()
+        client.connect()
+        with pytest.raises(UploadRejectedError):
+            client.upload_file(local, "/cache/test.bin", raise_on_reject=True)
+        client.disconnect()
+
+    def test_upload_550_returns_false_without_raise_on_reject(self, ftp_client_factory, ftp_server, tmp_path):
+        """Default behavior is unchanged: without raise_on_reject a rejected STOR
+        still returns False, so existing callers (background_dispatch, firmware)
+        are unaffected."""
+        ftp_server.inject_failure("STOR", 550, "Permission denied.")
+        local = tmp_path / "test.bin"
+        local.write_bytes(b"data")
+        client = ftp_client_factory()
+        client.connect()
+        assert client.upload_file(local, "/cache/test.bin") is False
         client.disconnect()
 
     def test_upload_426_with_intact_file_proceeds(self, ftp_client_factory, ftp_server, tmp_path):

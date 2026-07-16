@@ -30,6 +30,7 @@ from backend.app.core.database import Base
 from backend.app.models.archive import PrintArchive
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
+from backend.app.services.bambu_ftp import UploadRejectedError
 from backend.app.services.print_scheduler import PrintScheduler
 
 PRINTER_ID = 1
@@ -80,32 +81,47 @@ async def _make_db(tmp_path):
     return engine, session_maker
 
 
-def _ftp_failure_patches(scheduler, tmp_path, uploaded: bool):
-    """Patch every dependency _start_print touches up to (and through) the FTP call."""
+def _ftp_failure_patches(scheduler, tmp_path, uploaded: bool, reject: bool = False):
+    """Patch every dependency _start_print touches up to (and through) the FTP call.
+
+    ``reject=True`` makes the upload raise UploadRejectedError (printer refused the
+    STOR) instead of returning ``uploaded``, so tests can exercise the
+    reconnect-before-retry recovery path.
+    """
     mock_pm = MagicMock()
     mock_pm.is_connected.return_value = True
     mock_pm.get_status.return_value = SimpleNamespace(state="FINISH", subtask_id="s1", gcode_file=None)
+    # connect_printer is awaited by the FTP-wedge recovery path.
+    mock_pm.connect_printer = AsyncMock(return_value=True)
 
     notif = MagicMock()
     notif.on_queue_job_failed = AsyncMock()
 
-    return [
-        patch.object(settings, "base_dir", tmp_path),
-        patch("backend.app.services.print_scheduler.printer_manager", mock_pm),
-        patch(
-            "backend.app.services.print_scheduler.get_ftp_retry_settings",
-            AsyncMock(return_value=(False, 0, 0.0, 30.0)),
-        ),
-        patch("backend.app.services.print_scheduler.delete_file_async", AsyncMock(return_value=True)),
-        patch("backend.app.services.print_scheduler.upload_file_async", AsyncMock(return_value=uploaded)),
-        patch("backend.app.services.print_scheduler.notification_service", notif),
-        patch.object(scheduler, "_power_off_if_needed", AsyncMock()),
-    ], notif
+    upload_mock = (
+        AsyncMock(side_effect=UploadRejectedError("STOR rejected 550")) if reject else AsyncMock(return_value=uploaded)
+    )
+
+    return (
+        [
+            patch.object(settings, "base_dir", tmp_path),
+            patch("backend.app.services.print_scheduler.printer_manager", mock_pm),
+            patch(
+                "backend.app.services.print_scheduler.get_ftp_retry_settings",
+                AsyncMock(return_value=(False, 0, 0.0, 30.0)),
+            ),
+            patch("backend.app.services.print_scheduler.delete_file_async", AsyncMock(return_value=True)),
+            patch("backend.app.services.print_scheduler.upload_file_async", upload_mock),
+            patch("backend.app.services.print_scheduler.notification_service", notif),
+            patch.object(scheduler, "_power_off_if_needed", AsyncMock()),
+        ],
+        notif,
+        mock_pm,
+    )
 
 
-async def _dispatch_once(scheduler, session_maker, tmp_path, uploaded=False):
-    """Run _start_print for item 500 with FTP returning `uploaded`; return the reloaded item."""
-    patches, notif = _ftp_failure_patches(scheduler, tmp_path, uploaded)
+async def _dispatch_once(scheduler, session_maker, tmp_path, uploaded=False, reject=False):
+    """Run _start_print for item 500; return (reloaded item, notif mock, printer_manager mock)."""
+    patches, notif, mock_pm = _ftp_failure_patches(scheduler, tmp_path, uploaded, reject)
     async with session_maker() as db:
         item = (await db.execute(select(PrintQueueItem).where(PrintQueueItem.id == 500))).scalar_one()
         from contextlib import ExitStack
@@ -115,7 +131,7 @@ async def _dispatch_once(scheduler, session_maker, tmp_path, uploaded=False):
                 stack.enter_context(p)
             await scheduler._start_print(db, item)
         reloaded = (await db.execute(select(PrintQueueItem).where(PrintQueueItem.id == 500))).scalar_one()
-    return reloaded, notif
+    return reloaded, notif, mock_pm
 
 
 class TestFtpFailureArmsCooldown:
@@ -143,7 +159,7 @@ class TestFtpFailureRetryThenFail:
 
         # Attempts 1 and 2 → requeued as pending, no failure notification.
         for expected_attempt in (1, 2):
-            item, notif = await _dispatch_once(scheduler, session_maker, tmp_path, uploaded=False)
+            item, notif, _ = await _dispatch_once(scheduler, session_maker, tmp_path, uploaded=False)
             assert item.status == "pending", f"attempt {expected_attempt} should requeue"
             assert item.started_at is None
             assert item.completed_at is None
@@ -151,7 +167,7 @@ class TestFtpFailureRetryThenFail:
             notif.on_queue_job_failed.assert_not_called()
 
         # Attempt 3 → hard failure, notification sent, counter cleared.
-        item, notif = await _dispatch_once(scheduler, session_maker, tmp_path, uploaded=False)
+        item, notif, _ = await _dispatch_once(scheduler, session_maker, tmp_path, uploaded=False)
         assert item.status == "failed"
         assert item.completed_at is not None
         assert "3 attempts" in (item.error_message or "")
@@ -202,4 +218,44 @@ class TestCheckQueueHonoursHold:
         async with session_maker() as db:
             item = (await db.execute(select(PrintQueueItem).where(PrintQueueItem.id == 500))).scalar_one()
         assert item.status == "pending"
+        await engine.dispose()
+
+
+class TestFtpWedgeReconnect:
+    """When the printer accepts the FTP connection but refuses the STOR (a wedged
+    printer-side FTP/SD state, observed 2026-07-14 on 3DP 2), a plain retry can't
+    clear it. The scheduler must reconnect the printer (fresh MQTT session, what an
+    operator does via the menu) before bouncing the item for a later retry."""
+
+    @pytest.mark.asyncio
+    async def test_rejected_upload_reconnects_printer_then_requeues(self, tmp_path):
+        engine, session_maker = await _make_db(tmp_path)
+        scheduler = PrintScheduler()
+
+        item, notif, mock_pm = await _dispatch_once(scheduler, session_maker, tmp_path, reject=True)
+
+        # Recovery: printer torn down and reconnected with a fresh session.
+        mock_pm.disconnect_printer.assert_called_once_with(PRINTER_ID)
+        mock_pm.connect_printer.assert_awaited_once()
+        # Item bounced back to pending (not failed) so a later cycle retries it,
+        # and the printer is parked in the dispatch-hold cooldown meanwhile.
+        assert item.status == "pending"
+        assert item.started_at is None
+        assert scheduler._ftp_dispatch_attempts.get(500) == 1
+        assert scheduler._printer_in_dispatch_hold(PRINTER_ID) is True
+        notif.on_queue_job_failed.assert_not_called()
+        await engine.dispose()
+
+    @pytest.mark.asyncio
+    async def test_plain_ftp_failure_does_not_reconnect(self, tmp_path):
+        """A non-reject FTP failure (couldn't connect / transient) must NOT reconnect
+        the printer — reconnect is reserved for the connected-but-refused wedge."""
+        engine, session_maker = await _make_db(tmp_path)
+        scheduler = PrintScheduler()
+
+        item, _notif, mock_pm = await _dispatch_once(scheduler, session_maker, tmp_path, uploaded=False)
+
+        mock_pm.disconnect_printer.assert_not_called()
+        mock_pm.connect_printer.assert_not_awaited()
+        assert item.status == "pending"  # still bounced + cooled down, just no reconnect
         await engine.dispose()

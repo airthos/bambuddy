@@ -28,6 +28,26 @@ class FileNotOnPrinterError(Exception):
     """
 
 
+class UploadRejectedError(Exception):
+    """Raised when the printer accepts the FTP control connection but rejects
+    the STOR itself with a permanent 5xx (e.g. 550).
+
+    The upload socket is fine — login succeeded, the connection is up — but the
+    printer's storage/FTP subsystem refuses to create the file. This is a wedged
+    printer-side state that a fresh FTP connection does not clear: it survives
+    both bambu_ftp's own reconnect-and-retry and the scheduler's re-dispatch
+    (observed 2026-07-14 on 3DP 2, items 1427-1430, all 550 on STOR while the
+    printer reported a dispatchable state). What clears it is reconnecting the
+    *printer* (a fresh MQTT session, as an operator does via the menu — the same
+    heal path as force_reconnect_stale_session for the #1136 SD R/W wedge).
+
+    Opt in via ``upload_file(..., raise_on_reject=True)``. Use with
+    ``with_ftp_retry``'s ``non_retry_exceptions`` so the reject aborts the FTP
+    retry budget immediately and surfaces to the dispatch layer, which reconnects
+    the printer before retrying. See docs/airtho/fixes.md Fix 11.
+    """
+
+
 class ImplicitFTP_TLS(FTP_TLS):
     """FTP_TLS subclass for implicit FTPS (port 990) with model-specific SSL handling.
 
@@ -382,8 +402,15 @@ class BambuFTPClient:
         local_path: Path,
         remote_path: str,
         progress_callback: Callable[[int, int], None] | None = None,
+        raise_on_reject: bool = False,
     ) -> bool:
-        """Upload a file to the printer with optional progress callback."""
+        """Upload a file to the printer with optional progress callback.
+
+        When ``raise_on_reject`` is set, a permanent 5xx rejection of the STOR by
+        a connected printer raises :class:`UploadRejectedError` instead of
+        returning ``False``, so the caller can distinguish a printer-side FTP/SD
+        wedge (reconnect warranted) from a plain connection failure (transient).
+        """
         if not self._ftp:
             logger.warning("upload_file: FTP not connected")
             return False
@@ -545,6 +572,14 @@ class BambuFTPClient:
                 logger.error("FTP 550 error - File/directory not found or permission denied")
             elif error_code == "552":
                 logger.error("FTP 552 error - Storage quota exceeded (SD card full?)")
+            if raise_on_reject:
+                # Control connection was fine; the printer refused the write with a
+                # permanent 5xx. Signal the dispatch layer so it can reconnect the
+                # printer (fresh MQTT session) before retrying — a fresh FTP
+                # connection alone does not clear a wedged printer-side SD/FTP
+                # state (observed 2026-07-14 on 3DP 2; see docs/airtho/fixes.md
+                # Fix 11).
+                raise UploadRejectedError(f"Printer rejected STOR for {remote_path}: {e}") from e
             return False
         except (OSError, ftplib.Error) as e:
             logger.error("FTP upload failed for %s: %s (type: %s)", remote_path, e, type(e).__name__)
@@ -948,6 +983,7 @@ async def upload_file_async(
     progress_callback: Callable[[int, int], None] | None = None,
     socket_timeout: float | None = None,
     printer_model: str | None = None,
+    raise_on_reject: bool = False,
 ) -> bool:
     """Async wrapper for uploading a file with timeout and progress callback.
 
@@ -979,7 +1015,7 @@ async def upload_file_async(
         if client.connect():
             logger.info("FTP connected to %s", ip_address)
             try:
-                result = client.upload_file(local_path, remote_path, progress_callback)
+                result = client.upload_file(local_path, remote_path, progress_callback, raise_on_reject=raise_on_reject)
                 if result:
                     # Cache the working mode
                     BambuFTPClient.cache_mode(ip_address, mode_str)
@@ -999,7 +1035,16 @@ async def upload_file_async(
             return await asyncio.wait_for(loop.run_in_executor(None, lambda: _upload(force_prot_c)), timeout=timeout)
 
         # No cached mode - try prot_p first
-        result = await asyncio.wait_for(loop.run_in_executor(None, lambda: _upload(False)), timeout=timeout)
+        try:
+            result = await asyncio.wait_for(loop.run_in_executor(None, lambda: _upload(False)), timeout=timeout)
+        except UploadRejectedError:
+            # prot_p reached the printer but the STOR was refused. For A1 the
+            # refusal can be a prot_p incompatibility, so fall through to the
+            # prot_c fallback below; for other models it is a genuine printer-side
+            # rejection the caller must handle (reconnect), so re-raise.
+            if not is_a1:
+                raise
+            result = False
 
         if result:
             return True

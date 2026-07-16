@@ -22,6 +22,7 @@ from backend.app.models.smart_plug import SmartPlug
 from backend.app.models.spool_assignment import SpoolAssignment
 from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 from backend.app.services.bambu_ftp import (
+    UploadRejectedError,
     cache_3mf_download,
     delete_file_async,
     get_ftp_retry_settings,
@@ -2227,6 +2228,10 @@ class PrintScheduler:
         except Exception as e:
             logger.debug("Queue item %s: Delete failed (may not exist): %s", item.id, e)
 
+        # Set when the printer accepted the FTP connection but refused the STOR
+        # (a printer-side FTP/SD wedge). A fresh FTP connection won't clear it, so
+        # the failure handler reconnects the printer before bouncing the item.
+        ftp_rejected = False
         try:
             if ftp_retry_enabled:
                 uploaded = await with_ftp_retry(
@@ -2237,9 +2242,11 @@ class PrintScheduler:
                     remote_path,
                     socket_timeout=ftp_timeout,
                     printer_model=printer.model,
+                    raise_on_reject=True,
                     max_retries=ftp_retry_count,
                     retry_delay=ftp_retry_delay,
                     operation_name=f"Upload print to {printer.name}",
+                    non_retry_exceptions=(UploadRejectedError,),
                 )
             else:
                 uploaded = await upload_file_async(
@@ -2249,7 +2256,17 @@ class PrintScheduler:
                     remote_path,
                     socket_timeout=ftp_timeout,
                     printer_model=printer.model,
+                    raise_on_reject=True,
                 )
+        except UploadRejectedError as e:
+            uploaded = False
+            ftp_rejected = True
+            logger.error(
+                "Queue item %s: printer refused the upload (STOR rejected) — likely a "
+                "printer-side FTP/SD wedge, will reconnect before retry: %s",
+                item.id,
+                e,
+            )
         except Exception as e:
             uploaded = False
             logger.error("Queue item %s: FTP error: %s (type: %s)", item.id, e, type(e).__name__)
@@ -2285,6 +2302,25 @@ class PrintScheduler:
                 # it as failed. Keep printer_id/archive_id so the retry reuses the
                 # same printer and already-created archive rather than piling up a
                 # fresh archive per attempt.
+                if ftp_rejected:
+                    # The printer accepted the FTP connection but refused the STOR:
+                    # a wedged printer-side FTP/SD state that a fresh FTP connection
+                    # cannot clear (observed 2026-07-14 on 3DP 2, items 1427-1430).
+                    # Do what an operator does to fix it — reconnect the printer with
+                    # a fresh MQTT session (same heal path as force_reconnect for the
+                    # #1136 SD R/W wedge). Safe here: the upload failed, so no print
+                    # is running to disrupt, and the cooldown armed above gives the
+                    # fresh session time to settle before the next-cycle retry.
+                    logger.warning(
+                        "Queue item %s: reconnecting %s (fresh MQTT session) to clear the FTP/SD wedge before retry",
+                        item.id,
+                        printer.name,
+                    )
+                    try:
+                        printer_manager.disconnect_printer(item.printer_id)
+                        await printer_manager.connect_printer(printer)
+                    except Exception as e:
+                        logger.error("Queue item %s: printer reconnect during FTP recovery failed: %s", item.id, e)
                 item.status = "pending"
                 item.started_at = None
                 await db.commit()

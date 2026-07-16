@@ -195,3 +195,49 @@ left in a dispatch hold.
 **Not yet addressed (follow-up):** defect #1 above — a stale `FINISH` counting as dispatchable
 (same P1S delta-staleness class as Fix 2). The cooldown fix neutralizes its impact, but
 tightening `_is_printer_idle` against stale-FINISH is a separate hardening.
+
+## Fix 11: Reconnect the printer to clear an FTP/SD upload wedge
+
+**Discovered** from the same 2026-07-14 3DP 2 cluster as Fix 10, but a distinct root
+cause that Fix 10 did not resolve. Items 1427–1430 each failed on FTP upload; the failure
+signature in the logs is diagnostic: the FTP **control connection succeeds every time**
+(`FTP connected successfully to 10.1.10.220`), but the `STOR` is rejected with **550 in
+~25 ms** — no `FTP data channel ready` line, no data transferred. So the printer accepts
+the login but refuses to create the file: its storage/FTP subsystem is wedged while MQTT
+still reports a dispatchable state ("genuinely ready, but the upload fails").
+
+**Why Fix 10 wasn't enough.** Fix 10 stops the farm from *burning queue items* (cooldown +
+bounce-to-pending), but every retry layer — `bambu_ftp`'s own 4× reconnect-and-retry and
+the scheduler's re-dispatch — reopens a **fresh FTP socket** to the **same wedged printer**,
+so all of them hit the same 550. In the incident the wedge only cleared after ~2.5 minutes
+(item 1431 succeeded), and the reliable manual fix is to **reconnect the printer in the UI**.
+
+**Root cause / mechanism.** Reconnecting the printer (UI "reconnect" → `POST
+/{id}/disconnect` + `/connect`, which rebuilds the MQTT client with a fresh `client_id`)
+is the same heal path as `force_reconnect_stale_session`: it wipes a stale, unacked
+`project_file` command from a half-broken session — the documented #1136 trigger for
+`0500_4003` SD R/W on the printer. Clearing that lets the printer's SD/FTP subsystem
+accept writes again. A fresh FTP socket alone can't do this; the fix must reconnect the
+*printer*, not the FTP connection.
+
+**Fix:**
+- `backend/app/services/bambu_ftp.py`: new `UploadRejectedError`. `upload_file` /
+  `upload_file_async` gain `raise_on_reject` (default `False` — existing callers such as
+  `background_dispatch` and `firmware_update` are unchanged). When set, a permanent 5xx
+  rejection of the `STOR` by a *connected* printer raises `UploadRejectedError` instead of
+  returning the ambiguous `False`, distinguishing a printer-side wedge from a plain
+  connect failure. (Mirrors the existing `FileNotOnPrinterError` + `non_retry_exceptions`
+  pattern.)
+- `backend/app/services/print_scheduler.py` (`_start_print`): the dispatch upload opts in
+  (`raise_on_reject=True`, `non_retry_exceptions=(UploadRejectedError,)` so the reject
+  aborts the FTP retry budget immediately). On a reject, before bouncing the item back to
+  `pending`, it reconnects the printer (`disconnect_printer` + `connect_printer`) — the
+  automated equivalent of the operator's menu reconnect. Safe: the upload failed so no
+  print is running, and Fix 10's cooldown gives the fresh session time to settle before the
+  next-cycle retry. A plain (non-reject) FTP failure still takes Fix 10's path with no
+  reconnect.
+
+**Tests:** `backend/tests/unit/services/test_bambu_ftp.py` (a rejected `STOR` raises with
+`raise_on_reject`, still returns `False` without it); `backend/tests/unit/
+test_scheduler_ftp_failure_retry.py::TestFtpWedgeReconnect` (a rejected upload reconnects
+the printer then requeues; a plain failure does not reconnect).
