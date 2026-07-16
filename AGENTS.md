@@ -107,6 +107,10 @@ treats it as a living document:
   [`docs/airtho/ideas-not-implemented.md`](docs/airtho/ideas-not-implemented.md) so they
   don't get re-proposed as if new, and so whoever eventually builds one has the context
   from when it was first discussed.
+- **When a documented feature or fix lands, replace any "not yet committed/deployed" note
+  with its commit hash.** A stale "not yet" status makes every future reader re-verify it
+  against git — that's the exact context-burning churn this knowledge base exists to
+  prevent.
 
 If you notice this file or `docs/airtho/` is wrong, stale, or missing something you had
 to re-derive at nontrivial cost — fix it. That fix is part of the task, not a nice-to-have.

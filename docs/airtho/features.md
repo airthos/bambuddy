@@ -1,6 +1,6 @@
 # Custom Features Added in This Fork
 
-_Last updated: 2026-07-01. Verify file paths and line references against current code —
+_Last updated: 2026-07-16. Verify file paths and line references against current code —
 the codebase moves faster than this doc._
 
 ## 1. Farm Post-Processor Script Hook
@@ -53,9 +53,7 @@ Commit `7a953506`, deployed 2026-06-12.
 
 ## 1c. SD-Card HMS Auto-Clear
 
-Added 2026-06-29. **Not yet committed/deployed as of last update** — check
-`git log -- backend/app/main.py` / `git status` before assuming it's live; it may exist
-as a local uncommitted diff.
+Added 2026-06-29, committed 2026-07-02 as `1afe3156`.
 
 - **Why:** transient SD/MicroSD read/write HMS errors (especially `0500_C010`) spam a
   notification on every MQTT push and, worse, block the dispatch gate (any HMS at
@@ -145,9 +143,10 @@ toggle — no new setting (per the 1c lesson). Two changes:
   full 2→3→4→1 cycle, holds-current-when-loaded) in `test_scheduler_ams_mapping.py`;
   `TestActiveSpoolTrayPersistence` (in-memory + DB round-trip + restart rehydrate) in
   `test_scheduler_clear_plate.py`.
-- **Live state at ship time:** `prefer_recently_used_filament = true` on airtho-server
-  (`/opt/bambuddy/data/bambuddy.db`); farm printers 3DP 2/3/4. Not yet deployed as of
-  this doc update — verify the column exists after the next deploy.
+- **Committed** 2026-07-09 as `67ee4773`. `prefer_recently_used_filament = true` on
+  airtho-server (`/opt/bambuddy/data/bambuddy.db`); farm printers 3DP 2/3/4. If you're
+  diagnosing spool-order behavior, confirm the `printers.active_spool_tray` column
+  actually exists in the server DB (the migration runs on service start after deploy).
 
 ## 2. `scripts/farm_process.py` — Farm Loop End Sequence
 
@@ -180,7 +179,7 @@ Cherry-picked from `airthos/print-farm`, adds the farm's end-of-print loop seque
 
 ## 3. Sentry Mode — Per-Job Camera Recording + Interval Snapshots
 
-_Added 2026-07-02 through 2026-07-06._
+_Added 2026-07-02; playback rearchitected twice, current form landed 2026-07-09/10._
 
 Two independent camera-logging features, both off by default, configured in
 Settings → Sentry:
@@ -212,8 +211,11 @@ rows. Settings: `sentry_enabled`, `sentry_retention_days` (default 7), `sentry_p
   `reconcile_on_startup()` for backend restarts mid-print.
 - `backend/app/services/camera_recording_purge.py` — retention sweeper, respects a
   per-session `keep_forever` flag.
-- `backend/app/api/routes/camera_recordings.py` — list/frames/frame-image/keep-forever/
-  delete/storage/clear-all.
+- `backend/app/api/routes/camera_recordings.py` — per-recording: list / frames /
+  frame-image / chunk-pack (`frames/pack/{chunk}`, see Playback architecture below) /
+  thumbnail / download / keep-forever / delete; per-printer snapshots list + image;
+  global: storage summary (per-printer breakdown, same shape as the general
+  storage-usage endpoint the Settings UI uses) and clear-all.
 
 **Known limitation:** true pre-roll (frames from *before* the camera connection opens)
 isn't physically possible without holding every printer's camera connection open 24/7,
@@ -240,13 +242,35 @@ intervals — since it's sparse sampling, not continuous capture.
   usage query) so the interval/retention tradeoff is visible before committing to it.
 
 ### Frontend
-- Sidebar nav: "Cameras" → "Sentry" (Radar icon). Grid/Detail toggle lives on that page;
-  Detail is a per-printer timeline (24h mini-previews, scrubbable job timeline,
-  frame-by-frame player with speed control).
-- Player preloads every frame into the browser's HTTP cache as soon as a recording is
-  selected (`new Image()` per frame) — without this the first playthrough visibly
-  flickers/stalls because `<img src>` only starts fetching a frame the instant playback
-  reaches it.
+- Sidebar nav: "Sentry" (Radar icon; started life as a standalone "Cameras" page,
+  `9e60f7ee`, renamed when recording landed). Grid/Detail toggle lives on that page:
+  Grid shows every printer's live camera at once (`pages/CamerasPage.tsx` +
+  `components/CameraGridTile.tsx`); Detail is the per-printer timeline
+  (`components/camera-timeline/CameraTimelineView.tsx` — 24h rail with mini-previews,
+  scrubbable job and standby clips, mini timeline, plate overlay, speeds up to 100x,
+  per-frame snapshot download, timelapse download).
+- Settings → Sentry shows recording storage as a per-printer breakdown against the
+  server's total disk (`b373433d`).
+
+### Playback architecture (third generation — read this before touching the player)
+The player went through three architectures in one week (2026-07-02 → 07-09). Know why
+the first two died before proposing anything resembling them:
+1. **Per-frame JPEG `<img>` swap** (2026-07-02) — needed every frame preloaded into the
+   browser HTTP cache to avoid flicker; fine for short prints, unworkable for
+   multi-hour recordings (tens of thousands of individual fetches).
+2. **All-intra HLS video** (2026-07-07/08, `256ecdd1` … `9ba6f274`) — ffmpeg-transcoded
+   segments. A long fix chain (per-segment PTS resets, CSP `worker-src` for hls.js,
+   hls.js `Infinity` config breakage, buffer-window hangs) never made it reliable: any
+   segment failure or PTS gap froze playback "buffered-but-frozen" indefinitely.
+3. **Chunked image-sequence player** (current, `f61eb3b3`, 2026-07-09) — the timeline
+   draws half-res JPEGs on a `<canvas>`, fetched in fixed 50-frame chunks from
+   `.../frames/pack/{chunk}` (`backend/app/services/camera_frame_pack.py`), keeping a
+   bounded buffer window near the playhead. Chunks are packed lazily from the existing
+   framelog on first request and disk-cached — no pre-encode, no migration for old
+   recordings, and no codec buffer that can stall. Chunk membership is by ordinal
+   position ordered by `seq` (not by seq value), matching the client's frame-array
+   index so seq gaps can't desync the two. `CHUNK_FRAMES = 50` in the backend must
+   match the frontend player's constant.
 
 ### Fixes applied post-launch (for the historical record)
 1. **Settings not persisting** — the Settings page's debounced auto-save uses a
@@ -270,3 +294,10 @@ intervals — since it's sparse sampling, not continuous capture.
 4. **`reconcile_on_startup()` UNIQUE-constraint crash** — it called `start_session()`
    without `resume_row=`, which tried to `INSERT` a `CameraRecordingSession` row that
    already existed. Caught by a dedicated regression test before it hit production.
+
+The 2026-07-06 → 07-10 fix chain after this list is recorded in the commit log rather
+than itemized here — notably the recording-resume/orphaning cluster (`ce331fdd`,
+`8d4938e3`, `53c876ce`, `ab23979f`, `3c6bd380`), the inflated-duration and
+orphaned-mislabeling corrections (`2c361722`), and the entire HLS detour (see Playback
+architecture above). `git log --oneline -- backend/app/services/camera_*` is the
+authoritative list.

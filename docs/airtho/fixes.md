@@ -1,6 +1,6 @@
 # Bug Fixes Applied (committed to `airthos/bambuddy`)
 
-_Last updated: 2026-07-02. Commit hashes are the source of truth — `git show <hash>` to
+_Last updated: 2026-07-16. Commit hashes are the source of truth — `git show <hash>` to
 verify a fix's current form; this file records intent and root cause, which don't rot as
 fast as line numbers do._
 
@@ -149,7 +149,7 @@ Add to Queue" dispatch-path split is fixed by this; the double-dispatch *race* (
 firing for the same printer at once) documented there under Fix 7 is a separate,
 still-open issue.
 
-## Fix 10: Repeated dispatch onto a not-ready printer after FTP-upload failure (branch `fix/dispatch-cooldown-on-ftp-failure`, not yet deployed)
+## Fix 10: Repeated dispatch onto a not-ready printer after FTP-upload failure (`c963a894`)
 
 **Discovered 2026-07-14** from server logs — Airtho 3DP 2 (printer id 4) burned four
 queue items (1427, 1428, 1429, 1430) as `failed` in consecutive ~30 s cycles, each on an
