@@ -106,6 +106,17 @@ class PrintScheduler:
         # Matches the watchdog timeout (90 s) plus a safety margin so the
         # watchdog runs first on the unhappy path.
         self._dispatch_max_hold = 180.0
+        # Per-item FTP-upload retry counter for the dispatch path. A pre-dispatch
+        # FTP failure means the printer wasn't actually ready to receive (busy
+        # finishing/calibrating, or a transient SD/FTP glitch) despite reporting a
+        # dispatchable state — see the 2026-07-14 incident where items 1427–1430
+        # were each burned as 'failed' onto 3DP 2 in consecutive 30 s cycles. We
+        # bounce the item back to 'pending' and retry it (after the post-dispatch
+        # cooldown parks the printer) up to this many times before failing it for
+        # real. In-memory (keyed by queue-item id), mirroring _dispatch_holds — a
+        # service restart just resets the count, which is fine.
+        self._ftp_dispatch_attempts: dict[int, int] = {}
+        self._max_ftp_dispatch_retries = 3
 
     async def run(self):
         """Main loop - check queue every interval."""
@@ -2248,18 +2259,48 @@ class PrintScheduler:
             injected_path.unlink(missing_ok=True)
 
         if not uploaded:
+            # Park the printer for the post-dispatch cooldown even though no print
+            # command was ever sent. The FTP upload failing means the printer wasn't
+            # actually ready to receive the file (busy finishing/calibrating, or a
+            # transient SD/FTP glitch) despite reporting a dispatchable state. Without
+            # this hold, the next 30 s cycle sees the printer still "idle", finds no
+            # dispatch hold, and immediately dispatches the NEXT queue item onto the
+            # same not-ready printer — burning items in a row (observed 2026-07-14:
+            # items 1427–1430 each failed onto 3DP 2 in consecutive cycles). Passing
+            # None pre_state gives a pure time-based cooldown (_dispatch_min_cooldown),
+            # matching the #1157 hold's disconnected-at-dispatch fallback.
+            self._mark_printer_dispatched(item.printer_id, None, None)
+
+            attempts = self._ftp_dispatch_attempts.get(item.id, 0) + 1
+            self._ftp_dispatch_attempts[item.id] = attempts
+            logger.error(
+                f"Queue item {item.id}: FTP upload failed (attempt {attempts}/{self._max_ftp_dispatch_retries}) "
+                f"- printer={printer.name}, model={printer.model}, ip={printer.ip_address}. "
+                f"Check logs above for storage diagnostics and specific error codes."
+            )
+
+            if attempts < self._max_ftp_dispatch_retries:
+                # Transient failure — bounce the item back to the queue so a later
+                # cycle retries it (after the cooldown clears) instead of consuming
+                # it as failed. Keep printer_id/archive_id so the retry reuses the
+                # same printer and already-created archive rather than piling up a
+                # fresh archive per attempt.
+                item.status = "pending"
+                item.started_at = None
+                await db.commit()
+                return
+
+            # Retries exhausted — fail the item for real.
+            self._ftp_dispatch_attempts.pop(item.id, None)
             error_msg = (
-                "Failed to upload file to printer. Check if SD card is inserted and properly formatted (FAT32/exFAT). "
+                f"Failed to upload file to printer after {self._max_ftp_dispatch_retries} attempts. "
+                "Check if SD card is inserted and properly formatted (FAT32/exFAT). "
                 "See server logs for detailed diagnostics."
             )
             item.status = "failed"
             item.error_message = error_msg
             item.completed_at = datetime.now(timezone.utc)
             await db.commit()
-            logger.error(
-                f"Queue item {item.id}: FTP upload failed - printer={printer.name}, model={printer.model}, "
-                f"ip={printer.ip_address}. Check logs above for storage diagnostics and specific error codes."
-            )
 
             # Send failure notification
             await notification_service.on_queue_job_failed(
@@ -2332,6 +2373,8 @@ class PrintScheduler:
 
         if started:
             logger.info("Queue item %s: Print started successfully - %s", item.id, filename)
+            # Dispatch landed — clear any FTP-retry count accumulated on earlier attempts.
+            self._ftp_dispatch_attempts.pop(item.id, None)
 
             # Register the local 3MF in the cover-cache so /cover skips FTP
             # (#1166 follow-up). file_path was resolved earlier from either the

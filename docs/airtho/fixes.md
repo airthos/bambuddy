@@ -148,3 +148,50 @@ See [`known-issues.md`](known-issues.md) — the *post-processor* half of the "P
 Add to Queue" dispatch-path split is fixed by this; the double-dispatch *race* (both paths
 firing for the same printer at once) documented there under Fix 7 is a separate,
 still-open issue.
+
+## Fix 10: Repeated dispatch onto a not-ready printer after FTP-upload failure (branch `fix/dispatch-cooldown-on-ftp-failure`, not yet deployed)
+
+**Discovered 2026-07-14** from server logs — Airtho 3DP 2 (printer id 4) burned four
+queue items (1427, 1428, 1429, 1430) as `failed` in consecutive ~30 s cycles, each on an
+"FTP upload failed" error, until item 1431 finally succeeded. The printer's own
+`auto_cali_for_user_param.gcode` only reported `PRINT COMPLETE` at 13:47:30 — mid-way
+through the failed dispatches — so the printer was physically busy (FTP endpoint refusing
+uploads) the whole time while reporting a dispatchable `FINISH` state.
+
+**Root cause (two compounding defects):**
+1. `_is_printer_idle()` treats `FINISH` as dispatchable, and with `require_plate_clear=false`
+   a completed print raises no `awaiting_plate_clear` flag — so a stale/occupied `FINISH`
+   printer passes the gate.
+2. The bigger one: the anti-double-dispatch cooldown (`_mark_printer_dispatched`, the #1157
+   `_dispatch_holds` hold) is only armed *after* a **successful** `start_print`. When the FTP
+   upload fails, `_start_print` marked the item `failed` and returned **before** reaching that
+   call, so no hold was set. The failed item also isn't in `printing` status, so it never
+   seeds `busy_printers` from the DB. Result: every 30 s cycle the printer still read idle,
+   had no hold, and got the next pending item dispatched onto it — hammering a not-ready
+   printer and consuming queue items one per cycle.
+
+**Fix** (`backend/app/services/print_scheduler.py`, `_start_print`):
+- On FTP-upload failure, arm the post-dispatch cooldown with
+  `_mark_printer_dispatched(printer_id, None, None)` (a `None` pre_state gives a pure
+  time-based hold of `_dispatch_min_cooldown` = 60 s, matching the existing
+  disconnected-at-dispatch fallback). This parks the printer so the next cycle skips it.
+- Instead of failing the item outright, bounce it back to `pending` and retry up to
+  `_max_ftp_dispatch_retries` (=3) times, tracked in an in-memory `_ftp_dispatch_attempts`
+  map keyed by queue-item id (mirrors `_dispatch_holds`; resets on restart, which is fine).
+  `printer_id`/`archive_id` are preserved so a retry reuses the same printer and the
+  already-created archive rather than piling up a fresh archive per attempt. The counter is
+  cleared on a successful dispatch and on the final hard failure. Only after the retries are
+  exhausted is the item marked `failed` and the failure notification sent.
+
+**Net effect:** a transient FTP/SD glitch or a printer that's briefly busy no longer burns a
+run of queue items — the printer is parked for the cooldown and the same item retries a few
+cycles later. A genuinely broken printer still fails the item after 3 bounded attempts.
+
+**Tests:** `backend/tests/unit/test_scheduler_ftp_failure_retry.py` — failed upload arms the
+dispatch hold; first attempts requeue as `pending` then the last fails with an
+"after 3 attempts" message; per-item counter isolation; and `check_queue` skips a printer
+left in a dispatch hold.
+
+**Not yet addressed (follow-up):** defect #1 above — a stale `FINISH` counting as dispatchable
+(same P1S delta-staleness class as Fix 2). The cooldown fix neutralizes its impact, but
+tightening `_is_printer_idle` against stale-FINISH is a separate hardening.
