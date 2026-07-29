@@ -1085,6 +1085,7 @@ export interface AppSettings {
   drying_presets: string;  // JSON blob of drying presets per filament type
   gcode_snippets: string;  // JSON: per-model G-code injection snippets
   post_process_script: string;  // Path to farm post-processor script on server
+  farm_cooldown_temp: number;  // Bed release temp (°C) passed to the farm post-processor script
   // Scheduled local backup
   local_backup_enabled: boolean;
   local_backup_schedule: string;

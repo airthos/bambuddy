@@ -50,14 +50,34 @@ def _make_script(content: str) -> Path:
     return path
 
 
-def _mock_db_with_setting(value: str | None):
-    """A minimal AsyncSession stand-in whose execute().scalar_one_or_none()
-    returns a Settings-shaped object (or None) for post_process_script."""
+def _mock_db_with_settings(settings: dict):
+    """A minimal AsyncSession stand-in whose execute() returns a Settings-shaped
+    object (or None) keyed by which `Settings.key == "..."` the query filters on.
+    Keys not present in `settings` resolve to None (i.e. the field's own default)."""
     db = MagicMock()
-    result = MagicMock()
-    result.scalar_one_or_none.return_value = MagicMock(value=value) if value is not None else None
-    db.execute = AsyncMock(return_value=result)
+
+    async def side_effect(stmt):
+        result = MagicMock()
+        try:
+            compiled = stmt.compile(compile_kwargs={"literal_binds": False})
+            param_values = list(compiled.params.values())
+        except Exception:
+            param_values = []
+        for key, val in settings.items():
+            if key in param_values:
+                result.scalar_one_or_none.return_value = MagicMock(value=val) if val is not None else None
+                return result
+        result.scalar_one_or_none.return_value = None
+        return result
+
+    db.execute = AsyncMock(side_effect=side_effect)
     return db
+
+
+def _mock_db_with_setting(value: str | None):
+    """A minimal AsyncSession stand-in for just the post_process_script setting.
+    farm_cooldown_temp resolves to None (falls back to its 35 default)."""
+    return _mock_db_with_settings({"post_process_script": value})
 
 
 class TestApplyFarmPostProcess:
@@ -200,7 +220,34 @@ class TestApplyFarmPostProcess:
         try:
             result = await apply_farm_post_process(db, source, None, log_label="test")
             assert result is not None
-            assert captured_args["args"][-1] == "1"
+            assert captured_args["args"][2] == "1"
+            result.unlink(missing_ok=True)
+        finally:
+            source.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    async def test_cooldown_temp_read_from_settings_and_passed_to_script(self, monkeypatch):
+        source = _make_temp_3mf()
+        db = _mock_db_with_settings({"post_process_script": "/some/script", "farm_cooldown_temp": "42"})
+
+        captured_args = {}
+
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b"", b"")
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            captured_args["args"] = args
+            return FakeProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+        try:
+            result = await apply_farm_post_process(db, source, 1, log_label="test")
+            assert result is not None
+            assert captured_args["args"][2] == "1"
+            assert captured_args["args"][3] == "42"
             result.unlink(missing_ok=True)
         finally:
             source.unlink(missing_ok=True)

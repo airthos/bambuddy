@@ -660,12 +660,14 @@ def main():
     print("Open in BambuStudio and click 'Print Plate'. Do NOT re-slice.")
 
 
-def process_inplace(path: Path, plate_id: int = 1) -> None:
+def process_inplace(path: Path, plate_id: int = 1, cooldown_temp: int = 35) -> None:
     """
     BambuBuddy scheduler entry point.
 
     Called with a single argument: path to a temp 3MF copy.
     Optional second argument: plate number (1-based, default 1).
+    Optional third argument: bed release temp in C (default 35), configured via
+    Settings -> Workflow -> Farm Post-Processor Script in the BambuBuddy UI.
     Modifies the file in-place using default settings, exits 0 on success.
     """
     lines, plate_json = read_input_3mf(path, plate_id=plate_id)
@@ -691,7 +693,7 @@ def process_inplace(path: Path, plate_id: int = 1) -> None:
     end_block = (
         "; FEATURE: Custom\n"
         "; MACHINE_END_GCODE_START\n"
-        + build_end_sequence(max_z=max_z, cooldown_temp=35, push_x=push_x, flex_speed=300)
+        + build_end_sequence(max_z=max_z, cooldown_temp=cooldown_temp, push_x=push_x, flex_speed=300)
         + "; EXECUTABLE_BLOCK_END\n"
     )
 
@@ -710,15 +712,17 @@ def process_inplace(path: Path, plate_id: int = 1) -> None:
 
 
 if __name__ == "__main__":
-    # BambuBuddy calling convention: path [plate_id]
+    # BambuBuddy calling convention: path [plate_id] [cooldown_temp]
     # Single positional arg (no flags) triggers in-place mode.
     # Optional second arg is the plate number (1-based, default 1).
+    # Optional third arg is the bed release temp in C (default 35).
     if len(sys.argv) >= 2 and not sys.argv[1].startswith("-"):
         p = Path(sys.argv[1])
         if not p.exists():
             print("ERROR: not found: {}".format(p), file=sys.stderr)
             sys.exit(1)
         plate_id = int(sys.argv[2]) if len(sys.argv) >= 3 else 1
-        process_inplace(p, plate_id=plate_id)
+        cooldown_temp = int(sys.argv[3]) if len(sys.argv) >= 4 else 35
+        process_inplace(p, plate_id=plate_id, cooldown_temp=cooldown_temp)
     else:
         main()

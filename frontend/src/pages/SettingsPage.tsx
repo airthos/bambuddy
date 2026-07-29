@@ -4340,6 +4340,27 @@ export function SettingsPage() {
                   className="w-full bg-bambu-dark border border-bambu-dark-tertiary rounded px-3 py-2 text-sm text-bambu-text placeholder-bambu-gray-dark focus:outline-none focus:border-bambu-green"
                 />
               </div>
+              <div>
+                <label className="block text-xs text-bambu-gray mb-1">
+                  {t('settings.farmCooldownTemp', 'Bed release temp')}
+                </label>
+                <p className="text-xs text-bambu-gray mb-1">
+                  {t('settings.farmCooldownTempDescription', 'Bed temperature (°C) the farm loop end sequence waits for before pushing the finished part off the plate.')}
+                </p>
+                <div className="flex items-center gap-1">
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={localSettings?.farm_cooldown_temp ?? 35}
+                    onChange={(e) => setLocalSettings(prev => prev ? { ...prev, farm_cooldown_temp: Number(e.target.value) } : null)}
+                    onBlur={() => localSettings && updateMutation.mutate({ farm_cooldown_temp: localSettings.farm_cooldown_temp ?? 35 })}
+                    className="w-20 bg-bambu-dark border border-bambu-dark-tertiary rounded px-3 py-2 text-sm text-bambu-text focus:outline-none focus:border-bambu-green"
+                  />
+                  <span className="text-sm text-bambu-gray">°C</span>
+                </div>
+              </div>
             </CardContent>
           </Card>
 

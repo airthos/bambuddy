@@ -101,6 +101,12 @@ class AppSettings(BaseModel):
         default="",
         description="Path to executable on the server. Receives 3MF path as sole argument, modifies in-place, exits 0 on success.",
     )
+    farm_cooldown_temp: int = Field(
+        default=35,
+        ge=0,
+        le=100,
+        description="Bed temperature (°C) the farm post-processor script waits for before the push-off release",
+    )
 
     # Scheduled local backup (#884)
     local_backup_enabled: bool = Field(default=False, description="Enable scheduled local backups")
@@ -457,6 +463,7 @@ class AppSettingsUpdate(BaseModel):
     queue_shortest_first: bool | None = None
     gcode_snippets: str | None = None
     post_process_script: str | None = None
+    farm_cooldown_temp: int | None = None
     local_backup_enabled: bool | None = None
     local_backup_schedule: str | None = None
     local_backup_time: str | None = None

@@ -166,6 +166,7 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "sentry_post_roll_seconds",
             "sentry_interval_minutes",
             "sentry_interval_retention_days",
+            "farm_cooldown_temp",
         ]:
             settings_dict[setting.key] = int(setting.value)
         elif setting.key == "default_printer_id":

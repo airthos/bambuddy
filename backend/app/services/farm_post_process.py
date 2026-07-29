@@ -36,6 +36,12 @@ async def _read_post_process_script_setting(db: AsyncSession) -> str | None:
     return setting.value if setting else None
 
 
+async def _read_farm_cooldown_temp_setting(db: AsyncSession) -> int:
+    result = await db.execute(select(Settings).where(Settings.key == "farm_cooldown_temp"))
+    setting = result.scalar_one_or_none()
+    return int(setting.value) if setting else 35
+
+
 async def apply_farm_post_process(
     db: AsyncSession,
     file_path: Path,
@@ -56,6 +62,8 @@ async def apply_farm_post_process(
         logger.warning("%s: script_processing enabled but post_process_script not configured", log_label)
         return None
 
+    cooldown_temp = await _read_farm_cooldown_temp_setting(db)
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".3mf") as tmp:
         script_out_path = Path(tmp.name)
     shutil.copy2(file_path, script_out_path)
@@ -66,6 +74,7 @@ async def apply_farm_post_process(
             script_path.strip(),
             str(script_out_path),
             str(plate_id or 1),
+            str(cooldown_temp),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
