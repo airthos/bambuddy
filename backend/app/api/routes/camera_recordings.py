@@ -185,14 +185,17 @@ async def download_recording(
     db: AsyncSession = Depends(get_db),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.CAMERA_VIEW),
 ):
-    """Renders the recording's framelog into one downloadable timelapse MP4,
-    sped up 100x real time (see camera_frame_pack.render_timelapse).
+    """Renders the recording's framelog into one downloadable timelapse MP4 that
+    is always exactly one minute at 30fps, in the camera's native resolution
+    (see camera_frame_pack.render_timelapse). However long the print ran, the
+    export is the same length -- the recording is sampled down (or held up) to
+    fit the fixed frame budget.
 
     This is a re-encode to a normal GOP structure: the in-app scrubber needs
     frame-accurate all-intra playback, but a download is watched, not scrubbed,
     and a mostly-static chamber-cam timelapse compresses dramatically better
-    with inter-frame compression. Idle capture gaps are time-capped so they
-    don't become long frozen holds in the exported video.
+    with inter-frame compression. Idle capture gaps are time-capped when spacing
+    the sampled frames so an offline stretch doesn't eat the one-minute budget.
     """
     await get_printer_or_404(printer_id, db)
 

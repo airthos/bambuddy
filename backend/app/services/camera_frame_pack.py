@@ -21,6 +21,7 @@ offset. ts_ms per frame comes from the separate lightweight /frames list.
 from __future__ import annotations
 
 import asyncio
+import bisect
 import io
 import logging
 import os
@@ -46,12 +47,23 @@ CHUNK_FRAMES = 50
 _SCALE = 0.5
 _QUALITY = 80
 
-# Cap idle gaps in the downloaded timelapse the same way playback does, so a
-# long capture gap (printer offline / paused) doesn't become a multi-second
-# frozen hold in the exported video.
-_DOWNLOAD_SPEED = 100
+# The downloaded timelapse is always the same shape regardless of how long the
+# print ran: exactly _DOWNLOAD_SECONDS at _DOWNLOAD_FPS, i.e. a fixed
+# _DOWNLOAD_TARGET_FRAMES frames. A 30-minute print and an 18-hour print both
+# export as a one-minute clip -- the recording is *compressed into* that budget
+# rather than played at a fixed speed multiplier (which made export length
+# unpredictable and long prints unwatchable).
+_DOWNLOAD_SECONDS = 60
 _DOWNLOAD_FPS = 30
+_DOWNLOAD_TARGET_FRAMES = _DOWNLOAD_SECONDS * _DOWNLOAD_FPS
+# Cap idle gaps when spacing the sampled frames, the same way playback does, so
+# a long capture gap (printer offline / paused) doesn't eat a big share of the
+# one-minute budget on a single frozen frame.
 _MAX_GAP_SECONDS = 4.0
+# Quality for frames the exporter has to re-encode (only ones whose dimensions
+# differ from the recording's first frame). Every other frame is handed to ffmpeg
+# as its original bytes at native resolution, so this is a rare fallback path.
+_EXPORT_REENCODE_QUALITY = 95
 
 
 def pack_dir(printer_id: int, archive_id: int) -> Path:
@@ -188,9 +200,10 @@ async def get_thumbnail(db: AsyncSession, session: CameraRecordingSession) -> by
 
 
 async def render_timelapse(session: CameraRecordingSession) -> bytes | None:
-    """Render the recording's framelog into a downloadable MP4 timelapse at
-    _DOWNLOAD_SPEED (100x) real-time. Inter-frame gaps are capped so idle periods
-    don't become long frozen holds. Returns None if there are no frames."""
+    """Render the recording's framelog into a downloadable MP4 timelapse that is
+    always exactly _DOWNLOAD_SECONDS long at _DOWNLOAD_FPS, in the frames' native
+    resolution. The recording is compressed into that fixed budget by sampling
+    _DOWNLOAD_TARGET_FRAMES frames from it. Returns None if there are no frames."""
     async with _database().async_session() as db:  # type: ignore[misc]
         result = await db.execute(
             select(CameraRecordingFrame.ts_ms, CameraRecordingFrame.offset, CameraRecordingFrame.length)
@@ -203,33 +216,109 @@ async def render_timelapse(session: CameraRecordingSession) -> bytes | None:
     return await asyncio.to_thread(_render_timelapse_sync, session.file_path, rows)
 
 
+def _pick_export_frames(ts_list: list[int], target: int) -> list[int]:
+    """Frame indices to export, as a non-decreasing list of exactly `target`
+    entries (so the clip is always the same length).
+
+    Sampling is spread evenly over *gap-capped elapsed time* rather than over
+    ordinal position, because capture is bursty: a print's startup/leveling
+    burst can be 30fps while the body of the print is one frame every second or
+    two. Ordinal sampling would hand the burst a wildly disproportionate share
+    of the one-minute budget; time sampling makes the clip read like a real
+    timelapse of the print. Idle gaps are capped the same way playback caps them
+    so a printer-offline stretch can't eat the budget on one frozen frame.
+
+    When the recording has fewer frames than the budget, indices repeat -- the
+    export holds on frames instead of coming out short.
+    """
+    n = len(ts_list)
+    if n == 0 or target <= 0:
+        return []
+    if n == 1:
+        return [0] * target
+    cum = [0.0] * n
+    for i in range(1, n):
+        cum[i] = cum[i - 1] + min(_MAX_GAP_SECONDS, max(0.0, (ts_list[i] - ts_list[i - 1]) / 1000))
+    total = cum[-1]
+    if total <= 0:  # every frame shares a timestamp -- nothing to weight by
+        return [min(n - 1, (i * n) // target) for i in range(target)]
+    if target == 1:
+        return [0]
+    out: list[int] = []
+    for k in range(target):
+        t = total * k / (target - 1)  # spans first frame .. last frame inclusive
+        j = bisect.bisect_right(cum, t) - 1
+        out.append(min(n - 1, max(0, j)))
+    return out
+
+
+def _jpeg_size(data: bytes) -> tuple[int, int]:
+    with Image.open(io.BytesIO(data)) as im:  # header-only, no pixel decode
+        return im.size
+
+
+def _resize_to(data: bytes, size: tuple[int, int]) -> bytes:
+    im = Image.open(io.BytesIO(data)).convert("RGB").resize(size, Image.Resampling.BILINEAR)
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=_EXPORT_REENCODE_QUALITY)
+    return buf.getvalue()
+
+
 def _render_timelapse_sync(framelog_path: str, rows: list[tuple[int, int, int]]) -> bytes:
+    picks = _pick_export_frames([r[0] for r in rows], _DOWNLOAD_TARGET_FRAMES)
+
+    def read_frame(src_i: int) -> bytes:
+        with open(framelog_path, "rb") as fh:
+            fh.seek(rows[src_i][1])
+            return fh.read(rows[src_i][2])
+
+    # ffmpeg's image2 demuxer needs every input image at the same size. Take the
+    # size from the first frame that decodes; the rare frame that differs gets
+    # resampled to it, and everything else is written byte-for-byte so the export
+    # keeps the camera's native resolution and original JPEG quality.
+    target_size: tuple[int, int] | None = None
+    for src_i in dict.fromkeys(picks):
+        try:
+            target_size = _jpeg_size(read_frame(src_i))
+            break
+        except Exception:
+            continue
+    if target_size is None:
+        raise RuntimeError("no decodable frames in recording")
+
     with tempfile.TemporaryDirectory(prefix="sentry-dl-") as tmp_dir:
         tmp = Path(tmp_dir)
-        concat_lines: list[str] = []
+        written: dict[int, Path] = {}
         with open(framelog_path, "rb") as fh:
-            for i, (ts_ms, offset, length) in enumerate(rows):
-                fh.seek(offset)
-                data = fh.read(length)
+            for out_i, src_i in enumerate(picks):
+                dest = tmp / f"{out_i:06d}.jpg"
+                prev = written.get(src_i)
+                if prev is not None:
+                    # A held frame (recording shorter than the budget): hardlink
+                    # rather than duplicate full-res bytes on disk.
+                    try:
+                        os.link(prev, dest)
+                    except OSError:
+                        dest.write_bytes(prev.read_bytes())
+                    continue
+                fh.seek(rows[src_i][1])
+                data = fh.read(rows[src_i][2])
                 try:
-                    data = _downscale(data)
+                    if _jpeg_size(data) != target_size:
+                        data = _resize_to(data, target_size)
                 except Exception:
-                    pass
-                frame_file = tmp / f"{i:06d}.jpg"
-                frame_file.write_bytes(data)
-                if i + 1 < len(rows):
-                    real_dt = min(_MAX_GAP_SECONDS, max(0.001, (rows[i + 1][0] - ts_ms) / 1000))
-                else:
-                    real_dt = 1.0
-                concat_lines.append(f"file '{frame_file.as_posix()}'")
-                concat_lines.append(f"duration {max(0.001, real_dt / _DOWNLOAD_SPEED):.4f}")
-        concat_lines.append(f"file '{(tmp / f'{len(rows) - 1:06d}.jpg').as_posix()}'")
-        (tmp / "concat.txt").write_text("\n".join(concat_lines))
+                    pass  # unreadable frame: hand the bytes to ffmpeg and let it skip
+                dest.write_bytes(data)
+                written[src_i] = dest
 
         out_path = tmp / "out.mp4"
         cmd = [
-            "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(tmp / "concat.txt"),
-            "-vsync", "vfr", "-vf", f"fps={_DOWNLOAD_FPS}",
+            "ffmpeg", "-y",
+            "-framerate", str(_DOWNLOAD_FPS), "-start_number", "0", "-i", str(tmp / "%06d.jpg"),
+            # Odd native dimensions can't be encoded as yuv420p; this is a no-op
+            # for the usual even-sized camera frames.
+            "-vf", "scale=trunc(iw/2)*2:trunc(ih/2)*2",
+            "-frames:v", str(len(picks)),
             "-c:v", "libx264", "-preset", "medium", "-crf", "23",
             "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(out_path),
         ]

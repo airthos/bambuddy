@@ -192,6 +192,42 @@ const toNaiveUtcIso = (ms: number) => new Date(ms).toISOString().slice(0, 19);
 const shortTime = (ms: number) =>
   new Date(ms).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' });
 
+// The filmstrip timelines scroll horizontally, but a plain mouse wheel only
+// produces deltaY and browsers don't apply that to a horizontal scroller -- so
+// the strips read as frozen. In the detail view there's no page scroll to fall
+// back on either (the layout fills the viewport), which made the wheel feel
+// dead over the timeline. Translate vertical wheel into horizontal scroll, and
+// bow out once the strip reaches an end so the gesture still falls through to
+// whatever scrolls behind it.
+// Returns [ref-callback to spread onto the scroller, a live ref to the element].
+// A callback ref rather than useRef+useEffect because these scrollers mount
+// after their data arrives -- a mount-time effect would find null and silently
+// never attach.
+function useWheelToHorizontal<T extends HTMLElement>() {
+  const elRef = useRef<T | null>(null);
+  const detachRef = useRef<(() => void) | null>(null);
+  const attach = useCallback((el: T | null) => {
+    detachRef.current?.();
+    detachRef.current = null;
+    elRef.current = el;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      // Leave real horizontal gestures (trackpad swipe) to the browser.
+      if (e.deltaY === 0 || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
+      const max = el.scrollWidth - el.clientWidth;
+      if (max <= 0) return; // nothing to scroll -- let whatever is behind have it
+      if ((e.deltaY < 0 && el.scrollLeft <= 0) || (e.deltaY > 0 && el.scrollLeft >= max - 1)) return;
+      const step = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY; // line-mode wheels report ~3
+      e.preventDefault();
+      el.scrollLeft = Math.max(0, Math.min(max, el.scrollLeft + step));
+    };
+    // Must be a non-passive native listener: React's onWheel can't preventDefault.
+    el.addEventListener('wheel', onWheel, { passive: false });
+    detachRef.current = () => el.removeEventListener('wheel', onWheel);
+  }, []);
+  return [attach, elRef] as const;
+}
+
 // Pick at most n items spread evenly across arr (keeps first & last). Used to
 // fit a span's snapshots into however many tiles its on-screen width allows
 // without dropping the ends of the range.
@@ -419,6 +455,10 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     });
     return map;
   }, [printers, snapshotQueries]);
+
+  // Undefined data means "still loading" -- distinct from a printer that really
+  // has no recordings, which matters for the auto-select below.
+  const recordingsLoaded = recordingQueries.length === 0 || recordingQueries.some(q => q.data != null);
 
   const activeRecordings = recordingsByPrinter.get(activePrinterId) ?? [];
   const activeSnaps = snapshotsByPrinter.get(activePrinterId) ?? [];
@@ -846,6 +886,38 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
     setLiveFollow(false);
   }
 
+  // --- Land on whatever is happening right now ---
+  // Opening the page (or switching printers) with an empty viewport hides the
+  // thing you almost always came for: the print that's running. Pick it
+  // automatically. Selecting an in-progress recording turns on live-follow,
+  // which is what renders the live camera stream rather than the scrubber.
+  const initialPrinterRef = useRef(false);
+  useEffect(() => {
+    if (initialPrinterRef.current || !recordingsLoaded) return;
+    initialPrinterRef.current = true; // only ever the initial pick -- never yank the user later
+    const livePrinter = printers.find(p => (recordingsByPrinter.get(p.id) ?? []).some(r => r.status === 'recording'));
+    if (livePrinter) setActivePrinterId(livePrinter.id);
+  }, [printers, recordingsByPrinter, recordingsLoaded]);
+
+  useEffect(() => {
+    if (selection != null) return; // never clobber a selection the user made
+    const live = (recordingsByPrinter.get(activePrinterId) ?? []).find(r => r.status === 'recording');
+    if (!live) return;
+    setSelection({ kind: 'recording', archiveId: live.archive_id });
+    setLiveFollow(true);
+  }, [selection, activePrinterId, recordingsByPrinter]);
+
+  const [pickerScrollRef] = useWheelToHorizontal<HTMLDivElement>();
+  const [timelineScrollRef, timelineScrollEl] = useWheelToHorizontal<HTMLDivElement>();
+
+  // Open on the recent end of the timeline: "now" is the right edge, so a
+  // running print sits there, and the far left is up to 7 days stale.
+  useEffect(() => {
+    const el = timelineScrollEl.current;
+    if (el) el.scrollLeft = el.scrollWidth;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activePrinterId, activeTimeline.length]);
+
   const now = Date.now();
   const dayAgo = now - 24 * 3600000;
   const currentTsMs = clipFrames[currentFrame]?.ts_ms;
@@ -860,9 +932,13 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
   const blockWidths = activeTimeline.map(b => Math.max(44, Math.min(360, ((b.end - b.start) / 3600000) * 90)));
 
   return (
-    <div className="flex flex-col gap-3 h-full min-h-0">
+    // overflow-y-auto + a floor under the viewport below: on a short window the
+    // fixed-height rows (picker, controls, timeline) used to overflow a clipped
+    // container, putting the timeline permanently out of reach. Now the column
+    // scrolls instead of swallowing it.
+    <div className="flex flex-col gap-3 h-full min-h-0 overflow-y-auto">
       {/* Printer picker — a mini mirror of the main timeline per printer */}
-      <div className="flex gap-3 overflow-x-auto pb-1 shrink-0">
+      <div ref={pickerScrollRef} className="flex gap-3 overflow-x-auto pb-1 shrink-0">
         {printers.map(p => {
           const recs = (recordingsByPrinter.get(p.id) ?? []).filter(r => recordingEnd(r) > dayAgo);
           const isLive = recs.some(r => r.status === 'recording');
@@ -896,9 +972,11 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
         })}
       </div>
 
-      {/* Viewport + stats overlay. min-h-0 lets flex-1 size this box to the
-          remaining space rather than the canvas's intrinsic size. */}
-      <Card className="relative flex-1 min-h-0 flex items-center justify-center overflow-hidden">
+      {/* Viewport + stats overlay. flex-1 sizes this box to the remaining space
+          rather than the canvas's intrinsic size; the min-height is a floor so a
+          short window scrolls the column (see above) instead of collapsing the
+          video to nothing. */}
+      <Card className="relative flex-1 min-h-[220px] flex items-center justify-center overflow-hidden">
         {!selection ? (
           <p className="text-bambu-gray text-sm px-6 text-center">{t('camera.timeline.selectPrompt')}</p>
         ) : (
@@ -1113,52 +1191,56 @@ export function CameraTimelineView({ printers }: CameraTimelineViewProps) {
           <span className="text-white font-medium">{printers.find(p => p.id === activePrinterId)?.name}</span>
           <span>{t('camera.timeline.retentionNote', { days: 7 })}</span>
         </CardHeader>
-        <CardContent className="overflow-x-auto" dense>
+        <CardContent dense>
           {activeTimeline.length === 0 ? (
             <p className="text-sm text-bambu-gray">{t('settings.sentryNoRecordings')}</p>
           ) : (
-            <div className="min-w-max">
-              {/* Boundary rail: a tick + timestamp at the start of each block. */}
-              <div className="flex h-5">
-                {activeTimeline.map((b, i) => (
-                  <div key={i} style={{ width: blockWidths[i] }} className="relative shrink-0">
-                    <div className="absolute left-0 top-3 h-2 w-px bg-bambu-gray-dark" />
-                    {blockWidths[i] >= 46 && (
-                      <span className="absolute left-1 top-0 text-[9px] font-mono text-bambu-gray whitespace-nowrap">{shortTime(b.start)}</span>
-                    )}
-                  </div>
-                ))}
-              </div>
-              <div className="flex h-20">
-                {activeTimeline.map((b, i) => {
-                  const durMs = b.end - b.start;
-                  const widthPx = blockWidths[i];
-                  const maxTiles = Math.max(1, Math.min(16, Math.floor(widthPx / 28)));
-                  const isJob = b.type === 'job';
-                  const inRange = isJob ? [] : activeSnaps.filter(s => s.ms >= b.start && s.ms <= b.end);
-                  const title = isJob
-                    ? `${jobLabel(b.recording)} — ${formatDuration(durMs / 1000)} — ${b.recording.archive_status ?? b.recording.status} — ${formatFileSize(b.recording.size_bytes)}`
-                    : `${t('camera.timeline.standby')} — ${formatDuration(durMs / 1000)} — ${inRange.length} ${t('camera.timeline.snapsLabel')}`;
-                  const selected = isJob
-                    ? selection?.kind === 'recording' && selection.archiveId === b.recording.archive_id
-                    : selection?.kind === 'gap' && selection.start === b.start && selection.end === b.end;
-                  return (
-                    <FilmstripBlock
-                      key={i}
-                      printerId={activePrinterId}
-                      block={b}
-                      snaps={activeSnaps}
-                      maxTiles={maxTiles}
-                      thickCap
-                      jobFooter={isJob ? jobLabel(b.recording) : undefined}
-                      gapPill={!isJob ? `${inRange.length} ${t('camera.timeline.snapsLabel')}` : undefined}
-                      selected={selected}
-                      title={title}
-                      onClick={isJob ? () => selectRecording(b.recording) : inRange.length > 0 ? () => selectGap(b.start, b.end) : undefined}
-                      style={{ width: widthPx }}
-                    />
-                  );
-                })}
+            // The scroller is this inner div, not the card body, so the legend
+            // below stays put instead of sliding off with the strip.
+            <div ref={timelineScrollRef} className="overflow-x-auto">
+              <div className="min-w-max">
+                {/* Boundary rail: a tick + timestamp at the start of each block. */}
+                <div className="flex h-5">
+                  {activeTimeline.map((b, i) => (
+                    <div key={i} style={{ width: blockWidths[i] }} className="relative shrink-0">
+                      <div className="absolute left-0 top-3 h-2 w-px bg-bambu-gray-dark" />
+                      {blockWidths[i] >= 46 && (
+                        <span className="absolute left-1 top-0 text-[9px] font-mono text-bambu-gray whitespace-nowrap">{shortTime(b.start)}</span>
+                      )}
+                    </div>
+                  ))}
+                </div>
+                <div className="flex h-20">
+                  {activeTimeline.map((b, i) => {
+                    const durMs = b.end - b.start;
+                    const widthPx = blockWidths[i];
+                    const maxTiles = Math.max(1, Math.min(16, Math.floor(widthPx / 28)));
+                    const isJob = b.type === 'job';
+                    const inRange = isJob ? [] : activeSnaps.filter(s => s.ms >= b.start && s.ms <= b.end);
+                    const title = isJob
+                      ? `${jobLabel(b.recording)} — ${formatDuration(durMs / 1000)} — ${b.recording.archive_status ?? b.recording.status} — ${formatFileSize(b.recording.size_bytes)}`
+                      : `${t('camera.timeline.standby')} — ${formatDuration(durMs / 1000)} — ${inRange.length} ${t('camera.timeline.snapsLabel')}`;
+                    const selected = isJob
+                      ? selection?.kind === 'recording' && selection.archiveId === b.recording.archive_id
+                      : selection?.kind === 'gap' && selection.start === b.start && selection.end === b.end;
+                    return (
+                      <FilmstripBlock
+                        key={i}
+                        printerId={activePrinterId}
+                        block={b}
+                        snaps={activeSnaps}
+                        maxTiles={maxTiles}
+                        thickCap
+                        jobFooter={isJob ? jobLabel(b.recording) : undefined}
+                        gapPill={!isJob ? `${inRange.length} ${t('camera.timeline.snapsLabel')}` : undefined}
+                        selected={selected}
+                        title={title}
+                        onClick={isJob ? () => selectRecording(b.recording) : inRange.length > 0 ? () => selectGap(b.start, b.end) : undefined}
+                        style={{ width: widthPx }}
+                      />
+                    );
+                  })}
+                </div>
               </div>
             </div>
           )}
