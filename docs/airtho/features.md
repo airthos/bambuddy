@@ -216,6 +216,20 @@ rows. Settings: `sentry_enabled`, `sentry_retention_days` (default 7), `sentry_p
   thumbnail / download / keep-forever / delete; per-printer snapshots list + image;
   global: storage summary (per-printer breakdown, same shape as the general
   storage-usage endpoint the Settings UI uses) and clear-all.
+- **Video export contract** (`camera_frame_pack.render_timelapse`, `230253fb`): the
+  timelapse download is always **exactly 60s at 30fps (1800 frames) in the camera's
+  native resolution**, whatever the print's length — a 24-minute job and a 209-hour
+  session both export as the same one-minute clip. It replaced a fixed 100x speed
+  multiplier at half res, which made export length unpredictable and pushed *every*
+  frame through Pillow (unusable on a 277k-frame recording). Frames are sampled over
+  **gap-capped elapsed time**, not ordinal position: capture is bursty (startup/leveling
+  runs near 30fps, the print body is one frame every 1–2s), so ordinal sampling would
+  hand the startup burst most of the minute. Recordings shorter than 1800 frames hold
+  frames (hardlinked) rather than coming out short. Frames go to ffmpeg as their
+  original bytes; only one whose dimensions differ from the first frame is resampled,
+  because the `image2` demuxer needs a uniform size. Budget: ~40s render, ~40MB out at
+  1280x720 (`preset medium`, `crf 23`). Playback chunks are still half-res — this
+  changed the *download* only.
 
 **Known limitation:** true pre-roll (frames from *before* the camera connection opens)
 isn't physically possible without holding every printer's camera connection open 24/7,
