@@ -446,6 +446,11 @@ class PrintScheduler:
             # to clear it (#1865).
             require_plate_clear = await self._get_bool_setting(db, "require_plate_clear", default=False)
 
+            # Airtho fork: when "prefer recently-used spool" is on, a cached mapping
+            # must not be allowed to defeat the fresh pick — see _ensure_ams_mapping.
+            # Read once per tick rather than per item.
+            prefer_recent_enabled = await self._get_bool_setting(db, "prefer_recently_used_filament")
+
             if not items:
                 # No dispatchable pending items — still check auto-drying on idle
                 # printers, but keep any printer with an upload still in flight
@@ -644,7 +649,9 @@ class PrintScheduler:
                     # (all -1). A stored all-[-1] mapping is a bug artifact — a
                     # frontend status-load race can persist [-1] (#2589) — and
                     # must be recomputed from live trays rather than trusted.
-                    await self._ensure_ams_mapping(db, item.printer_id, item)
+                    await self._ensure_ams_mapping(
+                        db, item.printer_id, item, prefer_recent=prefer_recent_enabled
+                    )
 
                     # Filament-deficit pre-dispatch check (#1496). If the
                     # assigned spool can't satisfy any required slot grams,
@@ -814,7 +821,9 @@ class PrintScheduler:
                         # missing OR unresolved (all -1). Critical for model-based
                         # jobs where mapping wasn't computed upfront, and it also
                         # self-heals a bogus stored [-1] (#2589).
-                        await self._ensure_ams_mapping(db, printer_id, item)
+                        await self._ensure_ams_mapping(
+                            db, printer_id, item, prefer_recent=prefer_recent_enabled
+                        )
 
                         # Filament-deficit pre-dispatch check (#1496).
                         if await self._block_on_filament_deficit(db, item):
@@ -1389,7 +1398,14 @@ class PrintScheduler:
                 matches += 1
         return matches
 
-    async def _ensure_ams_mapping(self, db: AsyncSession, printer_id: int, item: PrintQueueItem) -> None:
+    async def _ensure_ams_mapping(
+        self,
+        db: AsyncSession,
+        printer_id: int,
+        item: PrintQueueItem,
+        *,
+        prefer_recent: bool = False,
+    ) -> None:
         """Ensure the queue item carries a usable AMS mapping before dispatch.
 
         Recomputes from live printer status when the stored mapping is missing OR
@@ -1417,16 +1433,18 @@ class PrintScheduler:
         # user's manual mapping is never overwritten. Two farm-specific triggers
         # override that and force a recompute anyway (Airtho fork):
         #
-        #  1. "Prefer recently-used spool" is on. The whole point of that setting
-        #     is that the pick tracks the printer's current last-loaded tray, so a
-        #     mapping cached at queue time (or baked in by the Print modal) must
-        #     not be allowed to defeat it. Non-RFID farm spools report remain=-1
-        #     and so never validate as "empty", which means trigger 2 below would
-        #     never fire for them.
-        #  2. The cached mapping points at a slot that has since run out. Without
-        #     this the item dispatches against an empty tray.
+        #  1. ``prefer_recent`` — "Prefer recently-used spool" is on. The whole
+        #     point of that setting is that the pick tracks the printer's current
+        #     last-loaded tray, so a mapping cached at queue time (or baked in by
+        #     the Print modal) must not be allowed to defeat it. Non-RFID farm
+        #     spools report remain=-1 and so never validate as "empty", which
+        #     means trigger 2 below would never fire for them. Passed in rather
+        #     than read here: check_queue reads it once per tick, and keeping the
+        #     read out of this function leaves the resolved path free of DB work.
+        #  2. The cached mapping points at a slot that has since run out. Checked
+        #     against live printer status (no DB). Without this the item
+        #     dispatches against an empty tray.
         if item.ams_mapping and not _mapping_is_all_unresolved(stored_mapping):
-            prefer_recent_enabled = await self._get_bool_setting(db, "prefer_recently_used_filament")
             slot_ran_out = isinstance(stored_mapping, list) and not self._validate_ams_mapping(
                 printer_id, stored_mapping
             )
@@ -1435,7 +1453,7 @@ class PrintScheduler:
                     "Queue item %s: cached AMS mapping has empty slot(s), remapping",
                     item.id,
                 )
-            if not prefer_recent_enabled and not slot_ran_out:
+            if not prefer_recent and not slot_ran_out:
                 return
 
         computed_mapping = await self._compute_ams_mapping_for_printer(db, printer_id, item)

@@ -409,7 +409,12 @@ async def test_one_failing_upload_does_not_cancel_the_others(farm):
     """A dead printer must not take its siblings' in-flight uploads down with it.
 
     Each upload is an independent task, so one raising cannot cancel the others;
-    _start_print marks that one item failed and the rest proceed.
+    _start_print bounces that one item and the rest proceed.
+
+    Airtho fork: the failed item lands on 'pending', not 'failed'. A pre-dispatch
+    FTP failure is retried up to DISPATCH_MAX_ATTEMPTS before the row is failed
+    for real, so the first failure requeues it. What this test actually guards —
+    that one dead printer doesn't cancel the other three uploads — is unchanged.
     """
     ctx = await farm(4, max_concurrent=4)
     upload = _UploadRecorder(fail_for_ip="10.0.0.2")  # printer index 1
@@ -417,7 +422,7 @@ async def test_one_failing_upload_does_not_cancel_the_others(farm):
     await _run_check_queue(ctx, upload)
 
     statuses = await _statuses(ctx)
-    assert statuses[1] == "failed", "the unreachable printer's item should be marked failed"
+    assert statuses[1] == "pending", "the unreachable printer's item should be requeued for retry"
     assert [s for i, s in enumerate(statuses) if i != 1] == ["printing"] * 3, (
         "the other three printers must have started despite the failure"
     )

@@ -519,8 +519,22 @@ class TestPlateGateEndToEnd:
     async def test_finish_awaiting_dispatch_eligibility_matches_setting(
         self, mock_pm, scheduler, row_value, expected_gate
     ):
-        """A FINISH printer with the awaiting flag raised is dispatch-eligible IFF the
-        gate is off. Reads the setting from a real DB, then feeds it to the real gate."""
+        """A FINISH printer with the awaiting flag raised is never dispatch-eligible.
+
+        Airtho fork (e878ec77): upstream makes this conditional on the gate, so with
+        require_plate_clear off a FINISH printer dispatches even while the awaiting
+        flag is up. The farm runs with the gate off by design — push-off clears the
+        plate on a normal finish — but the flag is only ever raised for prints that
+        ended WITHOUT running the push-off (failed/aborted/cancelled), which means
+        the partial part is still on the bed. Dispatching there starts the next job
+        onto a fouled plate; the observed result was under-printed parts swept into
+        the output bin (verified on 3DP 4, items 1285-1287). So the flag holds
+        dispatch regardless of the setting, and the setting only controls whether the
+        flag is raised after a *successful* print.
+
+        The gate value is still parsed from a real DB row here — that part is
+        upstream's #1865 coverage and is unchanged.
+        """
         require_plate_clear = await self._read_setting(scheduler, row_value)
         assert require_plate_clear is expected_gate
 
@@ -528,9 +542,12 @@ class TestPlateGateEndToEnd:
         mock_pm.get_status.return_value = MagicMock(state="FINISH")
         mock_pm.is_awaiting_plate_clear.return_value = True  # bed potentially fouled
 
-        is_idle = scheduler._is_printer_idle(1, require_plate_clear)
-        # Gate OFF -> idle (dispatches). Gate ON -> not idle (waits for ack).
-        assert is_idle is (not expected_gate)
+        # Fork semantics: awaiting-plate-clear wins over the setting, both ways.
+        assert scheduler._is_printer_idle(1, require_plate_clear) is False
+
+        # With the flag down, the printer is dispatch-eligible again regardless.
+        mock_pm.is_awaiting_plate_clear.return_value = False
+        assert scheduler._is_printer_idle(1, require_plate_clear) is True
 
     @pytest.mark.asyncio
     @patch("backend.app.services.print_scheduler.printer_manager")

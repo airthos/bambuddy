@@ -50,7 +50,17 @@ async def _run_with_backup(scheduler, backup_state, prefer_lowest_setting):
 
     captured: dict = {}
 
-    def _capture_match(reqs, loaded_, prefer, overrides, fts_installed=False):
+    # Signature tracks _match_filaments_to_slots: the Airtho fork inserts
+    # prefer_recent / preferred_tray ahead of upstream's fts_installed.
+    def _capture_match(
+        reqs,
+        loaded_,
+        prefer,
+        overrides,
+        prefer_recent=False,
+        preferred_tray=None,
+        fts_installed=False,
+    ):
         captured["prefer_lowest"] = prefer
         return [0]
 
