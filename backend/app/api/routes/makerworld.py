@@ -21,7 +21,12 @@ from fastapi.responses import Response
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.app.api.routes.cloud import get_stored_token
+from backend.app.api.routes.cloud import (
+    get_stored_token,
+    is_cloud_token_invalid,
+    mark_cloud_token_invalid,
+    resolve_api_key_cloud_owner,
+)
 from backend.app.api.routes.library import save_3mf_bytes_to_library
 from backend.app.core.auth import RequirePermissionIfAuthEnabled
 from backend.app.core.database import get_db
@@ -58,10 +63,16 @@ async def _build_service(db: AsyncSession, user: User | None) -> MakerWorldServi
     stored Bambu Cloud bearer token when available.
 
     Mirrors ``cloud.build_authenticated_cloud`` — the token is entirely
-    optional; anonymous calls (metadata, URL resolution) still work.
+    optional; anonymous calls (metadata, URL resolution) still work — and,
+    like it, records a rejected token so the whole app agrees the sign-in is
+    dead rather than each feature failing on its own.
     """
     token, _email, _region = await get_stored_token(db, user)
-    return MakerWorldService(auth_token=token)
+    user_id = user.id if user is not None else None
+    return MakerWorldService(
+        auth_token=token,
+        on_auth_failure=lambda: mark_cloud_token_invalid(user_id),
+    )
 
 
 def _canonical_url(model_id: int, profile_id: int | None = None) -> str:
@@ -143,11 +154,29 @@ async def proxy_thumbnail(
 async def get_status(
     db: AsyncSession = Depends(get_db),
     current_user: User | None = RequirePermissionIfAuthEnabled(Permission.MAKERWORLD_VIEW),
+    api_key_cloud_owner: User | None = Depends(resolve_api_key_cloud_owner),
 ):
-    """Report whether the caller can import 3MFs (needs a Bambu Cloud token)."""
-    token, _email, _region = await get_stored_token(db, current_user)
+    """Report whether the caller can import 3MFs (needs a Bambu Cloud token).
+
+    API-keyed callers (which return None from ``current_user``) get the
+    owner User via ``resolve_api_key_cloud_owner`` when the key carries the
+    cloud-access scope, so ``has_cloud_token`` reflects the owning user's
+    stored token rather than always reporting ``False`` (#1777, same shape
+    as the cloud-presets fix in #1182).
+    """
+    cloud_token_user = current_user or api_key_cloud_owner
+    token, _email, _region = await get_stored_token(db, cloud_token_user)
     has_token = bool(token)
-    return MakerWorldStatus(has_cloud_token=has_token, can_download=has_token)
+    # A token Bambu has already rejected downloads nothing. ``can_download``
+    # used to be a bare alias for ``has_cloud_token``, so the import button
+    # stayed enabled against a dead credential and the user found out via a
+    # 401 toast (#2562 follow-up).
+    expired = has_token and await is_cloud_token_invalid(db, cloud_token_user)
+    return MakerWorldStatus(
+        has_cloud_token=has_token,
+        can_download=has_token and not expired,
+        sign_in_expired=expired,
+    )
 
 
 @router.post("/resolve", response_model=MakerWorldResolvedModel)
@@ -155,6 +184,7 @@ async def resolve_url(
     body: MakerWorldResolveRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User | None = RequirePermissionIfAuthEnabled(Permission.MAKERWORLD_VIEW),
+    api_key_cloud_owner: User | None = Depends(resolve_api_key_cloud_owner),
 ):
     """Resolve a MakerWorld URL to full model metadata + plate list.
 
@@ -167,7 +197,10 @@ async def resolve_url(
     except MakerWorldError as exc:
         raise _map_service_error(exc) from exc
 
-    service = await _build_service(db, current_user)
+    # API-keyed callers carry identity on the key, not in current_user — see
+    # the /status handler comment and #1777 / #1182.
+    cloud_token_user = current_user or api_key_cloud_owner
+    service = await _build_service(db, cloud_token_user)
     try:
         design = await service.get_design(model_id)
         instances_envelope = await service.get_design_instances(model_id)
@@ -240,6 +273,7 @@ async def import_instance(
     body: MakerWorldImportRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User | None = RequirePermissionIfAuthEnabled(Permission.MAKERWORLD_IMPORT),
+    api_key_cloud_owner: User | None = Depends(resolve_api_key_cloud_owner),
 ):
     """Download a specific MakerWorld instance (plate configuration) and save
     the 3MF into the library.
@@ -278,7 +312,12 @@ async def import_instance(
             await db.flush()
         effective_folder_id = mw_folder.id
 
-    service = await _build_service(db, current_user)
+    # API-keyed callers carry identity on the key, not in current_user — see
+    # the /status handler comment and #1777 / #1182. The same resolved user
+    # is reused for owner_id on save_3mf_bytes_to_library below so the
+    # library row is attributed to the key's owner rather than NULL.
+    cloud_token_user = current_user or api_key_cloud_owner
+    service = await _build_service(db, cloud_token_user)
 
     # YASTL#51's iot-service endpoint needs the *alphanumeric* modelId
     # (e.g. "US2bb73b106683e5"), not the integer design id from /models/{N}.
@@ -387,7 +426,7 @@ async def import_instance(
         folder_id=effective_folder_id,
         source_type=_SOURCE_TYPE,
         source_url=source_url,
-        owner_id=current_user.id if current_user else None,
+        owner_id=cloud_token_user.id if cloud_token_user else None,
     )
 
     return MakerWorldImportResponse(

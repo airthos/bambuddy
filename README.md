@@ -6,21 +6,26 @@
 
 <p align="center">
   <strong>Your printers. No cloud. Your rules.</strong><br>
-  Self-hosted command center for Bambu Lab &mdash; from one A1 to a 40-printer farm.
+  Self-hosted command center for Bambu Lab &mdash; from one A1 to an entire print farm.
 </p>
 
 <p align="center">
-  <a href="https://github.com/maziggy/bambuddy/releases"><img src="https://img.shields.io/github/v/release/maziggy/bambuddy?style=flat-square&color=blue" alt="Release"></a>
+  <a href="https://github.com/maziggy/bambuddy/releases"><img src="https://img.shields.io/github/v/release/maziggy/bambuddy?style=flat-square&color=blue&cacheSeconds=3600" alt="Release"></a>
   <img src="https://github.com/maziggy/bambuddy/actions/workflows/ci.yml/badge.svg?branch=main">
   <img src="https://github.com/maziggy/bambuddy/actions/workflows/github-code-scanning/codeql/badge.svg">
   <img src="https://github.com/maziggy/bambuddy/actions/workflows/security.yml/badge.svg">
-  <a href="https://github.com/maziggy/bambuddy/blob/main/LICENSE"><img src="https://img.shields.io/github/license/maziggy/bambuddy?style=flat-square" alt="License"></a>
-  <a href="https://github.com/maziggy/bambuddy/stargazers"><img src="https://img.shields.io/github/stars/maziggy/bambuddy?style=flat-square" alt="Stars"></a>
-  <a href="https://github.com/maziggy/bambuddy/issues"><img src="https://img.shields.io/github/issues/maziggy/bambuddy?style=flat-square" alt="Issues"></a>
+  <a href="https://github.com/maziggy/bambuddy/blob/main/LICENSE"><img src="https://img.shields.io/github/license/maziggy/bambuddy?style=flat-square&cacheSeconds=3600" alt="License"></a>
+  <a href="https://github.com/maziggy/bambuddy/stargazers"><img src="https://img.shields.io/github/stars/maziggy/bambuddy?style=flat-square&cacheSeconds=3600" alt="Stars"></a>
+  <a href="https://github.com/maziggy/bambuddy/issues"><img src="https://img.shields.io/github/issues/maziggy/bambuddy?style=flat-square&cacheSeconds=3600" alt="Issues"></a>
   <a href="https://discord.gg/aFS3ZfScHM"><img src="https://img.shields.io/discord/1461241694715645994?style=flat-square&logo=discord&logoColor=white&label=Discord&color=5865F2" alt="Discord"></a>
   <a href="https://github.com/sponsors/maziggy"><img src="https://img.shields.io/badge/GitHub_Sponsors-Sponsor-ea4aaa?style=flat-square&logo=github-sponsors&logoColor=white" alt="GitHub Sponsors"></a>
   <a href="https://sponsors.bambuddy.cool"><img src="https://img.shields.io/badge/Sponsors_Portal-sponsors.bambuddy.cool-2dd4bf?style=flat-square&logo=heart&logoColor=white" alt="Sponsors Portal"></a>
   <a href="https://ko-fi.com/maziggy"><img src="https://img.shields.io/badge/Ko--fi-Support-ff5e5b?style=flat-square&logo=ko-fi&logoColor=white" alt="Ko-fi" target=_blank></a>
+</p>
+
+<p align="center">
+  <sub><strong>Backed by</strong></sub><br>
+  <a href="https://northpole3dprinting.com/"><img src="static/img/sponsors/northpole-3d-printing.jpg" alt="North Pole 3D Printing" height="60"></a>
 </p>
 
 <p align="center">
@@ -49,9 +54,12 @@
 > — Adam Conway, [XDA-Developers](https://www.xda-developers.com/finally-have-full-control-bambu-lab-printer-ditched-bambu-cloud/)
 
 <p align="center">
+  <a href="https://hackaday.com/2026/06/13/bambuddy-says-bye-to-bambu-lab-cloud-services/"><img src="https://img.shields.io/badge/Hackaday-Read-F2A724?style=flat-square&labelColor=000000" alt="Hackaday"></a>
   <a href="https://www.xda-developers.com/finally-have-full-control-bambu-lab-printer-ditched-bambu-cloud/"><img src="https://img.shields.io/badge/XDA--Developers-Read-C8102E?style=flat-square" alt="XDA-Developers"></a>
   <a href="https://www.howtogeek.com/free-your-bambu-lab-3d-printer-from-the-cloud/"><img src="https://img.shields.io/badge/How--To%20Geek-Read-33A6CA?style=flat-square" alt="How-To Geek"></a>
+  <a href="https://www.makeuseof.com/free-browser-tool-beats-bambu-lab-at-own-game/"><img src="https://img.shields.io/badge/MakeUseOf-Read-E02D2D?style=flat-square" alt="MakeUseOf"></a>
   <a href="https://www.fabbaloo.com/news/bambuddy-launches-as-open-source-alternative-to-bambu-labs-cloud"><img src="https://img.shields.io/badge/Fabbaloo-Read-F77B0F?style=flat-square" alt="Fabbaloo"></a>
+  <a href="https://itsfoss.com/news/bambuddy-self-hosted-bambu-lab-alternative/"><img src="https://img.shields.io/badge/It's%20FOSS-Read-00B5AD?style=flat-square" alt="It's FOSS"></a>
   <a href="https://www.igorslab.de/en/bambuddy-the-silent-alternative-to-the-bamboo-cloud/"><img src="https://img.shields.io/badge/Igor's%20Lab-Read-E10000?style=flat-square" alt="Igor's Lab"></a>
   <a href="https://3druck.com/en/programs/bambuddy-open-source-tool-replaces-bambu-cloud-for-management-and-automation-of-3d-print-jobs-38153226/"><img src="https://img.shields.io/badge/3Druck-Read-0080C0?style=flat-square" alt="3Druck"></a>
   <a href="https://www.fastblinker.com/bambuddy-the-open-source-solution-thats-revolutionizing-bambu-lab-3d-printer-management/"><img src="https://img.shields.io/badge/FastBlinker-Read-00B0FF?style=flat-square" alt="FastBlinker"></a>
@@ -104,6 +112,20 @@ Optional but recommended — drop the [`slicer-api/` Compose stack](slicer-api/R
 
 ---
 
+## 🧩 NEW: Slicer Pipelines — Save a Recipe, Reuse in One Click
+
+**Stop re-picking the same printer + process + filament + bed-type combination every slice.** Save a Slicer **Pipeline** once from the Slice dialog, then apply the whole bundle to any file with a single click — from File Manager, Archives, or MakerWorld imports.
+
+- 🧩 **One-click reuse** — A pipeline captures the entire Slice modal selection (printer + process + per-AMS-slot filaments + bed type) and surfaces as **Run with pipeline → \<name\>** on every sliceable row.
+- 🎯 **Specific printer or printer class** — Pin a pipeline to one printer, or to a *class* (e.g. *any X1C*) and let the queue scheduler pick the first available match. Identical-fleet farms get a single recipe instead of one-per-printer.
+- 🪢 **Multi-copy fanout** — Slice once, dispatch up to N copies. With class targeting the copies fan out across the matching printers in parallel — **Spread** (fastest wall-clock), **Single printer** (minimise colour-change overhead), or **First N** (one to each).
+- 📊 **Runs dashboard** — A new **Pipelines** tab on the Print Queue page lists every run with colour-coded status badges (queued / slicing / dispatching / in-progress / completed / partial-failure / failed / cancelled), per-copy detail on expand, filter dropdowns (Pipeline / Status / Target), and a **Retry failed** button that re-runs only the copies that didn't complete — successful copies are never re-printed.
+- 🔒 **Permission-gated** — Three permissions (`pipelines:read` / `pipelines:write` / `pipelines:run`) let you split authoring the recipe from spending filament with it.
+
+👉 **[Slicer Pipelines Guide →](https://wiki.bambuddy.cool/features/slicer-pipelines/)**
+
+---
+
 ## Why Bambuddy?
 
 - **Own your data** — All print history stored locally, no cloud dependency
@@ -134,29 +156,36 @@ Optional but recommended — drop the [`slicer-api/` Compose stack](slicer-api/R
 
 ### 📊 Monitoring & Control
 - Real-time printer status via WebSocket
+- **Print progress in the browser tab** — optional (off by default, toggle under Settings → Appearance): shows the soonest-finishing print's percentage in the tab title and a progress-ring favicon in your theme accent colour
 - Live camera streaming (MJPEG) & snapshots with multi-viewer support — most Bambu printers only allow one upstream connection, so Bambuddy fans out a single shared stream to all browser tabs / cards / overlays
+- **Cam Wall view** — Toggle the Printers page from cards into a responsive grid of camera tiles for at-a-glance monitoring across the whole farm. On-screen tiles stream live up to a configurable cap (default 4) so RPi installs stay sustainable; the rest fall back to periodic snapshot polling, and off-screen tiles pause entirely. Per-user settings (live cap, snapshot interval); click any tile to open the floating viewer or the dedicated camera window depending on your existing camera-view preference
 - **Long-lived camera tokens** for Home Assistant / Frigate / kiosks — mint a token from Settings → API Keys, paste it once, capped at 365 days, revocable at any time (no infinite tokens — leaked permanent tokens are unsafe by design)
 - **Streaming overlay for OBS** - Embeddable page with camera + status for live streaming (`/overlay/:printerId`), configurable FPS (`?fps=30`), status-only mode (`?camera=false`)
 - External camera support (MJPEG, RTSP, HTTP snapshot, USB/V4L2) with layer-based timelapse
 - **Build plate empty detection** - Auto-pause print if objects detected on plate (multi-reference calibration, ROI adjustment)
-- Fan status monitoring (part cooling, auxiliary, chamber)
-- Printer control (stop, pause, resume, chamber light, print speed, **airduct mode** for P2S/H2*, **build-plate Z-jog** with Studio-style not-homed warning)
+- Fan monitoring and **speed control** for part-cooling, auxiliary, and chamber fans (0–100% with customizable quick-select presets)
+- Printer control (stop, pause, resume, chamber light, print speed, **airduct mode** for P2S/H2*, **temperature setpoints** for nozzle / bed / **chamber heater** on H2C/H2D/H2DPro/H2S/X2D, **Z-jog / XY-jog / extruder jog**, customizable temperature & fan presets under Settings → Workflow)
 - **Status badges on printer card**: SD Card (green / red), Enclosure Door (green / yellow — X1/P1S/P2S/H2*), Airduct Mode (cooling / heating)
 - **Force Refresh** menu item — request a full status push from the printer without reconnecting
+- **Maintenance Mode** — put a printer "out of service" without removing it. Toggle from the card's three-dot menu, the in-card amber banner, or the Edit Printer dialog; the printer disconnects MQTT, drops out of queue dispatch, the scheduler, model-based filament lookups, metrics, and notifications until you take it out again. The card stays visible (amber wrench banner + Exit button) so the printer never disappears from your dashboard. Useful for parallel Bambuddy installs sharing the same hardware, printers under repair or awaiting parts, and temporary suspension.
 - Bulk printer actions (multi-select cards, then stop/pause/resume/clear all — select by state or location)
 - Printer search and filters — live search by name/model/location/serial plus status and location dropdown filters (WebSocket-reactive, mobile-friendly)
 - Resizable printer cards (S/M/L/XL)
 - Skip objects during print
 - AMS slot RFID re-read
 - **AMS slot Load / Unload from the printer card** — Hover any AMS slot or external spool, click the menu button, and load that tray or unload the currently-loaded one without going to the touchscreen; supports dual-extruder H2D (Ext-L / Ext-R drive their own nozzle)
+- **AMS Filament Backup status + control with pair view** — Mirrors BambuStudio's per-printer "AMS Filament Backup" auto-switch (when a spool runs out, the printer rolls over to a same-preset, same-colour spool in another slot). A small badge in the Filaments section header on each printer card shows the live state (blue circular-arrow icon = ON, dim = OFF, "?" = A1 family with no `cfg` field yet); click to open the AMS Filament Backup modal — a BambuStudio Auto Refill-style ring graphic per backup pair, with the filament colour as the ring fill and member slot labels (e.g. `A·1`, `B·3`) on contrast-aware pills around the band. Dual-extruder printers (H2D / H2C / X2D) carry an `R` / `L` badge per ring because the firmware can't cross extruders. State syncs in real time whether you toggled from Bambuddy, BambuStudio, or the printer's touchscreen. Bambuddy's "insufficient filament" check is **backup-aware**: when Backup is ON, the deficit check pools remaining grams across same-`(preset, colour)` spools on the printer, so the warning doesn't fire spuriously when the firmware will swap to a peer mid-print (#1762). Bambuddy's **Prefer Lowest Remaining Filament** sort also respects the toggle — when Backup is OFF the dispatcher skips the prefer-lowest sort entirely so it won't reach for a near-empty spool the printer can't roll off of.
 - AMS slot configuration (model-filtered presets, K profiles, color picker, pre-population for configured slots)
 - AMS info card (hover for serial number, firmware version) with custom friendly names that persist across printers
-- **AMS remote drying** — Start, monitor, and stop drying sessions for AMS 2 Pro and AMS-HT directly from the Printers page with filament-based temperature/duration presets, optional spool rotation; automatic PSU detection and HMS power error reporting
+- **AMS remote drying** — Start, monitor, and stop drying sessions for AMS 2 Pro and AMS-HT directly from the Printers page with filament-based temperature/duration presets, optional spool rotation; automatic PSU detection and HMS power error reporting. Rotate-spool toggle is disabled per-AMS when any tray has filament threaded into the feed tube (the AMS mechanism is locked there — rotating would jam the filament)
 - **Queue auto-drying** — Automatically dry filament between scheduled prints when humidity exceeds threshold; configurable presets per filament type, optional blocking mode
 - **Ambient drying** — Automatically keep filament dry on idle printers based on humidity, regardless of whether prints are queued
+- **Continue drying while printing** — On capable hardware (H2D 01.03.00.00+, H2C / H2S / P2S / H2D Pro 01.02.00.00+, X2D / A2L 01.01.00.00+, X1C 01.11.02.00+), auto-drying can keep running during a print. Default off, opt-in toggle in Settings → Print Queue. Drying temperature is automatically capped 5°C below the idle preset (floor 40°C) to protect spools inside the hot enclosure
 - Configurable drying presets per filament type (temperature & duration for AMS 2 Pro and AMS-HT)
+- **Per-filament humidity threshold** — Set a different humidity trigger per filament type (e.g. Nylon at 20%, PLA at 60%, ASA at 30%) instead of one global value. Mixed-material AMS units use the most-restrictive threshold across the loaded spools so a single PLA + Nylon unit triggers at Nylon's level. Drives both the auto-drying scheduler and the hourly humidity alarm so the two can never disagree on whether a unit is "too humid"
 - Dual external spool support for H2D (Ext-L / Ext-R)
-- HMS error monitoring with history and clear errors
+- **HMS error monitoring with one-click actions** — Live HMS error log with history and the same Resume / Stop / Continue / Retry / Check Assistant / Don't Remind Me action buttons BambuStudio shows. Click and the matching MQTT command goes back to the printer — no more walking to the device just to dismiss a paused-print dialog. Catalog covers every Bambu model (X1 / P1 / A1 / H2 series); buttons are translated in all 13 supported locales
+- **Heater history charts** — Bambuddy logs nozzle, bed, and chamber readings every minute and surfaces them via a tiny chart icon on each heater tile in the printer card. Click for a per-heater modal with current / average / min / max stats, target overlay, and a 6h / 24h / 48h / 7d time range — works on read-only chamber sensors (X1C / P2S) too. AMS humidity and temperature get the same treatment (already shipped).
 - Print success rates & trends
 - Filament usage tracking
 - Cost analytics & failure analysis
@@ -165,9 +194,10 @@ Optional but recommended — drop the [`slicer-api/` Compose stack](slicer-api/R
 - CSV/Excel export
 
 ### ⏰ Scheduling & Automation
-- **Background print dispatch** — FTP uploads and print-start commands run in the background with real-time WebSocket progress toasts (per-job upload bars, status badges, cancel button)
-- Print queue with drag-and-drop and timeline schedule view
+- **Unified dispatch through the queue** — Every print Bambuddy starts (File Manager, archive reprint, printer-card upload-and-print, scheduled queue items) flows through the same queue scheduler, so each print is visible on the queue page, attributable to the user that started it, deficit-checked, and cancellable from one place. FTP uploads and print-start commands run in the background with real-time WebSocket progress toasts (per-job upload bars, status badges, cancel button). Installations with custom groups or API keys: the immediate-print actions now require the `queue:create` permission alongside the existing `printers:control` — see [the permissions guide](https://wiki.bambuddy.cool/admin/permissions/) if you've granted control without queue-create
+- Print queue with three tabs (Queue / History / Timeline), multi-select drag-and-drop, batch grouping, and a Gantt-style timeline
 - Multi-printer selection (send to multiple printers at once)
+- Batch grouping — multi-plate prints auto-group into a collapsible row; any 2+ selected items can be grouped manually via "Group as batch", with ungroup on the batch parent
 - Batch print quantity (print multiple copies — set quantity in the print/schedule dialog, first copy prints immediately, rest are queued)
 - Staggered batch start (start printers in groups with configurable interval to avoid power spikes — works in both Print and Queue dialogs)
 - Configurable default print options (bed levelling, flow/vibration calibration, first layer inspection, timelapse) in Settings → Workflow
@@ -181,6 +211,7 @@ Optional but recommended — drop the [`slicer-api/` Compose stack](slicer-api/R
 - Queue Only mode (stage without auto-start)
 - Clear plate confirmation between queued prints (can be disabled in settings for farm workflows)
 - Auto-print G-code injection (per-model start/end snippets for Farmloop, SwapMod, AutoClear, Printflow 3D — toggle per queue item)
+- **Preheat & Heat Soak before queued prints** — Heat the bed (and the chamber, on supported printers) and hold at temperature between FTP upload and print start. Per-print Inherit / On / Off override in the Print Options panel; per-filament chamber-target map under Settings → Workflow so PA wants 50°C, ABS 45°C, PETG-CF 40°C, PLA 0°C (skips chamber phase automatically). Hardware-aware: H-series / X2D / X1E actively heat the chamber via M141; X1C / P2S rely on bed radiation with a chamber-sensor wait; P1S / P1P / A1 family have no chamber sensor so only the soak timer applies. The cooling/heating airduct flap on H-series / X2D / P2S auto-switches to match the resolved chamber target — preheat for ABS opens nothing and recirculates warm air; preheat for PLA opens the exhaust and vents — so engineering filaments actually reach target instead of fighting the open flap, and PLA prints don't inherit a previously-hot recirculation. M191 (wait-for-chamber-temp) isn't honoured by Bambu firmware, so doing this at the orchestration layer is the only place it works
 - Smart plug integration (Tasmota, Home Assistant, MQTT, REST/Webhook)
 - REST smart plugs: Control any device with an HTTP API (openHAB, ioBroker, FHEM, Node-RED) with separate power/energy URLs and unit multipliers
 - MQTT smart plugs: Subscribe to Zigbee2MQTT, Shelly, or any MQTT topic for energy monitoring
@@ -192,7 +223,7 @@ Optional but recommended — drop the [`slicer-api/` Compose stack](slicer-api/R
 
 ### 📁 File Manager (Library)
 - Upload and organize sliced files (3MF, gcode, STL)
-- **External folder mounting** - Mount host directories (NAS, USB, network shares) without copying files
+- **External folder mounting** - Mount host directories (NAS, USB, network shares) without copying files. Operator-controlled via the `BAMBUDDY_EXTERNAL_ROOTS` env var (colon-separated allowlist of host paths users are permitted to register; empty by default to disable the feature). See [Docker → External library folders](https://wiki.bambuddy.cool/getting-started/docker/#external-library-folders-bambuddy_external_roots).
 - **STL thumbnail generation** - Auto-generate previews for STL files on upload or batch generate for existing files
 - ZIP file extraction with folder structure preservation
 - Option to create folder from ZIP filename
@@ -260,6 +291,7 @@ Optional but recommended — drop the [`slicer-api/` Compose stack](slicer-api/R
 - MQTT publishing for Home Assistant, Node-RED, etc.
 - **Prometheus metrics** - Export printer telemetry for Grafana dashboards
 - Bambu Cloud profile management
+- **Orca Cloud profile sync** — read your OrcaSlicer 2.4.0+ cloud-synced profiles directly in Bambuddy, usable for slicing alongside Bambu Cloud / local / standard presets. Four sign-in providers (Google / Apple / GitHub / email+password)
 - **Local Profiles** - Import OrcaSlicer presets (`.orca_filament`, `.bbscfg`, `.bbsflmt`, `.zip`, `.json`) without Bambu Cloud
 - K-profiles (pressure advance)
 - **GitHub backup** - Schedule automatic backups of cloud profiles, k profiles and settings to GitHub
@@ -267,7 +299,7 @@ Optional but recommended — drop the [`slicer-api/` Compose stack](slicer-api/R
 - External sidebar links
 - Webhooks & API keys
   - Per-user ownership — each key acts on behalf of its creator
-  - Optional **cloud-access scope** — opt in to let an API key read its owner's Bambu Cloud presets / filament catalogue / device list (off by default)
+  - Optional **cloud-access scope** — opt in to let an API key read its owner's Bambu Cloud + Orca Cloud presets / filament catalogue / device list (off by default)
 - Interactive API browser with live testing
 
 ### 🖨️ Virtual Printer & Remote Printing
@@ -342,6 +374,8 @@ Optional but recommended — drop the [`slicer-api/` Compose stack](slicer-api/R
 ---
 
 ## 📸 Screenshots
+
+> **Refreshed printer card in 1.2.5b2** — tighter layout, popovers for all controls (temperature setpoints, fan speeds, jog), and a bottom-aligned power row. The screenshots below predate the refresh.
 
 <details>
 <summary><strong>Click to expand screenshots</strong></summary>
@@ -480,7 +514,21 @@ Optional but recommended — drop the [`slicer-api/` Compose stack](slicer-api/R
 
 ### Installation
 
-#### Docker (Recommended)
+#### Windows (Native Installer)
+
+Self-contained `.exe` — no Python, Node, Docker, or Git required on the target machine. The installer bundles Python 3.13, the React frontend, ffmpeg, and registers Bambuddy as a Windows service.
+
+Download the latest installer:
+
+> https://github.com/maziggy/bambuddy/releases/latest/download/bambuddy-windows-x64-setup.exe
+
+Run it (one-time UAC prompt — admin install) → Bambuddy starts as a Windows service and the dashboard opens at **http://localhost:8000** automatically. Data lives at `C:\ProgramData\Bambuddy\`, install at `C:\Program Files\Bambuddy\`. To update, just run a newer installer over the existing install — your database and archives are preserved.
+
+> **SmartScreen warning:** until our SignPath OSS code-signing approval lands, you'll see "Windows protected your PC" on first run. Click **More info → Run anyway**.
+
+See the [Windows Installer Guide](https://wiki.bambuddy.cool/getting-started/windows-installer/) for service management, logs, and troubleshooting.
+
+#### Docker (Linux / macOS / Windows via Docker Desktop)
 
 **Option A: Pre-built image (fastest)**
 ```bash
@@ -619,13 +667,23 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
 
-# Run
-uvicorn backend.app.main:app --host 0.0.0.0 --port 8000
+# Run (--loop asyncio avoids a uvloop TLS bug that can truncate VP FTP uploads)
+uvicorn backend.app.main:app --host 0.0.0.0 --port 8000 --loop asyncio
 ```
 
 Open **http://localhost:8000** and add your printer!
 
 > **Need detailed instructions?** See the [Installation Guide](http://wiki.bambuddy.cool/getting-started/installation/)
+
+### Windows Native Installation
+
+Windows PowerShell (run as Administrator — the installer self-elevates via UAC if not):
+
+```powershell
+powershell -ExecutionPolicy Bypass -Command "iwr -useb https://raw.githubusercontent.com/maziggy/bambuddy/main/install/windows-installer.ps1 -OutFile windows-installer.ps1; .\windows-installer.ps1"
+```
+
+> Installs Bambuddy natively on Windows using Git, Python, a virtual environment, separate data/log directories, and optional NSSM Windows Service registration. See the [Windows Installer Guide](http://wiki.bambuddy.cool/getting-started/windows-installer/) for parameters and unattended-install options.
 
 ### Enabling Developer Mode
 
@@ -671,6 +729,7 @@ Full documentation available at **[wiki.bambuddy.cool](http://wiki.bambuddy.cool
 | P1 | P1P, P1S |
 | P2 | P2S |
 | A1 | A1, A1 Mini |
+| A2 | A2L |
 
 ---
 
@@ -694,22 +753,21 @@ Contributions welcome! Ways to help:
 2. **Test** — Report issues with your printer model
 3. **Translate** — Add new languages
 4. **Code** — Submit PRs for bugs or features
+5. **🔒 Security review** — *(specifically wanted, see below)*
 
 Not sure where to start? Reach out on [Discord](https://discord.gg/aFS3ZfScHM) or email **martin@bambuddy.cool** — I'll help you find something that fits.
 
-```bash
-# Development setup
-git clone https://github.com/maziggy/bambuddy.git
-cd bambuddy
+### 🔒 Looking for a security-focused contributor
 
-# Backend
-python3 -m venv venv && source venv/bin/activate
-pip install -r requirements.txt
-DEBUG=true uvicorn backend.app.main:app --reload
+I'm bringing on a contributor whose specific focus is keeping an eye on Bambuddy's security.
 
-# Frontend (separate terminal)
-cd frontend && npm install && npm run dev
-```
+Concretely:
+
+Track the `dev` branch and flag changes touching auth, permissions, token handling, or the CI security backstops. Async post-merge — no gating of in-flight PRs.
+
+What matters more than formal qualifications: fail-closed thinking by default, comfortable reading the auth layer (FastAPI + SQLAlchemy on the backend, a small React surface), willing to push back on `except Exception` shapes in security-sensitive code.
+
+No fixed time commitment. If you're interested — or know someone who fits — email `martin@bambuddy.cool` or DM on Discord.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
 
@@ -734,7 +792,7 @@ AGPL-3.0 License — see [LICENSE](LICENSE) for details.
 
 Bambuddy stays independent because real people support it directly. If Bambuddy makes your printers more useful, please consider:
 
-- **[GitHub Sponsors](https://github.com/sponsors/maziggy)** — five recurring tiers from $5/mo (Backer) to $500/mo (Corporate). Supporter+ ($15/mo) get access to a private sponsors space with a monthly newsletter and early release notes. Patron+ ($35/mo) vote on the quarterly roadmap. Sustaining Sponsor+ ($150/mo) get a direct async email line for technical questions (~2-3 business days). Corporate ($500/mo) get priority email response (next business day), README header logo, sitewide footer logo on [bambuddy.cool](https://bambuddy.cool), and [Press page](https://bambuddy.cool/press.html) placement.
+- **[GitHub Sponsors](https://github.com/sponsors/maziggy)** — five recurring tiers from $5/mo (Backer) to $300/mo (Corporate). Supporter+ ($15/mo) get access to a private sponsors space with a monthly newsletter and early release notes. Patron+ ($35/mo) vote on the quarterly roadmap. Sustaining Sponsor+ ($150/mo) get a direct async email line for technical questions (~2-3 business days). Corporate ($300/mo) get priority email response (next business day), README header logo, sitewide footer logo on [bambuddy.cool](https://bambuddy.cool), and [Press page](https://bambuddy.cool/press.html) placement.
 - **[Ko-fi](https://ko-fi.com/maziggy)** — one-time tip or recurring.
 
 Sponsors get listed in [BACKERS.md](BACKERS.md). Need commercial support (SLA, multi-printer consulting)? Email `martin@bambuddy.cool`.

@@ -8,43 +8,19 @@ from pydantic import BaseModel, Field, model_validator
 class PresetRef(BaseModel):
     """A source-aware reference to a printer / process / filament preset.
 
-    The SliceModal pulls dropdown options from three tiers (cloud / local /
-    standard). At submit time the client sends one of these per slot so the
-    backend knows where to fetch the preset content from at slice time.
+    The SliceModal pulls dropdown options from four tiers (orca_cloud /
+    cloud / local / standard). At submit time the client sends one of these
+    per slot so the backend knows where to fetch the preset content from at
+    slice time. ``cloud`` is Bambu Cloud (kept as the bare name for backward
+    compatibility with existing requests); ``orca_cloud`` is Orca Cloud.
     """
 
-    source: Literal["cloud", "local", "standard"]
-    id: str = Field(..., description=("Cloud setting_id, local DB row id (stringified), or standard preset name."))
-
-
-class SliceBundleSpec(BaseModel):
-    """Per-request reference to a Printer Preset Bundle stored on the slicer
-    sidecar. When SliceRequest.bundle is set, the dispatch skips PresetRef
-    resolution entirely and asks the sidecar to pick its inner JSON triplet
-    by name from the bundle's extracted directory — much faster than
-    re-uploading three profile JSONs every slice and matches the preset
-    triplet the user actually slices with in BambuStudio.
-    """
-
-    bundle_id: str = Field(
+    source: Literal["orca_cloud", "cloud", "local", "standard"]
+    id: str = Field(
         ...,
-        min_length=1,
-        description="Sidecar-side bundle id from POST /api/v1/slicer/bundles.",
-    )
-    printer_name: str = Field(
-        ...,
-        min_length=1,
-        description="Preset name within the bundle's printer/ directory (with or without the BambuStudio '# ' prefix).",
-    )
-    process_name: str = Field(
-        ...,
-        min_length=1,
-        description="Preset name within the bundle's process/ directory.",
-    )
-    filament_names: list[str] = Field(
-        ...,
-        min_length=1,
-        description="Per-slot filament preset names within the bundle's filament/ directory. Index 0 = slot 1.",
+        description=(
+            "Orca Cloud profile id, Bambu Cloud setting_id, local DB row id (stringified), or standard preset name."
+        ),
     )
 
 
@@ -91,15 +67,6 @@ class SliceRequest(BaseModel):
     # is empty so older clients keep working.
     filament_presets: list[PresetRef] = Field(default_factory=list)
 
-    # Bundle dispatch alternative — when set, presets above are ignored and
-    # the slicer dispatch picks per-category JSONs from a previously-imported
-    # .bbscfg on the sidecar. Validator below short-circuits the
-    # presets-required check when this is non-None.
-    bundle: SliceBundleSpec | None = Field(
-        default=None,
-        description="When set, slice via a sidecar-side bundle instead of resolved preset refs.",
-    )
-
     plate: int | None = Field(
         default=None,
         ge=0,
@@ -114,6 +81,32 @@ class SliceRequest(BaseModel):
     export_3mf: bool = Field(
         default=False,
         description="If true, request a 3MF response with embedded G-code instead of raw G-code.",
+    )
+    design_overrides: list[str] | None = Field(
+        default=None,
+        description=(
+            "3MF only. Process setting keys from the source file's "
+            "``different_settings_to_system`` to carry onto the picked process "
+            "preset (#2622) — the designer's own wall count, infill, first-layer "
+            "height and so on, which ``--load-settings`` would otherwise discard. "
+            "Only keys the source actually lists as changed are applied; anything "
+            "else is ignored. ``None``/empty means a plain profile slice."
+        ),
+    )
+    use_embedded_settings: bool = Field(
+        default=False,
+        description=(
+            "3MF only. Slice using the file's embedded "
+            "``Metadata/project_settings.config`` (the designer's own tweaks — wall "
+            "count, infill, etc.) instead of the picked printer/process/filament "
+            "triplet. This is the 'slice as designed' path: no ``--load-settings`` "
+            "override, so a MakerWorld author's settings survive. Ignored for STL / "
+            "plain-model 3MF (no embedded profile to honour). The preset refs are "
+            "still required by the validator but go unused on this path. Only makes "
+            "sense when the picked printer matches the design's target model — the "
+            "UI gates the toggle on that; there is no cross-printer re-targeting here "
+            "(that is exactly what the profile path is for)."
+        ),
     )
     bed_type: str | None = Field(
         default=None,
@@ -135,13 +128,7 @@ class SliceRequest(BaseModel):
         ``filament_presets`` list satisfies the requirement on its own; an
         empty list falls back to the singular fields, which then promote
         into a one-element list.
-
-        When ``bundle`` is set, the dispatch picks the JSON triplet from
-        the sidecar bundle directly so PresetRef resolution is skipped —
-        return early before the presets-required checks below.
         """
-        if self.bundle is not None:
-            return self
         for slot, ref_attr, legacy_attr in (
             ("printer", "printer_preset", "printer_preset_id"),
             ("process", "process_preset", "process_preset_id"),

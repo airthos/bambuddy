@@ -1,6 +1,22 @@
 import json
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, ValidationInfo, field_validator
+
+from backend.app.schemas.print_queue import TriState
+
+# Outbound service URLs validated on save, so a bad value is rejected at
+# configuration time with a clear message rather than failing opaquely at
+# request time. Every one of these services is commonly self-hosted on the same
+# host or LAN as Bambuddy, so the LAN-service policy applies: loopback and
+# RFC-1918 stay permitted, while cloud-metadata endpoints, numeric-encoded IPs,
+# IPv4-mapped IPv6 and non-HTTP schemes are rejected. See
+# ``_url_safety.assert_safe_lan_service_url``.
+#
+# Module-level rather than a class attribute so the CI backstop in
+# tests/unit/test_outbound_url_ssrf_guards.py can import the real list and
+# cannot drift from it. Any new outbound-URL setting belongs here (or, if it
+# must be reachable on the public internet, on the stricter OIDC guard).
+LAN_SERVICE_URL_SETTINGS = ("ha_url", "obico_ml_url", "orcaslicer_api_url", "bambu_studio_api_url")
 
 
 class AppSettings(BaseModel):
@@ -9,7 +25,23 @@ class AppSettings(BaseModel):
     auto_archive: bool = Field(default=True, description="Automatically archive prints when completed")
     save_thumbnails: bool = Field(default=True, description="Extract and save preview images from 3MF files")
     capture_finish_photo: bool = Field(
-        default=True, description="Capture photo from printer camera when print completes"
+        default=True,
+        description=(
+            "Capture photo from printer camera when print completes. Bambuddy records a "
+            "brief timelapse during the print so the photo can be sourced from the moment "
+            "before the bed drops; the timelapse file is kept if you enabled timelapse for "
+            "this print, otherwise it is deleted automatically after the photo is captured."
+        ),
+    )
+    finish_photo_restore_plate: bool = Field(
+        default=True,
+        description=(
+            "Raise the build plate back into camera framing before taking the finish photo. "
+            "Bambu's end G-code drops the plate ~100mm as the last thing it does, leaving the "
+            "finished print far below the camera's natural framing. Bambuddy moves it back to "
+            "just above the last printed layer, takes the photo, then lowers it again. Skipped "
+            "when the print height is unknown or another job is queued for the printer."
+        ),
     )
     default_filament_cost: float = Field(default=25.0, description="Default filament cost per kg")
     currency: str = Field(default="USD", description="Currency for cost tracking")
@@ -32,6 +64,10 @@ class AppSettings(BaseModel):
     spoolman_report_partial_usage: bool = Field(
         default=True,
         description="Report Partial Usage for Failed Prints. When a print fails or is cancelled, report the estimated filament used up to that point based on layer progress.",
+    )
+    auto_add_unknown_rfid: bool = Field(
+        default=True,
+        description="Automatically add spools with unknown RFID tags to inventory. Disable if you pre-create inventory entries manually to avoid duplicates.",
     )
     disable_filament_warnings: bool = Field(
         default=False,
@@ -72,6 +108,9 @@ class AppSettings(BaseModel):
         default=35.0, description="Temperature threshold for fair (orange): <= this value, > is red"
     )
     ams_history_retention_days: int = Field(default=30, description="Number of days to keep AMS sensor history data")
+    printer_sensor_history_retention_days: int = Field(
+        default=30, description="Number of days to keep printer heater history data (nozzle / bed / chamber)"
+    )
 
     # Queue auto-drying settings
     queue_drying_enabled: bool = Field(
@@ -85,9 +124,27 @@ class AppSettings(BaseModel):
         default=False,
         description="Automatically dry AMS filament on idle printers when humidity exceeds threshold, regardless of queue",
     )
+    print_drying_enabled: bool = Field(
+        default=False,
+        description=(
+            "Allow auto-drying to also fire on a printer that is currently printing, "
+            "when its model+firmware supports concurrent drying (H2D 01.03.00.00+, "
+            "H2C/H2S/P2S/H2D Pro 01.02.00.00+, X2D/A2L 01.01.00.00+, X1C 01.11.02.00+). "
+            "Drying temperature is automatically capped 5 degC below the idle preset "
+            "(floor 40 degC) to protect spools during print."
+        ),
+    )
     drying_presets: str = Field(
         default="",
         description="JSON blob of drying presets per filament type (empty = use built-in defaults)",
+    )
+    ams_humidity_thresholds: str = Field(
+        default="",
+        description=(
+            "JSON blob of per-filament-type humidity trigger thresholds for auto-drying and alarms. "
+            'Shape: {"default": int, "PLA": int, "ASA": int, ...}. '
+            "Empty = fall back to ams_humidity_fair for all types."
+        ),
     )
 
     # Auto-print G-code injection (#422)
@@ -127,12 +184,21 @@ class AppSettings(BaseModel):
     # Default printer for operations
     default_printer_id: int | None = Field(default=None, description="Default printer ID for uploads, reprints, etc.")
 
+    # Slicer Pipelines (#1425 PR C). Cap on the ``copies`` field in the
+    # Run-with-pipeline modal — keeps a misclick from queueing 5000 prints.
+    pipeline_max_copies: int = Field(
+        default=50,
+        ge=1,
+        le=1000,
+        description="Upper bound on the copies an operator can request when running a Slicer Pipeline. Larger fleets / production rigs can raise this; the hard ceiling at 1000 is a sanity guard against fat-fingered input.",
+    )
+
     # Virtual Printer
     virtual_printer_enabled: bool = Field(default=False, description="Enable virtual printer for slicer uploads")
     virtual_printer_access_code: str = Field(default="", description="Access code for virtual printer authentication")
     virtual_printer_mode: str = Field(
-        default="immediate",
-        description="Mode: 'immediate' (archive now), 'review' (pending review), or 'print_queue' (add to print queue)",
+        default="archive",
+        description="Mode: 'archive' (archive now), 'review' (pending review), 'queue' (add to print queue), or 'proxy' (relay to real printer)",
     )
     virtual_printer_archive_name_source: str = Field(
         default="metadata",
@@ -199,10 +265,21 @@ class AppSettings(BaseModel):
         description="Camera view mode: 'window' opens in new browser window, 'embedded' shows overlay on main screen",
     )
 
-    # Preferred slicer application
+    # Preferred slicer application (server-side / API sidecar slicer)
     preferred_slicer: str = Field(
         default="bambu_studio",
-        description="Preferred slicer: 'bambu_studio' or 'orcaslicer'",
+        description="Slicer used for the server-side API / sidecar: 'bambu_studio' or 'orcaslicer'",
+    )
+    # "Open in Slicer" desktop URI handler — independent of the API slicer so
+    # a user can slice via the Bambu Studio sidecar but open files locally in
+    # OrcaSlicer, or vice versa (#1329). None falls back to ``preferred_slicer``
+    # so existing installs behave identically until someone changes it.
+    open_in_slicer: str | None = Field(
+        default=None,
+        description=(
+            "Desktop slicer for the 'Open in Slicer' button: 'bambu_studio' or "
+            "'orcaslicer'. None inherits from preferred_slicer."
+        ),
     )
 
     # Slicer dispatch mode: when True, "Slice" actions open the in-app
@@ -226,6 +303,21 @@ class AppSettings(BaseModel):
         default="",
         description="BambuStudio sidecar URL (e.g. http://localhost:3001). Empty falls back to the BAMBU_STUDIO_API_URL env var.",
     )
+    # How long to keep waiting on a slice that isn't finishing. Measured against
+    # the sidecar's progress channel, not total elapsed time — a heavy model can
+    # legitimately slice for half an hour, and a wall-clock ceiling cannot tell
+    # that apart from a stalled one (#2730). Sidecars too old to report progress
+    # fall back to using this as a total-elapsed ceiling, which is the pre-#2730
+    # behaviour with a configurable number.
+    slicer_stall_timeout_minutes: int = Field(
+        default=15,
+        ge=1,
+        le=240,
+        description=(
+            "Give up on a slice after this many minutes with no progress from the sidecar. "
+            "On sidecars that do not report progress, applies to total slicing time instead."
+        ),
+    )
 
     # Prometheus metrics endpoint
     prometheus_enabled: bool = Field(default=False, description="Enable Prometheus metrics endpoint at /metrics")
@@ -241,15 +333,30 @@ class AppSettings(BaseModel):
         description="Low stock threshold percentage (%) for inventory filtering and display",
     )
 
+    # Session policy (#1706) — admin-set ceiling for user session lifetime.
+    # Default 24h preserves the M-2 audit reduction from 7 days. Max 720h
+    # (30 days) bounds blast radius if an admin chooses a long session.
+    session_max_hours: int = Field(
+        default=24,
+        ge=1,
+        le=720,
+        description=(
+            "Maximum session lifetime in hours for user logins (default 24, max 720). "
+            "Applies to new logins only; already-issued tokens keep their original expiry. "
+            "Longer sessions reduce automatic logout protection."
+        ),
+    )
+
     # User email notifications (requires Advanced Authentication)
     user_notifications_enabled: bool = Field(
         default=True,
         description="Enable user email notifications for print job events (requires Advanced Authentication)",
     )
 
-    # Default print options
-    default_bed_levelling: bool = Field(default=True, description="Default bed levelling option for new prints")
-    default_flow_cali: bool = Field(default=False, description="Default flow calibration option for new prints")
+    # Default print options. bed_levelling / flow_cali / nozzle_offset_cali are
+    # tri-state (off/on/auto), defaulting to "auto" per BambuStudio.
+    default_bed_levelling: TriState = Field(default="auto", description="Default bed levelling option for new prints")
+    default_flow_cali: TriState = Field(default="auto", description="Default flow calibration option for new prints")
     default_vibration_cali: bool = Field(
         default=True, description="Default vibration calibration option for new prints"
     )
@@ -257,6 +364,10 @@ class AppSettings(BaseModel):
         default=False, description="Default first layer inspection option for new prints"
     )
     default_timelapse: bool = Field(default=False, description="Default timelapse option for new prints")
+    default_nozzle_offset_cali: TriState = Field(
+        default="auto",
+        description="Default nozzle offset calibration option for new prints (dual-nozzle printers only)",
+    )
 
     # Staggered batch start for multi-printer jobs
     stagger_group_size: int = Field(
@@ -274,6 +385,89 @@ class AppSettings(BaseModel):
     queue_shortest_first: bool = Field(
         default=False,
         description="Shortest Job First — scheduler prioritizes shorter print jobs over longer ones",
+    )
+    queue_max_concurrent_uploads: int = Field(
+        default=4,
+        ge=1,
+        le=16,
+        description=(
+            "How many printers the queue may upload to at the same time. Printers are independent "
+            "machines, so raising this starts a multi-printer batch proportionally sooner; each "
+            "concurrent upload costs one connection and one thread on the Bambuddy host."
+        ),
+    )
+
+    # Preheat / heat-soak before queued prints (#1468). The scheduler stage runs
+    # BEFORE FTP upload. Three hardware tiers behave differently:
+    #   - Chamber heater (H2C/H2D/H2DPro/H2S/X2D/X1E): M141 → wait for chamber
+    #     sensor to reach target → soak
+    #   - Chamber sensor only (X1C/P2S): M140 only → wait for radiant chamber
+    #     warm-up to reach target OR max-wait timeout → soak
+    #   - No chamber sensor (P1S/P1P/A1/A1 Mini): M140 only → fixed soak timer
+    #     (no way to verify chamber temp; relies entirely on max_wait + soak)
+    # Chamber target derives per-print from the loaded AMS filament types via
+    # preheat_filament_targets (max across loaded slots). A target of 0 skips
+    # the chamber phase but keeps the bed phase + soak. Per-queue-item
+    # `preheat_chamber_target_override` (nullable) bypasses the derivation.
+    preheat_enabled: bool = Field(
+        default=False,
+        description="Master toggle / default for new queue items. Per-item preheat_override can flip the decision per print.",
+    )
+    preheat_filament_targets: str = Field(
+        default="",
+        description=(
+            "JSON map of normalized filament type → chamber target °C. Empty = bundled defaults "
+            "(PLA/PETG/TPU/PVA: 0, PETG-CF: 40, ABS/ASA: 45, PA/PC/PC-FR: 50, PA-CF: 55, default: 0). "
+            "Scheduler picks max across loaded AMS slots; 0 disables chamber phase for that print."
+        ),
+    )
+    preheat_max_wait_seconds: int = Field(
+        default=900,
+        ge=60,
+        le=3600,
+        description="Maximum time to wait for the chamber to reach the target before falling through to the soak phase (radiant heating on X1C/P2S can take 15-30 min).",
+    )
+    preheat_soak_seconds: int = Field(
+        default=300,
+        ge=0,
+        le=1800,
+        description="Additional hold time at temperature after the chamber reaches the target (or after max_wait_seconds elapses). 0 = no soak.",
+    )
+
+    # User-configurable presets for the printer-card temperature / fan-speed
+    # popovers. Each is a JSON array of exactly 3 ints (the "Off" button is
+    # rendered separately and is not configurable). Empty string = use built-in
+    # defaults. Validators on AppSettingsUpdate enforce the shape on writes.
+    nozzle_temp_presets: str = Field(
+        default="",
+        description="JSON array of 3 nozzle-temperature preset values in C (0-320). Empty = use defaults [120, 220, 260]",
+    )
+    bed_temp_presets: str = Field(
+        default="",
+        description="JSON array of 3 bed-temperature preset values in C (0-140). Empty = use defaults [55, 75, 90]",
+    )
+    chamber_temp_presets: str = Field(
+        default="",
+        description="JSON array of 3 chamber-temperature preset values in C (0-60). Empty = use defaults [35, 45, 60]",
+    )
+    fan_speed_presets: str = Field(
+        default="",
+        description="JSON array of 3 fan-speed preset values in % (0-100). Empty = use defaults [50, 75, 100]",
+    )
+
+    # Local login (#1589) — when False, /auth/login rejects username+password
+    # credentials with HTTP 403 and the login page hides the credentials form,
+    # leaving only the OIDC SSO provider buttons. LDAP is governed by its own
+    # `ldap_enabled` toggle and is not affected. The env-var
+    # ``BAMBUDDY_LOCAL_LOGIN=true`` bypasses this gate at the route level so a
+    # server admin can recover an install whose SSO provider is unreachable
+    # without editing the DB.
+    local_login_enabled: bool = Field(
+        default=True,
+        description=(
+            "Allow username + password login on /auth/login. Disable when only SSO should be usable. "
+            "BAMBUDDY_LOCAL_LOGIN=true on the server overrides this to keep a recovery path open."
+        ),
     )
 
     # LDAP authentication (#794)
@@ -305,6 +499,13 @@ class AppSettings(BaseModel):
     obico_ml_url: str = Field(
         default="",
         description="Self-hosted Obico ML API base URL (e.g., http://192.168.1.10:3333)",
+    )
+    obico_ml_token: str = Field(
+        default="",
+        description=(
+            "Bearer token for the Obico ML API, matching the server's ML_API_TOKEN "
+            "environment variable. Empty when the server runs without one."
+        ),
     )
     obico_sensitivity: str = Field(
         default="medium",
@@ -385,6 +586,7 @@ class AppSettingsUpdate(BaseModel):
     auto_archive: bool | None = None
     save_thumbnails: bool | None = None
     capture_finish_photo: bool | None = None
+    finish_photo_restore_plate: bool | None = None
     default_filament_cost: float | None = None
     currency: str | None = None
     energy_cost_per_kwh: float | None = None
@@ -394,12 +596,14 @@ class AppSettingsUpdate(BaseModel):
     spoolman_sync_mode: str | None = None
     spoolman_disable_weight_sync: bool | None = None
     spoolman_report_partial_usage: bool | None = None
+    auto_add_unknown_rfid: bool | None = None
     disable_filament_warnings: bool | None = None
     prefer_lowest_filament: bool | None = None
     prefer_recently_used_filament: bool | None = None
     check_updates: bool | None = None
     check_printer_firmware: bool | None = None
     include_beta_updates: bool | None = None
+    local_login_enabled: bool | None = None
     language: str | None = None
     notification_language: str | None = None
     bed_cooled_threshold: float | None = None
@@ -408,14 +612,18 @@ class AppSettingsUpdate(BaseModel):
     ams_temp_good: float | None = None
     ams_temp_fair: float | None = None
     ams_history_retention_days: int | None = None
+    printer_sensor_history_retention_days: int | None = None
     queue_drying_enabled: bool | None = None
     queue_drying_block: bool | None = None
     ambient_drying_enabled: bool | None = None
+    print_drying_enabled: bool | None = None
     drying_presets: str | None = None
+    ams_humidity_thresholds: str | None = None
     per_printer_mapping_expanded: bool | None = None
     date_format: str | None = None
     time_format: str | None = None
     default_printer_id: int | None = None
+    pipeline_max_copies: int | None = None
     virtual_printer_enabled: bool | None = None
     virtual_printer_access_code: str | None = None
     virtual_printer_mode: str | None = None
@@ -445,22 +653,35 @@ class AppSettingsUpdate(BaseModel):
     library_disk_warning_gb: float | None = None
     camera_view_mode: str | None = None
     preferred_slicer: str | None = None
+    open_in_slicer: str | None = None
     use_slicer_api: bool | None = None
     orcaslicer_api_url: str | None = None
     bambu_studio_api_url: str | None = None
+    slicer_stall_timeout_minutes: int | None = Field(default=None, ge=1, le=240)
     prometheus_enabled: bool | None = None
     prometheus_token: str | None = None
     low_stock_threshold: float | None = Field(default=None, ge=0.1, le=99.9)
+    session_max_hours: int | None = Field(default=None, ge=1, le=720)
     user_notifications_enabled: bool | None = None
-    default_bed_levelling: bool | None = None
-    default_flow_cali: bool | None = None
+    default_bed_levelling: TriState | None = None
+    default_flow_cali: TriState | None = None
     default_vibration_cali: bool | None = None
     default_layer_inspect: bool | None = None
     default_timelapse: bool | None = None
+    default_nozzle_offset_cali: TriState | None = None
     stagger_group_size: int | None = Field(default=None, ge=1, le=50)
     stagger_interval_minutes: int | None = Field(default=None, ge=1, le=60)
     require_plate_clear: bool | None = None
     queue_shortest_first: bool | None = None
+    queue_max_concurrent_uploads: int | None = Field(default=None, ge=1, le=16)
+    preheat_enabled: bool | None = None
+    preheat_filament_targets: str | None = None
+    preheat_max_wait_seconds: int | None = Field(default=None, ge=60, le=3600)
+    preheat_soak_seconds: int | None = Field(default=None, ge=0, le=1800)
+    nozzle_temp_presets: str | None = None
+    bed_temp_presets: str | None = None
+    chamber_temp_presets: str | None = None
+    fan_speed_presets: str | None = None
     gcode_snippets: str | None = None
     post_process_script: str | None = None
     farm_cooldown_temp: int | None = None
@@ -481,6 +702,7 @@ class AppSettingsUpdate(BaseModel):
     ldap_default_group: str | None = None
     obico_enabled: bool | None = None
     obico_ml_url: str | None = None
+    obico_ml_token: str | None = None
     obico_sensitivity: str | None = None
     obico_action: str | None = None
     obico_poll_interval: int | None = Field(default=None, ge=5, le=120)
@@ -494,6 +716,47 @@ class AppSettingsUpdate(BaseModel):
     sentry_interval_enabled: bool | None = None
     sentry_interval_minutes: int | None = Field(default=None, ge=1, le=180)
     sentry_interval_retention_days: int | None = Field(default=None, ge=1, le=365)
+
+    @field_validator(*LAN_SERVICE_URL_SETTINGS)
+    @classmethod
+    def validate_lan_service_url(cls, v: str | None, info: ValidationInfo) -> str | None:
+        """Reject SSRF-unsafe outbound service URLs on save.
+
+        Empty (and whitespace-only) is the documented "not configured / fall
+        back to the env var" value for all four fields and must keep passing.
+
+        Values that are not absolute URLs at all ("192.168.1.10:3333",
+        "localhost:3333") are left alone rather than rejected. Two reasons:
+
+        - They are inert. Every consumer of these four settings goes through
+          httpx, which raises UnsupportedProtocol for a URL with no scheme, so
+          no request is ever issued and there is nothing to guard against.
+        - They were storable before this validator existed, and the settings
+          UI is a plain text input with no scheme enforcement. Newly rejecting
+          them would break saves that have nothing to do with the URL: the
+          Obico panel, for one, sends obico_ml_url with every change and
+          auto-saves, so one legacy value would block toggling detection on or
+          off. A pre-existing misconfiguration should keep failing where it
+          already failed (at request time), not spread to unrelated fields.
+
+        ``urlparse`` is no help in telling the two apart — it reads
+        "localhost:3333" as scheme "localhost" — so the test is the literal
+        "://" that makes a string an absolute URL.
+        """
+        if v is None or not v.strip():
+            return v
+        candidate = v.strip()
+        if "://" not in candidate:
+            return v
+        # Lazy-imported: schemas avoid top-level imports from api/routes,
+        # matching the existing pattern in auth.py's _validate_icon_url.
+        from backend.app.api.routes._url_safety import assert_safe_lan_service_url
+
+        try:
+            assert_safe_lan_service_url(candidate, label=info.field_name or "URL")
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        return v
 
     @field_validator("gcode_snippets")
     @classmethod
@@ -534,6 +797,43 @@ class AppSettingsUpdate(BaseModel):
             raise ValueError("obico_enabled_printers must be a JSON array of printer IDs (integers)")
         return v
 
+    @staticmethod
+    def _validate_preset_triple(v: str | None, field_name: str, lo: int, hi: int) -> str | None:
+        """Validate a JSON array of exactly 3 ints in [lo, hi]. Empty = defaults."""
+        if v is None or v == "":
+            return v
+        try:
+            parsed = json.loads(v)
+        except json.JSONDecodeError:
+            raise ValueError(f"{field_name} must be valid JSON or empty")
+        if not isinstance(parsed, list) or len(parsed) != 3:
+            raise ValueError(f"{field_name} must be a JSON array of exactly 3 integers")
+        if not all(isinstance(item, int) and not isinstance(item, bool) for item in parsed):
+            raise ValueError(f"{field_name} entries must all be integers")
+        if not all(lo <= item <= hi for item in parsed):
+            raise ValueError(f"{field_name} entries must each be in [{lo}, {hi}]")
+        return v
+
+    @field_validator("nozzle_temp_presets")
+    @classmethod
+    def validate_nozzle_temp_presets(cls, v: str | None) -> str | None:
+        return cls._validate_preset_triple(v, "nozzle_temp_presets", 0, 320)
+
+    @field_validator("bed_temp_presets")
+    @classmethod
+    def validate_bed_temp_presets(cls, v: str | None) -> str | None:
+        return cls._validate_preset_triple(v, "bed_temp_presets", 0, 140)
+
+    @field_validator("chamber_temp_presets")
+    @classmethod
+    def validate_chamber_temp_presets(cls, v: str | None) -> str | None:
+        return cls._validate_preset_triple(v, "chamber_temp_presets", 0, 60)
+
+    @field_validator("fan_speed_presets")
+    @classmethod
+    def validate_fan_speed_presets(cls, v: str | None) -> str | None:
+        return cls._validate_preset_triple(v, "fan_speed_presets", 0, 100)
+
     @field_validator("obico_sensitivity")
     @classmethod
     def validate_obico_sensitivity(cls, v: str | None) -> str | None:
@@ -563,6 +863,11 @@ class AppSettingsUpdate(BaseModel):
             raise ValueError("default_sidebar_order must be valid JSON or empty")
         if isinstance(parsed, dict):
             order = parsed.get("order")
+            hidden_system_item_ids = parsed.get("hiddenSystemItemIds", [])
+            if not isinstance(hidden_system_item_ids, list) or not all(
+                isinstance(item, str) for item in hidden_system_item_ids
+            ):
+                raise ValueError("sidebar hidden system item IDs must be an array of strings")
         elif isinstance(parsed, list):
             order = parsed
         else:

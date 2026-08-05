@@ -30,6 +30,21 @@ class APIKey(Base):
     can_queue: Mapped[bool] = mapped_column(Boolean, default=True)  # Add to queue
     can_control_printer: Mapped[bool] = mapped_column(Boolean, default=False)  # Start/stop/cancel
     can_read_status: Mapped[bool] = mapped_column(Boolean, default=True)  # Query status
+    can_manage_library: Mapped[bool] = mapped_column(
+        Boolean, default=True
+    )  # Upload/rename/delete own library files + MakerWorld import
+    can_manage_inventory: Mapped[bool] = mapped_column(
+        Boolean, default=True
+    )  # Inventory write ops (incl. SpoolBuddy kiosk NFC/scale/system)
+    can_manage_maintenance: Mapped[bool] = mapped_column(
+        Boolean, default=True
+    )  # Log/reset per-printer maintenance, edit intervals, manage the type catalog (#1832 follow-up)
+    can_manage_archives: Mapped[bool] = mapped_column(
+        Boolean, default=True
+    )  # Create/update/delete print archives (not purge) (#1888)
+    can_manage_projects: Mapped[bool] = mapped_column(
+        Boolean, default=True
+    )  # Create/update/delete projects + manage membership (add archives) (#1893)
     can_access_cloud: Mapped[bool] = mapped_column(Boolean, default=False)  # Read /cloud/* on the owner's behalf
     # Narrowly-scoped settings write: only POST /settings/electricity-price.
     # Lets HA/Tibber-style automations push dynamic tariff updates without

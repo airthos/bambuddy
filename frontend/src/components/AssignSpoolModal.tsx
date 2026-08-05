@@ -8,6 +8,7 @@ import { Button } from './Button';
 import { ConfirmModal } from './ConfirmModal';
 import { useToast } from '../contexts/ToastContext';
 import { filterSpoolsByQuery } from '../utils/inventorySearch';
+import { getSwatchStyle } from '../utils/colors';
 
 interface AssignSpoolModalProps {
   isOpen: boolean;
@@ -39,8 +40,16 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
   const [searchFilter, setSearchFilter] = useState('');
   const [pendingAssignId, setPendingAssignId] = useState<number | null>(null);
   const [showMismatchConfirm, setShowMismatchConfirm] = useState(false);
+  // Profile-only mismatch no longer triggers the popup — the backend's
+  // `apply_spool_to_slot_via_mqtt` pushes the spool's slicer profile to the
+  // AMS slot on every assign anyway, so warning the user about a profile
+  // delta then "fixing" it during the same action was friction without
+  // benefit (#1552). Material mismatch still warns because the firmware can
+  // refuse a print when type doesn't match; combined material+profile
+  // mismatches keep the profile detail in the same popup as the material
+  // warning.
   const [mismatchDetails, setMismatchDetails] = useState<{
-    type: 'material' | 'partial' | 'profile' | 'material_profile' | 'partial_profile';
+    type: 'material' | 'partial' | 'material_profile' | 'partial_profile';
     spoolMaterial: string;
     trayMaterial: string;
     spoolProfile?: string;
@@ -141,7 +150,19 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
       });
       queryClient.invalidateQueries({ queryKey: ['spool-assignments'] });
       nudgePrinterRepublish();
-      showToast(t('inventory.assignSuccess'), 'success');
+      // When the AMS slot was empty at assign time (tray_state ∈ {9, 10}), the
+      // backend persists the assignment but deliberately skips the MQTT
+      // `ams_filament_setting` push because Bambu firmware drops it silently
+      // for empty slots. `on_ams_change` re-fires the configuration once a
+      // spool is detected in the slot (#1680). The success-but-pending case
+      // gets a distinct toast so the user understands the slot hasn't been
+      // configured on the printer yet — saying "AMS slot configured" reads
+      // as a lie in that state. Mirror of `spoolbuddy/AssignToAmsModal.tsx`,
+      // which has handled this since the SpoolBuddy assign flow shipped.
+      const toastKey = newAssignment.pending_config
+        ? 'inventory.assignPendingInsert'
+        : 'inventory.assignSuccess';
+      showToast(t(toastKey), 'success');
       setShowMismatchConfirm(false);
       setPendingAssignId(null);
       setMismatchDetails(null);
@@ -290,17 +311,18 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
       const trayProfile = trayInfo.profile || trayInfo.type;
       const profileMatches = checkProfileMatch(spoolProfile, trayProfile);
 
-      // Always evaluate both checks; if both fail, show a combined warning.
-      if (materialMatchResult !== 'exact' || !profileMatches) {
-        let mismatchType: 'material' | 'partial' | 'profile' | 'material_profile' | 'partial_profile' = 'profile';
-
+      // Only material-bearing mismatches warn — profile-only deltas are
+      // silently resolved by the backend's AMS reconfigure on every assign
+      // (#1552).
+      if (materialMatchResult !== 'exact') {
+        let mismatchType: 'material' | 'partial' | 'material_profile' | 'partial_profile';
         if (materialMatchResult === 'none' && !profileMatches) {
           mismatchType = 'material_profile';
         } else if (materialMatchResult === 'partial' && !profileMatches) {
           mismatchType = 'partial_profile';
         } else if (materialMatchResult === 'none') {
           mismatchType = 'material';
-        } else if (materialMatchResult === 'partial') {
+        } else {
           mismatchType = 'partial';
         }
 
@@ -406,7 +428,7 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
                       {spool.rgba && (
                         <span
                           className="w-3 h-3 rounded-full border border-black/20 flex-shrink-0"
-                          style={{ backgroundColor: `#${spool.rgba.substring(0, 6)}` }}
+                          style={getSwatchStyle(spool.rgba)}
                         />
                       )}
                       <span className="text-xs text-bambu-gray truncate">{spool.color_name || ''}</span>
@@ -414,6 +436,11 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
                     {spool.label_weight && (
                       <p className="text-xs text-bambu-gray mt-1">
                         {Math.max(0, Math.round(spool.label_weight - spool.weight_used))} / {spool.label_weight}g
+                      </p>
+                    )}
+                    {spool.note && (
+                      <p className="text-[10px] text-bambu-gray/70 mt-1 truncate" title={spool.note}>
+                        {spool.note}
                       </p>
                     )}
                   </button>
@@ -481,7 +508,7 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
                               {spool.rgba && (
                                 <span
                                   className="w-3 h-3 rounded-full border border-black/20 flex-shrink-0"
-                                  style={{ backgroundColor: `#${spool.rgba.substring(0, 6)}` }}
+                                  style={getSwatchStyle(spool.rgba)}
                                 />
                               )}
                               <span className="text-xs text-bambu-gray truncate">{spool.color_name || ''}</span>
@@ -489,6 +516,11 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
                             {spool.label_weight && (
                               <p className="text-xs text-bambu-gray mt-1">
                                 {Math.max(0, Math.round(spool.label_weight - spool.weight_used))} / {spool.label_weight}g
+                              </p>
+                            )}
+                            {spool.note && (
+                              <p className="text-[10px] text-bambu-gray/70 mt-1 truncate" title={spool.note}>
+                                {spool.note}
                               </p>
                             )}
                           </button>
@@ -540,7 +572,7 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
 
 
         {assignMutation.isError && (
-          <div className="mx-4 mb-4 p-2 bg-red-500/20 border border-red-500/50 rounded text-sm text-red-400">
+          <div className="mx-4 mb-4 p-2 bg-red-100 dark:bg-red-500/20 border border-red-300 dark:border-red-500/50 rounded text-sm text-red-700 dark:text-red-400">
             {(assignMutation.error as Error).message}
           </div>
         )}
@@ -583,13 +615,13 @@ export function AssignSpoolModal({ isOpen, onClose, printerId, amsId, trayId, tr
             trayProfile: mismatchDetails.trayProfile || t('common.unknown'),
             location: trayInfo.location,
           })}`;
-        } else if (mismatchDetails.type === 'profile') {
-          message = t('inventory.assignProfileMismatchMessage', {
-            spoolProfile: mismatchDetails.spoolProfile || t('common.unknown'),
-            trayProfile: mismatchDetails.trayProfile || t('common.unknown'),
-            location: trayInfo.location,
-          });
         }
+
+        // Always tell the user the AMS slot is going to be reconfigured —
+        // the existing wording made "Assign Anyway" sound like the popup was
+        // a no-op confirmation, when the backend in fact pushes the spool's
+        // profile to the slot on every assign (#1552).
+        message = `${message}\n\n${t('inventory.assignReconfigureNote')}`;
 
         return (
           <ConfirmModal

@@ -20,7 +20,9 @@ class Printer(Base):
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     auto_archive: Mapped[bool] = mapped_column(Boolean, default=True)
     print_hours_offset: Mapped[float] = mapped_column(Float, default=0.0)  # Baseline hours to add
-    runtime_seconds: Mapped[int] = mapped_column(default=0)  # Accumulated active runtime (RUNNING/PAUSE states)
+    runtime_seconds: Mapped[int] = mapped_column(
+        default=0
+    )  # Accumulated active runtime (RUNNING state only — see #1521)
     last_runtime_update: Mapped[datetime | None] = mapped_column(
         DateTime, nullable=True
     )  # Last time runtime was updated
@@ -61,6 +63,9 @@ class Printer(Base):
     )
     kprofile_notes: Mapped[list["KProfileNote"]] = relationship(back_populates="printer", cascade="all, delete-orphan")
     ams_history: Mapped[list["AMSSensorHistory"]] = relationship(back_populates="printer", cascade="all, delete-orphan")
+    sensor_history: Mapped[list["PrinterSensorHistory"]] = relationship(
+        back_populates="printer", cascade="all, delete-orphan"
+    )
 
 
 from backend.app.models.ams_history import AMSSensorHistory  # noqa: E402
@@ -68,4 +73,5 @@ from backend.app.models.archive import PrintArchive  # noqa: E402
 from backend.app.models.kprofile_note import KProfileNote  # noqa: E402
 from backend.app.models.maintenance import PrinterMaintenance  # noqa: E402
 from backend.app.models.notification import NotificationProvider  # noqa: E402
+from backend.app.models.printer_sensor_history import PrinterSensorHistory  # noqa: E402
 from backend.app.models.smart_plug import SmartPlug  # noqa: E402

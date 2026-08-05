@@ -1,9 +1,8 @@
 """In-memory background dispatcher for slice jobs.
 
-Mirrors the shape of `background_dispatch.py` (the print-upload dispatcher)
-but tailored for slicing: jobs are independent (no printer-busy gating),
-short-lived (typically 5-60s), and the result is a `LibraryFile` or
-`PrintArchive` row rather than a printer-side dispatch.
+Slice jobs are independent (no printer-busy gating), short-lived (typically
+5-60s), and the result is a `LibraryFile` or `PrintArchive` row rather than a
+printer-side dispatch.
 
 The frontend kicks off a slice via `POST /library/files/{id}/slice` or
 `POST /archives/{id}/slice`, gets back `{job_id, status_url}`, then polls
@@ -31,6 +30,10 @@ class SliceJob:
     kind: Literal["library_file", "archive"]
     source_id: int
     source_name: str
+    # JWT user id that started the job, for per-row scoping of the polling
+    # endpoint. None for API-key / auth-disabled callers (no per-row identity);
+    # those jobs are visible only to READ_ALL pollers — see slice_jobs.py.
+    owner_id: int | None = None
     status: SliceJobStatus = "pending"
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     started_at: datetime | None = None
@@ -69,6 +72,7 @@ class SliceDispatchService:
         kind: Literal["library_file", "archive"],
         source_id: int,
         source_name: str,
+        owner_id: int | None = None,
         run: Callable[[int], Awaitable[dict[str, Any]]],
     ) -> SliceJob:
         """Register a new slice job and start it on the event loop.
@@ -84,6 +88,7 @@ class SliceDispatchService:
                 kind=kind,
                 source_id=source_id,
                 source_name=source_name,
+                owner_id=owner_id,
             )
             self._next_id += 1
             self._jobs[job.id] = job

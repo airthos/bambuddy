@@ -69,8 +69,30 @@ class TestStatus:
         resp = await async_client.get("/api/v1/makerworld/status")
         assert resp.status_code == 200
         body = resp.json()
-        # Fresh in-memory DB has no stored token, so can_download must be false
-        assert body == {"has_cloud_token": False, "can_download": False}
+        # Fresh in-memory DB has no stored token, so can_download must be false.
+        # sign_in_expired is False, not True: there is no sign-in to have expired.
+        assert body == {"has_cloud_token": False, "can_download": False, "sign_in_expired": False}
+
+    @pytest.mark.asyncio
+    async def test_rejected_token_blocks_download_and_reports_expired(self, async_client, db_session):
+        """A token Bambu has already rejected downloads nothing. ``can_download``
+        used to be a bare alias for ``has_cloud_token``, so the import button
+        stayed live against a dead credential and the user only found out via a
+        401 toast."""
+        from backend.app.api.routes.cloud import CLOUD_TOKEN_INVALID_KEY, CLOUD_TOKEN_KEY
+        from backend.app.models.settings import Settings
+
+        db_session.add(Settings(key=CLOUD_TOKEN_KEY, value="dead-token"))
+        db_session.add(Settings(key=CLOUD_TOKEN_INVALID_KEY, value="2026-07-14T07:00:00+00:00"))
+        await db_session.commit()
+
+        resp = await async_client.get("/api/v1/makerworld/status")
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "has_cloud_token": True,
+            "can_download": False,
+            "sign_in_expired": True,
+        }
 
 
 class TestResolve:
@@ -381,6 +403,151 @@ class TestImport:
             )
         assert resp.status_code == 200, resp.text
         assert resp.json()["profile_id"] == 298919107
+
+    @pytest.mark.asyncio
+    async def test_import_to_writable_external_writes_bytes_to_mount(self, async_client, db_session, tmp_path):
+        """#1645: importing into a writable external folder writes the bytes to
+        ``<external_path>/<filename>`` and tags the row ``is_external=True`` —
+        same shape as the multipart-upload path (#1112). Previously the bytes
+        landed in the internal library dir under a UUID name while the row
+        showed up under the external folder in the UI, leaving a NAS/SMB user
+        unable to find their file on the mount."""
+        ext_dir = tmp_path / "nas-makerworld"
+        ext_dir.mkdir()
+        folder = LibraryFolder(
+            name="NAS Imports",
+            parent_id=None,
+            is_external=True,
+            external_path=str(ext_dir),
+            external_readonly=False,
+        )
+        db_session.add(folder)
+        await db_session.commit()
+        await db_session.refresh(folder)
+
+        svc = _fake_service(
+            get_design=_default_design(),
+            get_profile_download=_default_manifest("seed-starter.3mf"),
+            download_3mf=(self._FAKE_3MF_BYTES, "seed-starter.3mf"),
+        )
+
+        with patch("backend.app.api.routes.makerworld._build_service", AsyncMock(return_value=svc)):
+            resp = await async_client.post(
+                "/api/v1/makerworld/import",
+                json={"model_id": 1400373, "profile_id": 298919107, "folder_id": folder.id},
+            )
+        assert resp.status_code == 200, resp.text
+
+        from sqlalchemy import select
+
+        row = (
+            await db_session.execute(select(LibraryFile).where(LibraryFile.id == resp.json()["library_file_id"]))
+        ).scalar_one()
+        assert row.folder_id == folder.id
+        assert row.is_external is True, "Row must be tagged external so re-scan can reconcile it"
+        # External rows persist the absolute mount path (matches scan + upload paths).
+        assert row.file_path == str(ext_dir / "seed-starter.3mf")
+        on_disk = ext_dir / "seed-starter.3mf"
+        assert on_disk.is_file(), "Bytes must land on the external mount, not in the internal library dir"
+        assert on_disk.read_bytes() == self._FAKE_3MF_BYTES
+
+    @pytest.mark.asyncio
+    async def test_import_to_readonly_external_rejected_at_route(self, async_client, db_session, tmp_path):
+        """The route-layer gate at ``makerworld.py:256-260`` rejects read-only
+        externals with 403 before any download happens — so MakerWorld
+        credentials and the upstream download bandwidth aren't wasted."""
+        ext_dir = tmp_path / "nas-readonly"
+        ext_dir.mkdir()
+        folder = LibraryFolder(
+            name="NAS read-only",
+            parent_id=None,
+            is_external=True,
+            external_path=str(ext_dir),
+            external_readonly=True,
+        )
+        db_session.add(folder)
+        await db_session.commit()
+        await db_session.refresh(folder)
+
+        svc = _fake_service(
+            get_design=_default_design(),
+            get_profile_download=_default_manifest(),
+        )
+        svc.download_3mf = AsyncMock()
+
+        with patch("backend.app.api.routes.makerworld._build_service", AsyncMock(return_value=svc)):
+            resp = await async_client.post(
+                "/api/v1/makerworld/import",
+                json={"model_id": 1400373, "profile_id": 298919107, "folder_id": folder.id},
+            )
+        assert resp.status_code == 403, resp.text
+        svc.download_3mf.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_import_to_external_with_missing_path_returns_400(self, async_client, db_session, tmp_path):
+        """If the external folder's mount has gone away (NAS unplugged, SMB
+        share down), ``_resolve_upload_destination`` returns 400 before the
+        write so we don't silently fall back to the internal library dir."""
+        missing_dir = tmp_path / "vanished-mount"  # NOTE: deliberately not created
+        folder = LibraryFolder(
+            name="NAS gone",
+            parent_id=None,
+            is_external=True,
+            external_path=str(missing_dir),
+            external_readonly=False,
+        )
+        db_session.add(folder)
+        await db_session.commit()
+        await db_session.refresh(folder)
+
+        svc = _fake_service(
+            get_design=_default_design(),
+            get_profile_download=_default_manifest(),
+            download_3mf=(self._FAKE_3MF_BYTES, "benchy.3mf"),
+        )
+
+        with patch("backend.app.api.routes.makerworld._build_service", AsyncMock(return_value=svc)):
+            resp = await async_client.post(
+                "/api/v1/makerworld/import",
+                json={"model_id": 1400373, "profile_id": 298919107, "folder_id": folder.id},
+            )
+        assert resp.status_code == 400, resp.text
+        assert "not accessible" in resp.text.lower()
+
+    @pytest.mark.asyncio
+    async def test_import_to_external_with_name_collision_returns_409(self, async_client, db_session, tmp_path):
+        """A user-visible 409 fires when the filename already exists on the
+        external mount, instead of silently overwriting a file the user put
+        there outside Bambuddy."""
+        ext_dir = tmp_path / "nas-collide"
+        ext_dir.mkdir()
+        (ext_dir / "benchy.3mf").write_bytes(b"pre-existing")
+
+        folder = LibraryFolder(
+            name="NAS collide",
+            parent_id=None,
+            is_external=True,
+            external_path=str(ext_dir),
+            external_readonly=False,
+        )
+        db_session.add(folder)
+        await db_session.commit()
+        await db_session.refresh(folder)
+
+        svc = _fake_service(
+            get_design=_default_design(),
+            get_profile_download=_default_manifest("benchy.3mf"),
+            download_3mf=(self._FAKE_3MF_BYTES, "benchy.3mf"),
+        )
+
+        with patch("backend.app.api.routes.makerworld._build_service", AsyncMock(return_value=svc)):
+            resp = await async_client.post(
+                "/api/v1/makerworld/import",
+                json={"model_id": 1400373, "profile_id": 298919107, "folder_id": folder.id},
+            )
+        assert resp.status_code == 409, resp.text
+        # Pre-existing file's contents must not be clobbered by the failed write.
+        assert (ext_dir / "benchy.3mf").read_bytes() == b"pre-existing"
 
 
 class TestRecentImports:

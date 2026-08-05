@@ -1,6 +1,11 @@
 
 import type { Printer, SpoolKProfile } from '../../api/client';
 
+// Which operation the spool form is performing. Lives here (rather than in
+// SpoolFormModal) so validateForm can key off it without a circular import;
+// SpoolFormModal re-exports it for existing consumers.
+export type SpoolFormMode = 'create' | 'edit' | 'copy';
+
 // Catalog color display type (moved from component)
 export interface CatalogDisplayColor {
   name: string;
@@ -36,7 +41,7 @@ export interface SpoolFormData {
   // User-defined category + per-spool low-stock threshold override (#729).
   category: string;
   low_stock_threshold_pct: number | null;
-  storage_location: string;
+  location_id: number | null;
   // When set the spool is linked to a specific Spoolman filament catalog entry;
   // the backend skips find_or_create_filament() and uses this ID directly.
   spoolman_filament_id: number | null;
@@ -59,7 +64,7 @@ export const defaultFormData: SpoolFormData = {
   cost_per_kg: null,
   category: '',
   low_stock_threshold_pct: null,
-  storage_location: '',
+  location_id: null,
   spoolman_filament_id: null,
 };
 
@@ -112,7 +117,17 @@ export interface FilamentSectionProps extends SectionProps {
   filamentOptions: FilamentOption[];
   availableBrands: string[];
   availableMaterials: string[];
+  // Brands/materials the catalog and slicer presets know to pair with the other
+  // field's current value (#1905). These sort to the top under a "Suggested"
+  // heading — they are never used to hide the rest, because doing so made
+  // legitimate combinations (Elegoo ASA) look impossible to enter.
+  suggestedBrands: string[];
+  suggestedMaterials: string[];
   quickAdd: boolean;
+  // Whether preset/brand/subtype are mandatory for this submission — see
+  // validateForm. Drives the " *" markers so the form never advertises a
+  // requirement it won't enforce (#1905).
+  detailsRequired: boolean;
   quantity: number;
   onQuantityChange: (value: number) => void;
   errors?: Partial<Record<keyof SpoolFormData, string>>;
@@ -143,6 +158,8 @@ export interface AdditionalSectionProps extends SectionProps {
   // Global low-stock threshold (%); shown as placeholder on the per-spool
   // override input so users see what they're overriding. #729
   globalLowStockThreshold: number;
+  availableLocations?: { id: number; name: string }[];
+  onCreateLocation?: (name: string) => Promise<{ id: number; name: string } | null>;
   // When true the empty-spool weight is managed by Spoolman on the filament
   // object, so SpoolWeightPicker is hidden and an info notice is shown instead.
   spoolmanMode?: boolean;
@@ -179,11 +196,17 @@ export function validateForm(
   formData: SpoolFormData,
   quickAdd = false,
   spoolmanMode = false,
+  mode: SpoolFormMode = 'create',
 ): ValidationResult {
   const errors: Partial<Record<keyof SpoolFormData, string>> = {};
 
-  // Quick-add and Spoolman mode only require material (unless a catalog entry is pre-selected)
-  if (quickAdd || spoolmanMode) {
+  // Quick-add and Spoolman mode only require material (unless a catalog entry
+  // is pre-selected). Edit and copy relax the same way (#1905): the spool
+  // already exists, and a row created by quick-add, CSV import or an RFID scan
+  // has no preset/brand/subtype — demanding them here blocked every later edit,
+  // even one that only changed the storage location. The backend only ever
+  // required material (SpoolCreate/SpoolUpdate in schemas/spool.py).
+  if (quickAdd || spoolmanMode || mode !== 'create') {
     if (!formData.material && !formData.spoolman_filament_id) {
       errors.material = 'Material is required';
     }

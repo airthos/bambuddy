@@ -117,6 +117,47 @@ def _archive_colors_from_spools(filament_usage: list[dict], results: list[dict])
     return ordered
 
 
+def _archive_types_from_spools(filament_usage: list[dict], results: list[dict]) -> list[str] | None:
+    """Slot-ordered, de-duplicated materials for an archive's ``filament_type``,
+    taken from the inventory spools that actually fed the print (#2563).
+
+    The slicer's 3MF records the filament type it was *sliced for*. When the
+    user manually maps a slot to a differently-typed loaded spool in the Print
+    dialog — a PLA slice routed to the only loaded PETG slot — that sliced type
+    misclassifies the run in the archive card, the Print Log and the material
+    statistics, even though the deduction correctly hit the PETG spool. Once
+    usage tracking has resolved every used slot to an inventory spool, the
+    spool's declared material is the authoritative record of what was consumed,
+    the same reasoning that already adopts the spool colour (#1494).
+
+    Returns ``None`` — leave the 3MF type untouched — unless *every* slot with
+    non-zero usage was matched to a spool that carries a material. All-or-
+    nothing, exactly like ``_archive_colors_from_spools``: a partial rewrite
+    would silently drop the unmatched slots' types from the archive (and the
+    material stats).
+    """
+    used_slots = {u["slot_id"] for u in filament_usage if u.get("used_g", 0) > 0 and u.get("slot_id") is not None}
+    if not used_slots:
+        return None
+
+    slot_material: dict[int, str] = {}
+    for r in results:
+        slot_id = r.get("slot_id")
+        material = (r.get("material") or "").strip()
+        if slot_id is not None and material:
+            slot_material.setdefault(slot_id, material)
+
+    if not used_slots.issubset(slot_material):
+        return None
+
+    ordered: list[str] = []
+    for slot_id in sorted(used_slots):
+        material = slot_material[slot_id]
+        if material not in ordered:
+            ordered.append(material)
+    return ordered
+
+
 def _match_slots_by_color(
     filament_usage: list[dict],
     ams_raw: dict | list | None,
@@ -214,6 +255,10 @@ class PrintSession:
     spool_assignments: dict[tuple[int, int], int] = field(default_factory=dict)
     # AMS mapping from print command (captured at start, needed when auto-archive is off)
     ams_mapping: list[int] | None = None
+    # Queue item's plate_id when this print is a multi-plate 3MF dispatched for a
+    # single plate (#1697). None for non-queue prints — the file's first/only plate
+    # is the default and the 3MF parser already returns the full file in that case.
+    plate_id: int | None = None
 
 
 # Module-level storage, keyed by printer_id
@@ -380,6 +425,21 @@ async def on_print_start(printer_id: int, data: dict, printer_manager, db: Async
                 {f"{k[0]}-{k[1]}": v for k, v in spool_assignments.items()},
             )
 
+    # Capture the queue item's plate_id so 3MF parsing at completion is scoped to
+    # the plate that actually ran, not the whole multi-plate file (#1697).
+    plate_id: int | None = None
+    if db:
+        from backend.app.models.print_queue import PrintQueueItem
+
+        queue_result = await db.execute(
+            select(PrintQueueItem)
+            .where(PrintQueueItem.printer_id == printer_id)
+            .where(PrintQueueItem.status == "printing")
+        )
+        queue_item = queue_result.scalars().first()
+        if queue_item is not None:
+            plate_id = queue_item.plate_id
+
     # Always create session (even without valid remain data) so print_name
     # is available at completion for 3MF-based tracking
     session = PrintSession(
@@ -390,6 +450,7 @@ async def on_print_start(printer_id: int, data: dict, printer_manager, db: Async
         tray_now_at_start=tray_now_at_start,
         spool_assignments=spool_assignments,
         ams_mapping=data.get("ams_mapping"),
+        plate_id=plate_id,
     )
     _active_sessions[printer_id] = session
 
@@ -490,6 +551,7 @@ async def on_print_complete(
             spool_assignments=session.spool_assignments if session else None,
             print_started_at=session.started_at if session else None,
             threemf_path=threemf_path,
+            plate_id=session.plate_id if session else None,
         )
         results.extend(threemf_results)
 
@@ -855,6 +917,7 @@ async def _track_from_3mf(
     spool_assignments: dict[tuple[int, int], int] | None = None,
     print_started_at: datetime | None = None,
     threemf_path=None,
+    plate_id: int | None = None,
 ) -> list[dict]:
     """Track usage from 3MF per-filament slicer data (primary path).
 
@@ -864,6 +927,11 @@ async def _track_from_3mf(
 
     When archive_id is None (auto-archive disabled), a pre-resolved threemf_path
     can be provided to still track filament usage from slicer data.
+
+    When ``plate_id`` is set (queue prints of a single plate from a multi-plate
+    3MF), only that plate's filaments contribute. Without it the 3MF parser sums
+    every plate, which is correct for direct/library Print flows that always
+    target the first or only plate (#1697).
 
     Slot-to-tray mapping priority:
     1. Stored ams_mapping from print command (reprints/direct prints)
@@ -904,12 +972,12 @@ async def _track_from_3mf(
         logger.info("[UsageTracker] 3MF: no file available for archive %s, skipping", archive_id)
         return []
 
-    filament_usage = extract_filament_usage_from_3mf(file_path)
+    filament_usage = extract_filament_usage_from_3mf(file_path, plate_id)
     if not filament_usage:
         logger.info("[UsageTracker] 3MF: no filament usage data in %s", file_path)
         return []
 
-    logger.info("[UsageTracker] 3MF: archive %s, filament_usage=%s", archive_id, filament_usage)
+    logger.info("[UsageTracker] 3MF: archive %s, plate_id=%s, filament_usage=%s", archive_id, plate_id, filament_usage)
 
     # --- Resolve slot-to-tray mapping ---
     mapping_source = None
@@ -1056,6 +1124,10 @@ async def _track_from_3mf(
             continue
 
         # --- Mid-print tray switch: split weight across trays ---
+        # Split math is shared with the Spoolman writer via
+        # ``utils.tray_split.compute_tray_split_grams`` (#1793) — both
+        # inventory backends must attribute segments identically or a
+        # user running dual-mode sees divergent totals.
         if len(tray_changes) > 1:
             # Compute total weight for this slot (same logic as normal path)
             if layer_grams and slot_id in layer_grams:
@@ -1073,8 +1145,6 @@ async def _track_from_3mf(
                 from backend.app.utils.threemf_tools import (
                     extract_filament_properties_from_3mf,
                     extract_layer_filament_usage_from_3mf,
-                    get_cumulative_usage_at_layer,
-                    mm_to_grams,
                 )
 
                 split_layer_usage = extract_layer_filament_usage_from_3mf(file_path)
@@ -1083,33 +1153,20 @@ async def _track_from_3mf(
             except Exception:
                 pass  # Fall back to linear splitting
 
-            density = split_props.get("density", 1.24)
-            diameter = split_props.get("diameter", 1.75)
-            filament_id = slot_id - 1  # 0-based for gcode
+            from backend.app.utils.tray_split import compute_tray_split_grams
 
-            sum_previous = 0.0
-            for seg_idx, (tray_global, seg_start_layer) in enumerate(tray_changes):
-                is_last = seg_idx + 1 >= len(tray_changes)
+            segments = compute_tray_split_grams(
+                tray_changes=tray_changes,
+                total_weight=total_weight,
+                slot_id=slot_id,
+                layer_usage=split_layer_usage,
+                density=split_props.get("density", 1.24),
+                diameter=split_props.get("diameter", 1.75),
+                total_layers=(state.total_layers if state else 0) or 0,
+                last_layer_num=last_layer_num,
+            )
 
-                if is_last:
-                    # Last segment: remainder to avoid rounding drift
-                    segment_grams = total_weight - sum_previous
-                elif split_layer_usage:
-                    seg_end_layer = tray_changes[seg_idx + 1][1]
-                    mm_at_start = get_cumulative_usage_at_layer(split_layer_usage, seg_start_layer).get(filament_id, 0)
-                    mm_at_end = get_cumulative_usage_at_layer(split_layer_usage, seg_end_layer).get(filament_id, 0)
-                    segment_grams = mm_to_grams(mm_at_end - mm_at_start, diameter, density)
-                else:
-                    # No per-layer data: linear fallback by layer ratio
-                    seg_end_layer = tray_changes[seg_idx + 1][1]
-                    total_layers = state.total_layers if state else 0
-                    if total_layers > 0:
-                        segment_grams = total_weight * (seg_end_layer - seg_start_layer) / total_layers
-                    else:
-                        # Can't compute ratio — assign all to last segment
-                        segment_grams = 0.0
-
-                sum_previous += segment_grams
+            for seg_idx, tray_global, segment_grams in segments:
                 if segment_grams <= 0:
                     continue
 
@@ -1128,6 +1185,8 @@ async def _track_from_3mf(
                 if seg_key in handled_trays:
                     continue
 
+                seg_start_layer = tray_changes[seg_idx][1]
+                is_last = seg_idx + 1 >= len(tray_changes)
                 logger.info(
                     "[UsageTracker] 3MF split: segment %d tray=%d (AMS%d-T%d) layers %d-%s -> %.1fg",
                     seg_idx,
@@ -1223,14 +1282,26 @@ async def _track_from_3mf(
                 if isinstance(mapped, int) and mapped >= 0:
                     global_tray_id = mapped
             # Position-based default: sort available tray IDs so external spools (254/255)
-            # naturally follow standard AMS trays, matching slicer slot numbering
+            # naturally follow standard AMS trays, matching slicer slot numbering.
+            #
+            # Filter out AMS slots that have no spool loaded (empty `tray_type`) —
+            # BambuStudio/OrcaSlicer compact the slot list when assigning filaments
+            # and don't expose empty AMS slots to the user, so the slicer's 3MF
+            # slot N maps to the Nth *loaded* tray, not the Nth physical position.
+            # Without this filter a "3 AMS slots loaded + 1 empty + external"
+            # layout routes the slicer's 4th filament to the empty AMS slot
+            # instead of the external (#1607), and the external's spool usage
+            # never gets recorded. vt_tray entries are already filtered the
+            # same way inside `build_ams_tray_lookup` (line 174 checks
+            # `tray_type`), so this just mirrors that for the AMS side.
             if global_tray_id is None:
                 _state = printer_manager.get_status(printer_id)
                 _raw = getattr(_state, "raw_data", None) if _state else None
                 if _raw:
                     from backend.app.services.spoolman_tracking import build_ams_tray_lookup
 
-                    available_trays = sorted(build_ams_tray_lookup(_raw).keys())
+                    _lookup = build_ams_tray_lookup(_raw)
+                    available_trays = sorted(gid for gid, info in _lookup.items() if info.get("tray_type"))
                     if slot_id <= len(available_trays):
                         global_tray_id = available_trays[slot_id - 1]
             # Final fallback: slot_id - 1 (legacy, works for pure AMS without external spools)
@@ -1365,5 +1436,20 @@ async def _track_from_3mf(
                     joined,
                 )
                 archive.filament_color = joined
+
+        # Adopt the matched spools' materials too (#2563) — a slot mapped to a
+        # differently-typed spool than it was sliced for otherwise records the
+        # sliced type in the archive, Print Log and material stats.
+        spool_types = _archive_types_from_spools(filament_usage, results)
+        if spool_types:
+            joined_types = ",".join(spool_types)
+            if joined_types != archive.filament_type:
+                logger.info(
+                    "[UsageTracker] 3MF: archive %s filament_type %r -> %r (from inventory spools)",
+                    archive_id,
+                    archive.filament_type,
+                    joined_types,
+                )
+                archive.filament_type = joined_types
 
     return results

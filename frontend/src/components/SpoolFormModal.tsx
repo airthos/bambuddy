@@ -6,9 +6,9 @@ import { api, ApiError } from '../api/client';
 import type { InventorySpool, SlicerSetting, SpoolCatalogEntry, LocalPreset, BuiltinFilament, SpoolmanBulkCreateResult, SpoolKProfileInput, SpoolmanFilamentEntry } from '../api/client';
 import { Button } from './Button';
 import { useToast } from '../contexts/ToastContext';
-import type { SpoolFormData, PrinterWithCalibrations, ColorPreset } from './spool-form/types';
+import type { SpoolFormData, PrinterWithCalibrations, ColorPreset, SpoolFormMode } from './spool-form/types';
 import { defaultFormData, validateForm, SPOOLMAN_LINKED_FIELDS } from './spool-form/types';
-import { buildFilamentOptions, extractBrandsFromPresets, findPresetOption, loadRecentColors, parsePresetName, saveRecentColor } from './spool-form/utils';
+import { buildFilamentOptions, extractBrandsFromPresets, fetchPrinterCalibrations, findPresetOption, loadRecentColors, pairedOptions, parsePresetName, saveRecentColor, withCurrentValue } from './spool-form/utils';
 import { MATERIALS } from './spool-form/constants';
 import { FilamentSection } from './spool-form/FilamentSection';
 import { ColorSection } from './spool-form/ColorSection';
@@ -16,12 +16,16 @@ import { AdditionalSection } from './spool-form/AdditionalSection';
 import { SpoolmanFilamentPicker } from './spool-form/SpoolmanFilamentPicker';
 import { PAProfileSection } from './spool-form/PAProfileSection';
 import { SpoolUsageHistory } from './SpoolUsageHistory';
+import {
+  invalidateInventoryLocations,
+  invalidateSpoolAndLocationQueries,
+} from '../utils/inventoryQueries';
 
 type TabId = 'filament' | 'pa-profile';
 
 const CLEAR_TAG_PAYLOAD = { tag_uid: null, tray_uuid: null, tag_type: null, data_origin: null };
 
-export type SpoolFormMode = 'create' | 'edit' | 'copy';
+export type { SpoolFormMode };
 
 interface SpoolFormModalProps {
   isOpen: boolean;
@@ -52,6 +56,9 @@ export function SpoolFormModal({
   const queryClient = useQueryClient();
   const { showToast } = useToast();
 
+  const refreshSpoolQueries = () =>
+    invalidateSpoolAndLocationQueries(queryClient, spoolsQueryKey);
+
   const isEditing = mode === 'edit';
   const isCopying = mode === 'copy';
 
@@ -60,7 +67,7 @@ export function SpoolFormModal({
   const [errors, setErrors] = useState<Partial<Record<keyof SpoolFormData, string>>>({});
   const [activeTab, setActiveTab] = useState<TabId>('filament');
   const [weightTouched, setWeightTouched] = useState(false);
-  const [storageLocationTouched, setStorageLocationTouched] = useState(false);
+  const [locationIdTouched, setLocationIdTouched] = useState(false);
   const [quickAdd, setQuickAdd] = useState(false);
   const [quantity, setQuantity] = useState(1);
 
@@ -72,6 +79,7 @@ export function SpoolFormModal({
 
   // Spool catalog
   const [spoolCatalog, setSpoolCatalog] = useState<SpoolCatalogEntry[]>([]);
+  const [storageLocations, setStorageLocations] = useState<{ id: number; name: string }[]>([]);
 
   // Local presets (OrcaSlicer imports)
   const [localPresets, setLocalPresets] = useState<LocalPreset[]>([]);
@@ -122,23 +130,51 @@ export function SpoolFormModal({
     setRecentColors(loadRecentColors());
   }, []);
 
-  // Fetch cloud presets and catalog when modal opens
+  // Fetch cloud presets and catalog when modal opens. Fetches Bambu Cloud
+  // and Orca Cloud in parallel; merges Orca filaments into ``cloudPresets``
+  // since ``OrcaProfileMeta`` is structurally identical to ``SlicerSetting``
+  // (same fields, same semantics). ``cloudAuthenticated`` flips on if either
+  // cloud is connected — the UI only uses it to gate "no cloud" hints.
   useEffect(() => {
+    // ``cancelled`` gates every state setter so a fetch that resolves AFTER
+    // the modal closes / unmounts can't fire setState on a torn-down
+    // component. Without this guard the parallel Promise.allSettled chain
+    // can still hit ``setLoadingCloudPresets(false)`` in its ``finally``
+    // after vitest has dismantled the JSDOM window — surfaced as an
+    // "Unhandled Rejection: window is not defined" in CI runs.
+    let cancelled = false;
     if (isOpen) {
       const fetchData = async () => {
         setLoadingCloudPresets(true);
         try {
-          const status = await api.getCloudStatus();
-          setCloudAuthenticated(status.is_authenticated);
-          if (status.is_authenticated) {
-            const presets = await api.getFilamentPresets();
-            setCloudPresets(presets);
-          }
+          const [bambuResult, orcaResult] = await Promise.allSettled([
+            (async () => {
+              const status = await api.getCloudStatus();
+              if (!status.is_authenticated) return { connected: false, presets: [] as SlicerSetting[] };
+              const presets = await api.getFilamentPresets();
+              return { connected: true, presets };
+            })(),
+            (async () => {
+              const status = await api.orcaCloudStatus();
+              if (!status.connected) return { connected: false, presets: [] as SlicerSetting[] };
+              const list = await api.orcaCloudListProfiles();
+              // OrcaProfileMeta is structurally identical to SlicerSetting.
+              return { connected: true, presets: list.filament as unknown as SlicerSetting[] };
+            })(),
+          ]);
+          if (cancelled) return;
+          const bambuConnected = bambuResult.status === 'fulfilled' && bambuResult.value.connected;
+          const orcaConnected = orcaResult.status === 'fulfilled' && orcaResult.value.connected;
+          const bambuPresets = bambuResult.status === 'fulfilled' ? bambuResult.value.presets : [];
+          const orcaPresets = orcaResult.status === 'fulfilled' ? orcaResult.value.presets : [];
+          setCloudAuthenticated(bambuConnected || orcaConnected);
+          setCloudPresets([...bambuPresets, ...orcaPresets]);
         } catch (e) {
+          if (cancelled) return;
           console.error('Failed to fetch cloud presets:', e);
           setCloudAuthenticated(false);
         } finally {
-          setLoadingCloudPresets(false);
+          if (!cancelled) setLoadingCloudPresets(false);
         }
       };
       fetchData();
@@ -148,6 +184,7 @@ export function SpoolFormModal({
       api.getColorCatalog().then(setColorCatalog).catch(console.error);
       api.getLocalPresets().then(r => setLocalPresets(r.filament)).catch(console.error);
       api.getBuiltinFilaments().then(setBuiltinFilaments).catch(console.error);
+      api.getLocations().then((locs) => setStorageLocations(locs.map((l) => ({ id: l.id, name: l.name })))).catch(console.error);
 
       // Fetch printer calibrations if not provided via props
       if (printersWithCalibrations.length === 0) {
@@ -164,21 +201,9 @@ export function SpoolFormModal({
               const connected = status?.connected ?? false;
               let calibrations: PrinterWithCalibrations['calibrations'] = [];
               if (connected) {
-                try {
-                  const kRes = await api.getKProfiles(printer.id);
-                  calibrations = kRes.profiles.map(p => ({
-                    cali_idx: p.slot_id,
-                    filament_id: p.filament_id,
-                    setting_id: p.setting_id || '',
-                    name: p.name,
-                    k_value: parseFloat(p.k_value) || 0,
-                    n_coef: parseFloat(p.n_coef) || 0,
-                    extruder_id: p.extruder_id,
-                    nozzle_diameter: p.nozzle_diameter,
-                  }));
-                } catch {
-                  // Printer may not support K-profiles
-                }
+                // Fetch across every installed nozzle so dual-nozzle printers
+                // surface both the 0.4mm and 0.6mm K-profiles, not just 0.4 (#2618).
+                calibrations = await fetchPrinterCalibrations(printer.id, status);
               }
               results.push({ printer: { ...printer, connected }, calibrations });
             }
@@ -195,6 +220,9 @@ export function SpoolFormModal({
     // "test environment was torn down" errors in vitest. spoolmanMode only
     // gates a single fetch (getSpoolCatalog) which is cheap enough to skip
     // when the modal opens in Spoolman mode.
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, printersWithCalibrations.length]);
 
@@ -272,21 +300,33 @@ export function SpoolFormModal({
     return map;
   }, [brandMaterialPairs]);
 
-  const availableBrands = useMemo(() => {
-    if (!formData.material) return baseAvailableBrands;
-    const materialKey = formData.material.toLowerCase();
-    const brandKeys = materialToBrands.get(materialKey);
-    if (!brandKeys || brandKeys.size === 0) return baseAvailableBrands;
-    return baseAvailableBrands.filter(brand => brandKeys.has(brand.toLowerCase()));
-  }, [baseAvailableBrands, formData.material, materialToBrands]);
+  // #1905: the brand and material dropdowns used to be filtered down to the
+  // pairs seen in the color catalog / slicer presets, which hid perfectly valid
+  // combinations — "Elegoo" exists (as a PLA brand) but vanished from the list
+  // once ASA was selected, making the entry look impossible. Both lists now
+  // always offer everything we know about, plus whatever the spool already has
+  // stored (a custom brand saved earlier was missing from its own dropdown).
+  // The pairing knowledge survives as `suggestedBrands`/`suggestedMaterials`,
+  // which the dropdowns sort to the top instead of filtering by.
+  const availableBrands = useMemo(
+    () => withCurrentValue(baseAvailableBrands, formData.brand),
+    [baseAvailableBrands, formData.brand],
+  );
 
-  const availableMaterials = useMemo(() => {
-    if (!formData.brand) return baseAvailableMaterials;
-    const brandKey = formData.brand.toLowerCase();
-    const materialKeys = brandToMaterials.get(brandKey);
-    if (!materialKeys || materialKeys.size === 0) return baseAvailableMaterials;
-    return baseAvailableMaterials.filter(material => materialKeys.has(material.toLowerCase()));
-  }, [baseAvailableMaterials, formData.brand, brandToMaterials]);
+  const availableMaterials = useMemo(
+    () => withCurrentValue(baseAvailableMaterials, formData.material),
+    [baseAvailableMaterials, formData.material],
+  );
+
+  const suggestedBrands = useMemo(
+    () => pairedOptions(availableBrands, formData.material, materialToBrands),
+    [availableBrands, formData.material, materialToBrands],
+  );
+
+  const suggestedMaterials = useMemo(
+    () => pairedOptions(availableMaterials, formData.brand, brandToMaterials),
+    [availableMaterials, formData.brand, brandToMaterials],
+  );
 
   // Find selected preset option
   const selectedPresetOption = useMemo(
@@ -329,7 +369,7 @@ export function SpoolFormModal({
           cost_per_kg: spool.cost_per_kg ?? null,
           category: spool.category || '',
           low_stock_threshold_pct: spool.low_stock_threshold_pct ?? null,
-          storage_location: spool.storage_location || '',
+          location_id: spool.location_id ?? null,
           spoolman_filament_id: null,
         });
         setPresetInputValue(spool.slicer_filament_name || spool.slicer_filament || '');
@@ -350,15 +390,31 @@ export function SpoolFormModal({
         setFormData(defaultFormData);
         setPresetInputValue('');
         setSelectedProfiles(new Set());
-        setQuickAdd(false);
-        setQuantity(1);
       }
+      // Reset on every open, not just the create path (#1905). The modal keeps
+      // its state while closed, and the Quick Add toggle only renders in create
+      // mode — so quick-adding a spool and then opening Edit left the edit form
+      // stuck in quick-add layout (no preset field, no PA-profile tab) with no
+      // control to switch back.
+      setQuickAdd(false);
+      setQuantity(1);
       setErrors({});
       setActiveTab('filament');
       setWeightTouched(false);
-      setStorageLocationTouched(false);
+      setLocationIdTouched(false);
     }
   }, [isOpen, spool, mode, isCopying]);
+
+  // Legacy rows may have storage_location text but no location_id yet — link when catalog loads.
+  useEffect(() => {
+    if (!isOpen || !spool || locationIdTouched || formData.location_id != null) return;
+    const legacy = spool.storage_location?.trim();
+    if (!legacy || storageLocations.length === 0) return;
+    const match = storageLocations.find((l) => l.name.toLowerCase() === legacy.toLowerCase());
+    if (match) {
+      setFormData((prev) => (prev.location_id === match.id ? prev : { ...prev, location_id: match.id }));
+    }
+  }, [isOpen, spool, storageLocations, formData.location_id, locationIdTouched]);
 
   // Expand all printers in PA profile section when calibrations are available
   useEffect(() => {
@@ -381,7 +437,7 @@ export function SpoolFormModal({
         : {}),
     }));
     if (key === 'weight_used') setWeightTouched(true);
-    if (key === 'storage_location') setStorageLocationTouched(true);
+    if (key === 'location_id') setLocationIdTouched(true);
     if (errors[key]) {
       setErrors(prev => ({ ...prev, [key]: undefined }));
     }
@@ -425,7 +481,7 @@ export function SpoolFormModal({
         const ok = await saveKProfiles(newSpool.id);
         if (!ok) return;
       }
-      await queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
+      await refreshSpoolQueries();
       if (onSpoolsCreated) onSpoolsCreated([newSpool]);
       showToast(t('inventory.spoolCreated'), 'success');
       onClose();
@@ -464,7 +520,7 @@ export function SpoolFormModal({
           await saveKProfiles(s.id);
         }
       }
-      await queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
+      await refreshSpoolQueries();
       if (onSpoolsCreated) onSpoolsCreated(createdSpools);
       if (spoolmanResult && spoolmanResult.failed_count > 0) {
         showToast(
@@ -498,7 +554,7 @@ export function SpoolFormModal({
         const ok = await saveKProfiles(spool.id);
         if (!ok) return;
       }
-      await queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
+      await refreshSpoolQueries();
       showToast(t('inventory.spoolUpdated'), 'success');
       onClose();
     },
@@ -519,7 +575,7 @@ export function SpoolFormModal({
       return api.updateSpool(spool!.id, CLEAR_TAG_PAYLOAD as Parameters<typeof api.updateSpool>[1]);
     },
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
+      await refreshSpoolQueries();
       showToast(t('inventory.rfidCleared', 'RFID tag cleared'), 'success');
       onClose();
     },
@@ -678,7 +734,7 @@ export function SpoolFormModal({
   if (!isOpen) return null;
 
   const handleSubmit = () => {
-    const validation = validateForm(formData, quickAdd, spoolmanMode);
+    const validation = validateForm(formData, quickAdd, spoolmanMode, mode);
     if (!validation.isValid) {
       setErrors(validation.errors);
       if (validation.errors.slicer_filament || validation.errors.material || validation.errors.brand || validation.errors.subtype) {
@@ -717,11 +773,10 @@ export function SpoolFormModal({
       data.weight_used = formData.weight_used;
     }
 
-    // Only send storage_location when creating or when explicitly changed by the user.
-    // This prevents the modal round-trip from overwriting the Spoolman location field
-    // with a stale cached value when the user saves without touching this field.
-    if (!isEditing || storageLocationTouched) {
-      data.storage_location = formData.storage_location || null;
+    // Only send location_id when creating or when explicitly changed by the user.
+    // Backend derives storage_location; omitting on untouched edit avoids stale overwrites.
+    if (!isEditing || locationIdTouched) {
+      data.location_id = formData.location_id;
     }
 
     if (isEditing) {
@@ -767,7 +822,7 @@ export function SpoolFormModal({
         {mode === 'create' && (
           <div className="flex items-center justify-between px-4 py-2 border-b border-bambu-dark-tertiary flex-shrink-0">
             <div className="flex items-center gap-2">
-              <Zap className="w-4 h-4 text-amber-400" />
+              <Zap className="w-4 h-4 text-amber-600 dark:text-amber-400" />
               <span className="text-sm text-white">{t('inventory.quickAdd')}</span>
             </div>
             <button
@@ -830,7 +885,7 @@ export function SpoolFormModal({
               {spoolmanMode && !isEditing && (
                 <div>
                   {filamentsError ? (
-                    <p className="text-sm text-red-400 px-1">{t('inventory.spoolmanCatalogLoadFailed')}</p>
+                    <p className="text-sm text-red-700 dark:text-red-400 px-1">{t('inventory.spoolmanCatalogLoadFailed')}</p>
                   ) : (
                     <SpoolmanFilamentPicker
                       filaments={spoolmanFilaments}
@@ -858,7 +913,10 @@ export function SpoolFormModal({
                   filamentOptions={filamentOptions}
                   availableBrands={availableBrands}
                   availableMaterials={availableMaterials}
+                  suggestedBrands={suggestedBrands}
+                  suggestedMaterials={suggestedMaterials}
                   quickAdd={quickAdd}
+                  detailsRequired={!quickAdd && !spoolmanMode && mode === 'create'}
                   quantity={quantity}
                   onQuantityChange={setQuantity}
                   errors={errors}
@@ -890,6 +948,23 @@ export function SpoolFormModal({
                   spoolCatalog={spoolCatalog}
                   currencySymbol={currencySymbol}
                   availableCategories={availableCategories}
+                  availableLocations={storageLocations}
+                  onCreateLocation={async (name) => {
+                    try {
+                      const created = await api.createLocation({ name });
+                      setStorageLocations((prev) => [...prev, { id: created.id, name: created.name }].sort((a, b) => a.name.localeCompare(b.name)));
+                      await invalidateInventoryLocations(queryClient);
+                      return { id: created.id, name: created.name };
+                    } catch (e) {
+                      // Surface the backend's actual error so the user can
+                      // distinguish 409 duplicate / 400 validation / 500 from
+                      // a generic "save failed" message.
+                      console.error(e);
+                      const message = e instanceof Error ? e.message : t('locations.saveFailed');
+                      showToast(message || t('locations.saveFailed'), 'error');
+                      return null;
+                    }
+                  }}
                   globalLowStockThreshold={globalLowStockThreshold}
                   spoolmanMode={spoolmanMode}
                 />

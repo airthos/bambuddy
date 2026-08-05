@@ -4,16 +4,16 @@ Bambuddy is sustainable thanks to people who put their money where their use is.
 
 If you'd like to support Bambuddy:
 
-- **GitHub Sponsors** (recurring, 5 tiers from $5/mo to $500/mo) — https://github.com/sponsors/maziggy
+- **GitHub Sponsors** (recurring, 5 tiers from $5/mo to $300/mo) — https://github.com/sponsors/maziggy
 - **Ko-fi** (one-time or recurring) — https://ko-fi.com/maziggy
 
 If you sponsor and your name isn't here within 48h, please write an email to martin@bambuddy.cool or open an Issue on the main repo.
 
 ---
 
-## Corporate Sponsors ($500/mo+)
+## Corporate Sponsors ($300/mo+)
 
-*None yet — be the first. Your logo on the bambuddy.cool homepage and press.html, plus co-marketing.*
+- [@northpole3dprinting](https://github.com/northpole3dprinting)
 
 ## Sustaining Sponsors ($150/mo+)
 
@@ -22,14 +22,22 @@ If you sponsor and your name isn't here within 48h, please write an email to mar
 ## Patrons ($35/mo+)
 
 - [@VREmma](https://github.com/VREmma)
+- [@pwostran](https://github.com/pwostran)
+- [@Praxeis](https://github.com/Praxeis)
+- [@jmclaren7](https://github.com/jmclaren7)
+- [@RoBoT24-web](https://github.com/RoBoT24-web)
+- [@Rayvenhaus](https://github.com/Rayvenhaus)
+- [@TheUltimateC0der](https://github.com/TheUltimateC0der)
+- [@rstocks](https://github.com/rstocks)
 
 ## Supporters ($15/mo+)
 
 - [@rewart01](https://github.com/rewart01)
-- [@rstocks](https://github.com/rstocks)
 - [@sixfootseven](https://github.com/sixfootseven)
-- [@pwostran](https://github.com/pwostran)
 - [@MethodicalMartian](https://github.com/MethodicalMartian)
+- [@brianharwell](https://github.com/brianharwell)
+- [@shosier01](https://github.com/shosier01)
+- [@freifunk-bamberg](https://github.com/freifunk-bamberg)
 
 ## Backers ($5/mo+)
 
@@ -40,6 +48,29 @@ If you sponsor and your name isn't here within 48h, please write an email to mar
 - [@sentinel-center](https://github.com/sentinel-center)
 - [@brianehlert](https://github.com/brianehlert)
 - [@siiruup](https://github.com/siiruup)
+- [@agntcoopersea](https://github.com/agntcoopersea)
+- [@PJMCL1618033](https://github.com/PJMCL1618033
+- [@mgf99](https://github.com/mgf99)
+- [@Geoff-S](https://github.com/Geoff-S)
+- [@andyspinball](https://github.com/andyspinball
+- [@avandeputte](https://github.com/avandeputte)
+- [@joeferrante](https://github.com/joeferrante)
+- [@GPop61](https://github.com)
+- [@CooleyMcCoolson](https://github.com/CooleyMcCoolson)
+- [@mikeloveridge](https://github.com/mikeloveridge)
+- [@boernie](https://github.com/boernie)
+- [@qoatzelcoat](https://github.com/qoatzelcoat)
+- [@Sanaki](https://github.com/Sanaki)
+- [@jlofshult](https://github.com/jlofshult)
+- [@TriadX1](https://github.com/TriadX1)
+- [@hazzardr](https://github.com/hazzardr)
+- [@Shihchiun](https://github.com/Shihchiun)
+- [@kycrna](https://github.com/kycrna)
+- [@iljur](https://github.com/iljur)
+- [@bhamiltoncx](https://github.com/bhamiltoncx)
+- [@g7ufo](https://github.com/g7ufo)
+- [@Heidelberger2000](https://github.com/Heidelberger2000)
+
 ---
 
 ## One-time and historical supporters

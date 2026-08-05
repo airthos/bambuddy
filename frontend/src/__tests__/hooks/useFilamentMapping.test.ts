@@ -6,10 +6,15 @@
  */
 
 import { describe, it, expect } from 'vitest';
+import { renderHook } from '@testing-library/react';
 import {
+  buildAmsMapping,
+  buildFilamentComparison,
   buildLoadedFilaments,
   computeAmsMapping,
+  useFilamentMapping,
 } from '../../hooks/useFilamentMapping';
+import { effectivePreferLowest } from '../../utils/amsHelpers';
 import type { PrinterStatus } from '../../api/client';
 
 // Helper to create a minimal printer status with AMS data
@@ -1046,5 +1051,349 @@ describe('computeAmsMapping preferLowest', () => {
 
     const result = computeAmsMapping(reqs, status, true);
     expect(result).toEqual([1]); // Known 60% over unknown
+  });
+});
+
+// #1766: the user reported that "Prefer lowest remaining filament" picked the
+// wrong spool when two identical-material/color spools differed only in the
+// inventory-tracked grams (not the printer's `remain%`). The pre-fix sort
+// looked at `remain%` only and ignored Bambuddy's bound inventory entirely;
+// now we pass a globalTrayId -> grams map and the sort lifts inventory-bound
+// spools to tier 0 (matching backend _prefer_lowest_sort_key).
+describe('computeAmsMapping preferLowest with inventory map (#1766)', () => {
+  it('picks spool with lower inventory grams when both spools report same remain%', () => {
+    // Reporter's scenario: two identical Bambu-branded spools, both report
+    // `remain=100` because they were freshly inserted, but inventory has them
+    // at 950 g vs 50 g remaining. Pre-fix sort ties and picks the first.
+    const reqs = {
+      filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10, tray_info_idx: 'GFA00' }],
+    };
+    const status = createPrinterStatus([
+      {
+        id: 0,
+        tray: [
+          { id: 0, tray_type: 'PLA', tray_color: 'FF0000', tray_info_idx: 'GFA00', remain: 100 },
+          { id: 1, tray_type: 'PLA', tray_color: 'FF0000', tray_info_idx: 'GFA00', remain: 100 },
+        ],
+      },
+    ]);
+    const inventory = new Map<number, number>([[0, 950], [1, 50]]);
+
+    const result = computeAmsMapping(reqs, status, true, inventory);
+    expect(result).toEqual([1]); // Inventory says tray 1 is nearly empty — use it first.
+  });
+
+  it('prefers inventory-tracked spool over non-tracked one even when remain% would order them differently', () => {
+    // Two spools both match by type+color, both have the same tray_info_idx
+    // (identical SKU). Tray 0 has no inventory binding but reports remain=20.
+    // Tray 1 has an inventory binding with 100 g remaining. Tier 0 (bound)
+    // always beats tier 1 (MQTT-only) regardless of value — matches backend.
+    const reqs = {
+      filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10, tray_info_idx: 'GFA00' }],
+    };
+    const status = createPrinterStatus([
+      {
+        id: 0,
+        tray: [
+          { id: 0, tray_type: 'PLA', tray_color: 'FF0000', tray_info_idx: 'GFA00', remain: 20 },
+          { id: 1, tray_type: 'PLA', tray_color: 'FF0000', tray_info_idx: 'GFA00', remain: 80 },
+        ],
+      },
+    ]);
+    const inventory = new Map<number, number>([[1, 100]]); // Only tray 1 bound
+
+    const result = computeAmsMapping(reqs, status, true, inventory);
+    expect(result).toEqual([1]);
+  });
+
+  it('falls back to remain% sort when no inventory map provided (pre-#1766 behaviour)', () => {
+    // Regression guard: callers that haven't yet wired the map must get the
+    // same sort they always got. None of the existing tests in this file pass
+    // a map; this asserts the default path is unchanged.
+    const reqs = {
+      filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }],
+    };
+    const status = createPrinterStatus([
+      {
+        id: 0,
+        tray: [
+          { id: 0, tray_type: 'PLA', tray_color: 'FF0000', remain: 80 },
+          { id: 1, tray_type: 'PLA', tray_color: 'FF0000', remain: 25 },
+        ],
+      },
+    ]);
+
+    const result = computeAmsMapping(reqs, status, true, undefined);
+    expect(result).toEqual([1]); // Same as the existing no-inventory case.
+  });
+});
+
+// #1766 safety gate: when the printer has AMS Filament Backup OFF, the sort
+// MUST NOT run, even with the user setting on. Otherwise the dispatch picks a
+// near-empty spool the printer can't switch off of when it runs out mid-print.
+// Mirrors backend `_compute_ams_mapping_for_printer` gate.
+describe('effectivePreferLowest gate (#1766)', () => {
+  it('coerces to false when backup is OFF', () => {
+    expect(effectivePreferLowest(true, false)).toBe(false);
+  });
+
+  it('passes through when backup is ON', () => {
+    expect(effectivePreferLowest(true, true)).toBe(true);
+  });
+
+  it('passes through when backup is unknown (null/undefined — A1 family)', () => {
+    expect(effectivePreferLowest(true, null)).toBe(true);
+    expect(effectivePreferLowest(true, undefined)).toBe(true);
+  });
+
+  it('stays false when the user setting is off, regardless of backup state', () => {
+    expect(effectivePreferLowest(false, true)).toBe(false);
+    expect(effectivePreferLowest(false, false)).toBe(false);
+    expect(effectivePreferLowest(undefined, true)).toBe(false);
+  });
+
+  it('slot-priority tie-break: external/VT spools sort AFTER regular AMS', () => {
+    // Mirrors backend `_slot_priority` banding. When tier and value tie, slot
+    // position decides — external (ams_id = -1) must clamp to 10_000 so it
+    // can't beat AMS slot 0 (priority 0).
+    const reqs = {
+      filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }],
+    };
+    const status = createPrinterStatus(
+      [
+        {
+          id: 0,
+          tray: [
+            { id: 0, tray_type: 'PLA', tray_color: 'FF0000', remain: -1 },  // priority 0
+          ],
+        },
+      ],
+      [{ id: 254, tray_type: 'PLA', tray_color: 'FF0000', remain: -1 }],  // priority 10_000
+    );
+    const result = computeAmsMapping(reqs, status, true);
+    expect(result).toEqual([0]); // AMS slot wins the tie; VT does not.
+  });
+
+  it('end-to-end: backup OFF prevents lowest-pick at dispatch (caller-coerced)', () => {
+    // PrintModal computes the effective flag and passes it to computeAmsMapping.
+    // This pins that flow: with backup=false the flag becomes false, the sort
+    // doesn't run, and the first matching tray wins (today's behaviour).
+    const reqs = {
+      filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }],
+    };
+    const status = createPrinterStatus([
+      {
+        id: 0,
+        tray: [
+          { id: 0, tray_type: 'PLA', tray_color: 'FF0000', remain: 80 },
+          { id: 1, tray_type: 'PLA', tray_color: 'FF0000', remain: 5 },  // near-empty
+        ],
+      },
+    ]);
+    const gated = effectivePreferLowest(true, false);
+    const result = computeAmsMapping(reqs, status, gated);
+    expect(result).toEqual([0]); // First match wins; the 5%-remain spool is NOT selected.
+  });
+});
+
+describe('per-plate mapping vs. the whole-file union (#2551 follow-up)', () => {
+  // The multi-plate case that made this necessary: two plates, each printing one
+  // red object, but on different slots of the same file. The printer has exactly
+  // one red spool.
+  const PLATE_1 = { filaments: [{ slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 }] };
+  const PLATE_2 = { filaments: [{ slot_id: 2, type: 'PLA', color: '#FF0000', used_grams: 10 }] };
+  const WHOLE_FILE_UNION = {
+    filaments: [
+      { slot_id: 1, type: 'PLA', color: '#FF0000', used_grams: 10 },
+      { slot_id: 2, type: 'PLA', color: '#FF0000', used_grams: 10 },
+    ],
+  };
+
+  const printer = createPrinterStatus([
+    {
+      id: 0,
+      tray: [
+        { id: 0, tray_type: 'PLA', tray_color: 'FF0000' }, // the only red — global tray 0
+        { id: 1, tray_type: 'PLA', tray_color: '000000' }, // black — global tray 1
+      ],
+    },
+  ]);
+
+  const mapPlate = (reqs: { filaments: { slot_id: number; type: string; color: string; used_grams: number }[] }) =>
+    buildAmsMapping(buildFilamentComparison(reqs, buildLoadedFilaments(printer), {}));
+
+  it('maps each plate to the red tray, because each plate is its own print', () => {
+    expect(mapPlate(PLATE_1)).toEqual([0]);
+    // Slot 1 is unused by this plate, so it stays -1; slot 2 takes the red tray.
+    expect(mapPlate(PLATE_2)).toEqual([-1, 0]);
+  });
+
+  it('the union starves the second slot — which is what a shared mapping sent', () => {
+    // Tray assignment is stateful: slot 1 claims the red tray, so slot 2 falls
+    // through to a type-only match on the BLACK tray. Sending this to plate 2
+    // prints it in black. This is the mapping the modal used to post for every
+    // plate of a multi-plate submission.
+    expect(mapPlate(WHOLE_FILE_UNION)).toEqual([0, 1]);
+  });
+
+  it('a manual override on one plate does not leak into another', () => {
+    const loaded = buildLoadedFilaments(printer);
+    // The user pins plate 2's slot 2 to the black tray by hand.
+    const plate2 = buildAmsMapping(buildFilamentComparison(PLATE_2, loaded, { 2: 1 }));
+    expect(plate2).toEqual([-1, 1]);
+    // Plate 1 is mapped from its own (empty) override set and still gets red.
+    expect(buildAmsMapping(buildFilamentComparison(PLATE_1, loaded, {}))).toEqual([0]);
+  });
+});
+
+describe('useFilamentMapping — no [-1] mapping during a status-load race (#2589)', () => {
+  // The file requires one PETG slot; two compatible PETG spools are loaded once
+  // the printer status arrives.
+  const filamentReqs = {
+    filaments: [{ slot_id: 1, type: 'PETG', color: '#161616', used_grams: 141.86 }],
+  };
+  const statusWithPetg = createPrinterStatus([
+    {
+      id: 0,
+      tray: [
+        { id: 0, tray_type: 'PETG', tray_color: 'BCBCBC' },
+        { id: 1, tray_type: 'PETG', tray_color: 'FFFFFF' },
+      ],
+    },
+  ]);
+
+  it('returns undefined (not [-1]) while printerStatus is still loading', () => {
+    // printerStatus undefined = query not resolved yet. Serializing [-1] here is
+    // exactly what dispatched the P1S print to the empty external feed.
+    const { result } = renderHook(() => useFilamentMapping(filamentReqs, undefined, {}));
+    expect(result.current.amsMapping).toBeUndefined();
+  });
+
+  it('resolves to an AMS tray once status has loaded (type-only match, strict color off)', () => {
+    // Black requested, only gray/white PETG loaded: a type-only match is valid.
+    const { result } = renderHook(() => useFilamentMapping(filamentReqs, statusWithPetg, {}));
+    expect(result.current.amsMapping).toEqual([0]);
+    expect(result.current.hasTypeMismatch).toBe(false);
+  });
+
+  it('still emits [-1] for a genuine mismatch when trays are present', () => {
+    // Status loaded but nothing compatible (only PLA) -> the mapping legitimately
+    // carries -1 and the mismatch is surfaced; this must NOT be suppressed.
+    const statusWithPla = createPrinterStatus([
+      { id: 0, tray: [{ id: 0, tray_type: 'PLA', tray_color: 'FF0000' }] },
+    ]);
+    const { result } = renderHook(() => useFilamentMapping(filamentReqs, statusWithPla, {}));
+    expect(result.current.amsMapping).toEqual([-1]);
+    expect(result.current.hasTypeMismatch).toBe(true);
+  });
+});
+
+describe('colour verdict is independent of how the tray was found (#2687)', () => {
+  // tray_info_idx names the filament *variant*, not an individual spool:
+  // GFA00 = PLA Basic, GFA01 = PLA Matte, GFA17 = PLA Translucent. A user with
+  // exactly one Matte spool loaded therefore idx-matches every Matte
+  // requirement no matter what colour it is.
+  const MATTE_DARK_GREEN = createPrinterStatus([
+    { id: 0, tray: [{ id: 0, tray_type: 'PLA', tray_color: '004225', tray_info_idx: 'GFA01' }] },
+  ]);
+  const wantRedMatte = {
+    filaments: [
+      { slot_id: 1, type: 'PLA', color: '#9D432C', used_grams: 31, tray_info_idx: 'GFA01' },
+    ],
+  };
+
+  it('reports a unique-idx tray of the wrong colour as type_only, not match', () => {
+    const [item] = buildFilamentComparison(
+      wantRedMatte,
+      buildLoadedFilaments(MATTE_DARK_GREEN),
+      {},
+    );
+
+    // The tray is still selected — it is the right variant (#2650) ...
+    expect(item.loaded?.globalTrayId).toBe(0);
+    // ... but red-on-dark-green is not a colour match.
+    expect(item.colorMatch).toBe(false);
+    expect(item.status).toBe('type_only');
+  });
+
+  it('auto and manual agree on the same tray', () => {
+    const loaded = buildLoadedFilaments(MATTE_DARK_GREEN);
+    const auto = buildFilamentComparison(wantRedMatte, loaded, {})[0];
+    const manual = buildFilamentComparison(wantRedMatte, loaded, { 1: 0 })[0];
+
+    // The original report: auto said "match", manually picking that very tray
+    // said "mismatch". Both paths must now reach the same verdict.
+    expect(manual.isManual).toBe(true);
+    expect(auto.status).toBe(manual.status);
+    expect(auto.colorMatch).toBe(manual.colorMatch);
+  });
+
+  it('surfaces the mismatch through the hook so the panel stops saying Ready', () => {
+    const { result } = renderHook(() => useFilamentMapping(wantRedMatte, MATTE_DARK_GREEN, {}));
+    // hasColorMismatch drives the yellow "(Color mismatch)" header; the tray is
+    // still mapped, so this is not a type mismatch.
+    expect(result.current.hasColorMismatch).toBe(true);
+    expect(result.current.hasTypeMismatch).toBe(false);
+    expect(result.current.amsMapping).toEqual([0]);
+  });
+
+  it('still reports a match when the unique-idx tray does carry the right colour', () => {
+    const [item] = buildFilamentComparison(
+      { filaments: [{ slot_id: 1, type: 'PLA', color: '#004225', used_grams: 31, tray_info_idx: 'GFA01' }] },
+      buildLoadedFilaments(MATTE_DARK_GREEN),
+      {},
+    );
+    expect(item.status).toBe('match');
+    expect(item.colorMatch).toBe(true);
+  });
+
+  it('accepts a near-enough shade on the idx path', () => {
+    // Within colorsAreSimilar's per-channel tolerance — the printer reporting a
+    // spool a shade off must not become a mismatch.
+    const [item] = buildFilamentComparison(
+      { filaments: [{ slot_id: 1, type: 'PLA', color: '#0A4A2A', used_grams: 31, tray_info_idx: 'GFA01' }] },
+      buildLoadedFilaments(MATTE_DARK_GREEN),
+      {},
+    );
+    expect(item.status).toBe('match');
+  });
+
+  it('treats a colourless requirement as satisfied by any colour', () => {
+    // 3MFs that omit the colour parse to "" (filament_requirements.py); there is
+    // nothing to disagree with, so this must not read as a colour mismatch.
+    const [item] = buildFilamentComparison(
+      { filaments: [{ slot_id: 1, type: 'PLA', color: '', used_grams: 31, tray_info_idx: 'GFA01' }] },
+      buildLoadedFilaments(MATTE_DARK_GREEN),
+      {},
+    );
+    expect(item.status).toBe('match');
+    expect(item.colorMatch).toBe(true);
+  });
+
+  it('keeps the multi-idx path intact — same idx, several colours picks the right one', () => {
+    // Two Matte spools: the branch that already compared colours must be
+    // unaffected, and the exact-colour tray still wins.
+    const twoMatte = createPrinterStatus([
+      {
+        id: 0,
+        tray: [
+          { id: 0, tray_type: 'PLA', tray_color: '004225', tray_info_idx: 'GFA01' },
+          { id: 1, tray_type: 'PLA', tray_color: '9D432C', tray_info_idx: 'GFA01' },
+        ],
+      },
+    ]);
+    const [item] = buildFilamentComparison(wantRedMatte, buildLoadedFilaments(twoMatte), {});
+    expect(item.loaded?.globalTrayId).toBe(1);
+    expect(item.status).toBe('match');
+  });
+
+  it('a type-only fallback with no idx candidate is still type_only', () => {
+    // Regression guard: the pre-existing "type matches, colour does not" path.
+    const basicOnly = createPrinterStatus([
+      { id: 0, tray: [{ id: 0, tray_type: 'PLA', tray_color: '004225', tray_info_idx: 'GFA00' }] },
+    ]);
+    const [item] = buildFilamentComparison(wantRedMatte, buildLoadedFilaments(basicOnly), {});
+    expect(item.status).toBe('type_only');
+    expect(item.colorMatch).toBe(false);
   });
 });

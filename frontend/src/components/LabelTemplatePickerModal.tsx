@@ -4,6 +4,7 @@ import { X, Loader2, Printer, CheckSquare, Square, Search } from 'lucide-react';
 import { api, type SpoolLabelTemplate, type InventorySpool } from '../api/client';
 import { Button } from './Button';
 import { useToast } from '../contexts/ToastContext';
+import { getSwatchStyle } from '../utils/colors';
 
 /** Subset of InventorySpool the modal needs for checkbox rendering. */
 type SpoolForLabel = Pick<
@@ -72,7 +73,16 @@ const TEMPLATE_OPTIONS: TemplateOption[] = [
 
 function openBlobInNewTab(blob: Blob): void {
   const url = window.URL.createObjectURL(blob);
-  const win = window.open(url, '_blank', 'noopener,noreferrer');
+  // Do NOT pass `noopener,noreferrer`: per the WindowFeatures spec, `noopener`
+  // forces window.open to return `null` even on success, which made the
+  // `if (!win)` popup-block fallback below fire on EVERY click — so the blob
+  // tab opened (downloading a random-named PDF on systems without an inline
+  // viewer) AND the `<a download>` fallback fired (downloading a second copy
+  // named bambuddy-labels.pdf). Two identical PDFs per click — issue #1628.
+  // The blob is same-origin, the destination is a passive PDF tab with no
+  // script context, and `noreferrer` is a no-op for blob URLs, so dropping
+  // these flags has no security impact.
+  const win = window.open(url, '_blank');
   if (!win) {
     const a = document.createElement('a');
     a.href = url;
@@ -84,10 +94,12 @@ function openBlobInNewTab(blob: Blob): void {
   setTimeout(() => window.URL.revokeObjectURL(url), 60_000);
 }
 
+// Thin wrapper over `getSwatchStyle` from utils/colors so the modal's render
+// sites keep their existing call shape. Transparent (alpha=00) spools now
+// render as a checkerboard pattern instead of collapsing to solid black
+// (#1545).
 function swatchStyle(rgba: string | null | undefined): React.CSSProperties {
-  if (!rgba) return { backgroundColor: '#808080' };
-  const cleaned = rgba.replace(/^#/, '').slice(0, 6);
-  return cleaned.length === 6 ? { backgroundColor: `#${cleaned}` } : { backgroundColor: '#808080' };
+  return getSwatchStyle(rgba);
 }
 
 function spoolDisplayName(s: SpoolForLabel): string {
@@ -162,6 +174,7 @@ export function LabelTemplatePickerModal({
   const [search, setSearch] = useState('');
   const [materialFilter, setMaterialFilter] = useState<string>('');
   const [sortMode, setSortMode] = useState<SortMode>('id');
+  const [monochrome, setMonochrome] = useState(false);
 
   // Sync from caller and reset transient state on open. Intentionally not
   // reactive to props while open — once the user starts editing we don't want
@@ -173,6 +186,7 @@ export function LabelTemplatePickerModal({
       setSearch('');
       setMaterialFilter('');
       setSortMode('id');
+      setMonochrome(false);
       setPending(null);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -261,8 +275,8 @@ export function LabelTemplatePickerModal({
     setPending(template);
     try {
       const blob = spoolmanMode
-        ? await api.printSpoolmanSpoolLabels({ spool_ids: ids, template })
-        : await api.printSpoolLabels({ spool_ids: ids, template });
+        ? await api.printSpoolmanSpoolLabels({ spool_ids: ids, template, monochrome })
+        : await api.printSpoolLabels({ spool_ids: ids, template, monochrome });
       openBlobInNewTab(blob);
       onClose();
     } catch (err) {
@@ -452,10 +466,33 @@ export function LabelTemplatePickerModal({
           )}
         </div>
 
+        {/* Print options */}
+        <div className="px-4 pt-2 pb-1 border-t border-bambu-dark-tertiary">
+          <label className="inline-flex items-center gap-2 cursor-pointer select-none">
+            {monochrome ? (
+              <CheckSquare className="w-4 h-4 text-bambu-green shrink-0" />
+            ) : (
+              <Square className="w-4 h-4 text-bambu-gray shrink-0" />
+            )}
+            <input
+              type="checkbox"
+              checked={monochrome}
+              onChange={(e) => setMonochrome(e.target.checked)}
+              className="sr-only"
+            />
+            <span className="text-sm text-white">
+              {t('inventory.labels.monochrome', 'Monochrome (black & white printer)')}
+            </span>
+            <span className="text-xs text-bambu-gray">
+              {t('inventory.labels.monochromeHint', 'Drops the colour swatch and widens the text')}
+            </span>
+          </label>
+        </div>
+
         {/* Templates — 2x2 grid on >= sm so all 4 plus the Cancel footer fit
             inside max-h-[90vh] even when browser chrome eats into the viewport
             (#1230). Stacked single column on mobile widths. */}
-        <div className="px-3 pt-2 pb-2 grid grid-cols-1 sm:grid-cols-2 gap-2 border-t border-bambu-dark-tertiary">
+        <div className="px-3 pt-1 pb-2 grid grid-cols-1 sm:grid-cols-2 gap-2">
           {TEMPLATE_OPTIONS.map((opt) => {
             const isPending = pending === opt.value;
             const label = t(`inventory.labels.templates.${opt.i18nKey}.label`, opt.fallbackLabel);

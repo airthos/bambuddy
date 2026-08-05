@@ -6,7 +6,8 @@ import { Layers, Settings2, Package, Unlink, Link2, X } from 'lucide-react';
 import type { SpoolBuddyOutletContext } from '../../components/spoolbuddy/SpoolBuddyLayout';
 import { api } from '../../api/client';
 import type { PrinterStatus, AMSTray, SpoolAssignment } from '../../api/client';
-import { getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, formatSlotLabel, isBambuLabSpool } from '../../utils/amsHelpers';
+import { getGlobalTrayId, getFillBarColor, getSpoolmanFillLevel, getFallbackSpoolTag, formatSlotLabel, isBambuLabSpool, resolveSlotNozzleDiameter } from '../../utils/amsHelpers';
+import { getSwatchStyle } from '../../utils/colors';
 import { AmsUnitCard, HumidityIndicator, TemperatureIndicator, NozzleBadge } from '../../components/spoolbuddy/AmsUnitCard';
 import type { AmsThresholds } from '../../components/spoolbuddy/AmsUnitCard';
 import { ConfigureAmsSlotModal } from '../../components/ConfigureAmsSlotModal';
@@ -26,10 +27,11 @@ function mapModelCode(ssdpModel: string | null): string {
     'O1D': 'H2D', 'O1E': 'H2D Pro', 'O2D': 'H2D Pro', 'O1C': 'H2C', 'O1C2': 'H2C', 'O1S': 'H2S',
     'BL-P001': 'X1C', 'BL-P002': 'X1', 'BL-P003': 'X1E',
     'N6': 'X2D',
+    'N9': 'A2L',
     'C11': 'P1S', 'C12': 'P1P', 'C13': 'P2S',
     'N2S': 'A1', 'N1': 'A1 Mini',
     'X1C': 'X1C', 'X1': 'X1', 'X1E': 'X1E', 'X2D': 'X2D', 'P1S': 'P1S', 'P1P': 'P1P', 'P2S': 'P2S',
-    'A1': 'A1', 'A1 Mini': 'A1 Mini', 'H2D': 'H2D', 'H2D Pro': 'H2D Pro', 'H2C': 'H2C', 'H2S': 'H2S',
+    'A1': 'A1', 'A1 Mini': 'A1 Mini', 'A2L': 'A2L', 'H2D': 'H2D', 'H2D Pro': 'H2D Pro', 'H2C': 'H2C', 'H2S': 'H2S',
   };
   return modelMap[ssdpModel] || ssdpModel;
 }
@@ -685,6 +687,7 @@ export function SpoolBuddyAmsPage() {
           printerId={selectedPrinterId}
           slotInfo={configureSlotModal}
           printerModel={mapModelCode(printer?.model ?? null) || undefined}
+          nozzleDiameter={resolveSlotNozzleDiameter(status, configureSlotModal.amsId)}
           fullScreen
           onSuccess={() => {
             queryClient.invalidateQueries({ queryKey: ['slotPresets', selectedPrinterId] });
@@ -748,7 +751,7 @@ export function SpoolBuddyAmsPage() {
                       {assignment.spool.rgba && (
                         <span
                           className="w-3 h-3 rounded-full border border-black/20 flex-shrink-0"
-                          style={{ backgroundColor: `#${assignment.spool.rgba.substring(0, 6)}` }}
+                          style={getSwatchStyle(assignment.spool.rgba)}
                         />
                       )}
                       <span className="text-sm text-white">
@@ -781,7 +784,7 @@ export function SpoolBuddyAmsPage() {
                       {spoolmanAssignedSpool.rgba && (
                         <span
                           className="w-3 h-3 rounded-full border border-black/20 flex-shrink-0"
-                          style={{ backgroundColor: `#${spoolmanAssignedSpool.rgba.substring(0, 6)}` }}
+                          style={getSwatchStyle(spoolmanAssignedSpool.rgba)}
                         />
                       )}
                       <span className="text-sm text-white">

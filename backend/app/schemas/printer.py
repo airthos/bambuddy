@@ -2,6 +2,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, Field, field_validator
 
+from backend.app.utils.printer_models import supports_nozzle_flow_type
+
 
 class PrinterBase(BaseModel):
     name: str = Field(..., min_length=1, max_length=100)
@@ -29,7 +31,6 @@ class PrinterBase(BaseModel):
         max_length=253,
         pattern=r"^(\d{1,3}(\.\d{1,3}){3}|[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*)$",
     )
-    access_code: str = Field(..., min_length=1, max_length=20)
     model: str | None = None
     location: str | None = None  # Group/location name
     auto_archive: bool = True
@@ -41,7 +42,10 @@ class PrinterBase(BaseModel):
 
 
 class PrinterCreate(PrinterBase):
-    pass
+    # access_code lives on the input shapes only — never on the default
+    # PrinterResponse. Direct exposure on PRINTERS_READ would let a Viewer
+    # connect to the printer's MQTT and bypass Bambuddy's RBAC.
+    access_code: str = Field(..., min_length=1, max_length=20)
 
 
 class PlateDetectionROI(BaseModel):
@@ -79,6 +83,11 @@ class PrinterResponse(PrinterBase):
     id: int
     is_active: bool
     nozzle_count: int = 1  # 1 or 2, auto-detected from MQTT
+    # Whether the model is sold with both Standard and High Flow nozzles, so a
+    # K-profile's flow type is a real choice rather than a meaningless field.
+    # Derived from the model, not from nozzle_count — see
+    # printer_models.supports_nozzle_flow_type.
+    supports_nozzle_flow_type: bool = True
     print_hours_offset: float = 0.0
     external_camera_url: str | None = None
     external_camera_type: str | None = None
@@ -101,7 +110,6 @@ class PrinterResponse(PrinterBase):
             "name": printer.name,
             "serial_number": printer.serial_number,
             "ip_address": printer.ip_address,
-            "access_code": printer.access_code,
             "model": printer.model,
             "location": printer.location,
             "auto_archive": printer.auto_archive,
@@ -112,6 +120,7 @@ class PrinterResponse(PrinterBase):
             "camera_rotation": printer.camera_rotation,
             "is_active": printer.is_active,
             "nozzle_count": printer.nozzle_count,
+            "supports_nozzle_flow_type": supports_nozzle_flow_type(printer.model),
             "print_hours_offset": printer.print_hours_offset,
             "plate_detection_enabled": printer.plate_detection_enabled,
             "created_at": printer.created_at,
@@ -135,11 +144,32 @@ class PrinterResponse(PrinterBase):
         return cls(**data)
 
 
+class PrinterResponseWithSecret(PrinterResponse):
+    """PrinterResponse + access_code. Returned ONLY to callers with
+    PRINTERS_UPDATE (Admin / Operator JWTs, or single-trust auth-disabled mode).
+
+    Viewers and API keys never receive this shape — they get the bare
+    PrinterResponse without access_code, since holding the access_code lets
+    the caller talk to the printer's MQTT directly and bypass Bambuddy's RBAC.
+    """
+
+    access_code: str
+
+
 class HMSErrorResponse(BaseModel):
     code: str
     attr: int = 0  # Attribute value for constructing wiki URL
     module: int
     severity: int  # 1=fatal, 2=serious, 3=common, 4=info
+    actions: list[str] = []  # List of user-facing action keys (e.g. "CHECK_FILAMENT")
+    job_id: str | None = None  # Optional job ID for actions that require it (e.g. "CHECK_ASSISTANT")
+    # Canonical hex identifier the firmware uses to match HMS-related commands.
+    # 16 chars for `hms[]`-array faults (full 64-bit attr+code), 8 chars for
+    # `print_error` faults. The frontend echoes this back as
+    # HmsActionBody.print_error so we send the firmware-recognised key, not the
+    # truncated short_code that historically caused silent command rejection
+    # (#1830, H2D wrong-plate verification).
+    full_code: str = ""
 
 
 class AMSTray(BaseModel):
@@ -159,6 +189,10 @@ class AMSTray(BaseModel):
     drying_temp: int | None = None  # RFID-recommended drying temp
     drying_time: int | None = None  # RFID-recommended drying time (hours)
     state: int | None = None  # AMS tray state: 9=empty, 10=spool present not loaded, 11=loaded
+    # Firmware's authoritative "spool physically present" bit (from tray_exist_bits).
+    # True for a non-RFID spool the firmware can't identify — the UI shows "?" rather
+    # than "Empty" (#2527). None when the bitmask was unavailable (→ state-based fallback).
+    exists: bool | None = None
 
 
 class AMSUnit(BaseModel):
@@ -173,6 +207,8 @@ class AMSUnit(BaseModel):
     dry_status: int = 0  # 0=Off, 1=Checking, 2=Drying, 3=Cooling, 4=Stopping, 5=Error
     dry_sub_status: int = 0  # 0=Off, 1=Heating, 2=Dehumidify
     dry_sf_reason: list[int] = []  # Cannot-dry reasons from firmware (see CannotDryReason)
+    dry_target_temp: int | None = None  # Active-cycle target °C (Bambu doesn't echo this)
+    dry_filament: str | None = None  # Active-cycle filament name we sent
     module_type: str = ""  # "ams", "n3f", "n3s"
 
 
@@ -199,6 +235,20 @@ class NozzleRackSlot(BaseModel):
 class AmsLabelBody(BaseModel):
     label: str = Field(..., min_length=1, max_length=100)
     ams_serial: str = Field(default="", max_length=50)
+
+
+class HmsActionBody(BaseModel):
+    # Canonical hex identifier (HMSErrorResponse.full_code): 8 chars for
+    # `print_error`-sourced faults, 16 chars for `hms[]`-array faults whose
+    # full 64-bit code is the firmware's matching key. Length-bounded to
+    # those two valid shapes to keep stray input from reaching the dispatcher.
+    print_error: str = Field(..., min_length=8, max_length=16, pattern=r"^[0-9A-Fa-f]{8}([0-9A-Fa-f]{8})?$")
+    # One of the HMSAction enum values. Length-capped to keep stray input from
+    # reaching the dispatcher's `match` statement.
+    action: str = Field(..., min_length=1, max_length=64)
+    # The `subtask_id` snapshot from the HMSError that surfaced this dialog.
+    # Bambu echoes it back in HMS-aware commands. Optional for idle errors.
+    job_id: str | None = Field(default=None, max_length=64)
 
 
 class FilaSwitchResponse(BaseModel):
@@ -290,6 +340,17 @@ class PrinterStatus(BaseModel):
     fila_switch: FilaSwitchResponse | None = None
     # Currently loaded tray (global ID): 254 = external spool, 255 = no filament
     tray_now: int = 255
+    # Runout / filament-replacement guidance (#2587). Populated only while the
+    # print is PAUSED. Both are globalised tray IDs (ams_id*4+slot, or 128-135 for
+    # AMS-HT, or 254 for external) so the frontend can highlight them with the same
+    # logic it uses for tray_now:
+    #   expected_tray = the slot the firmware now expects filament in (from tray_tar).
+    #                   None when idle, not paused, or the slot can't be resolved
+    #                   (multi-AMS ambiguity) — the UI then says "check the printer".
+    #   previous_tray = the slot loaded before the pause, i.e. the one that ran out
+    #                   (from tray_pre). None when unknown.
+    expected_tray: int | None = None
+    previous_tray: int | None = None
     # AMS status for filament change tracking
     # Main status: 0=idle, 1=filament_change, 2=rfid_identifying, 3=assist, 4=calibration
     ams_status_main: int = 0
@@ -307,15 +368,33 @@ class PrinterStatus(BaseModel):
     big_fan1_speed: int | None = None  # Auxiliary fan
     big_fan2_speed: int | None = None  # Chamber/exhaust fan
     heatbreak_fan_speed: int | None = None  # Hotend heatbreak fan
+    # Left auxiliary part cooling fan (optional P2S/X2D accessory, airduct part id 10).
+    # None = not installed / not reported by this model.
+    left_aux_fan_speed: int | None = None
+    # Chamber exhaust fan present (P2S/X2D External Exhaust Fan kit; airduct part id 3).
+    exhaust_fan_present: bool = False
     # Firmware version (from info.module[name="ota"].sw_ver)
     firmware_version: str | None = None
     # Developer LAN mode: True = enabled, False = disabled (MQTT encryption), None = unknown
     developer_mode: bool | None = None
+    # AMS Filament Backup ("auto-switch" to a second spool when one runs out).
+    # True = ON, False = OFF, None = unknown / unsupported (A1 family — protocol field
+    # not yet identified). UI treats None as "status unavailable", not as a hard disable.
+    ams_filament_backup: bool | None = None
     # Queue: printer is awaiting the user to acknowledge the build plate is cleared
     # after a finished/failed print. Persisted across restarts (#961).
     awaiting_plate_clear: bool = False
     # AMS drying support
     supports_drying: bool = False
+    # AMS "Print While Drying" — drying mid-print. Verified per Bambu wiki release notes;
+    # see _DRY_WHILE_PRINTING_MIN_FIRMWARE in printer_manager.py for the matrix.
+    supports_drying_while_printing: bool = False
+    # The AMS can dry, but only from the printer's own screen (P1 series, #2533).
+    # supports_drying is False on these; the UI keeps the control visible but disabled
+    # and says why, rather than dropping it without explanation.
+    drying_screen_only: bool = False
+    # Active chamber heater (responds to M141). True only for H2C/H2D/H2DPro/H2S/X2D.
+    supports_chamber_heater: bool = False
     # Linked archive for the active print (resolved via subtask_id). Frontend uses
     # this to fetch plate metadata and show the plate name when the source 3MF is
     # multi-plate (#881 follow-up).

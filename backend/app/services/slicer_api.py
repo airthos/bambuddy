@@ -9,7 +9,10 @@ under the hood, response body is raw G-code or 3MF with metadata in the
 """
 
 import asyncio
+import io
 import logging
+import time
+import zipfile
 from collections.abc import Callable
 from typing import NamedTuple
 
@@ -38,6 +41,18 @@ class SlicerInputError(SlicerApiError):
     """Sidecar rejected the input as invalid (4xx)."""
 
 
+class SlicerTimeoutError(SlicerApiError):
+    """We gave up waiting on a slice that never finished.
+
+    Kept apart from ``SlicerApiUnavailableError`` because they call for
+    opposite reactions and used to be reported as the same thing: an
+    ``httpx.ReadTimeout`` is a subclass of ``RequestError``, so a slice that
+    simply took a long time surfaced as "Slicer sidecar unreachable" — sending
+    the reporter of #2730 off to check a sidecar that was reachable throughout
+    and still slicing when we hung up on it.
+    """
+
+
 class SliceResult(NamedTuple):
     """Result of a slice operation."""
 
@@ -47,43 +62,37 @@ class SliceResult(NamedTuple):
     filament_used_mm: float
 
 
-class BundleSummary(NamedTuple):
-    """Sidecar's view of a stored Printer Preset Bundle (.bbscfg).
-
-    Mirrors the JSON shape returned by `/profiles/bundle(s)` on the
-    sidecar — `printer`, `process`, `filament` are each a list of preset
-    names available within the bundle (without the `.json` extension and
-    without the BambuStudio "# " user-clone prefix; the sidecar accepts
-    both forms when looking them up at slice time).
-    """
-
-    id: str
-    printer_preset_name: str
-    printer: list[str]
-    process: list[str]
-    filament: list[str]
-    version: str | None
-
-
-class BundleNotFoundError(SlicerApiError):
-    """Sidecar returned 404 for the bundle id (deleted, never imported)."""
-
-
-def _parse_bundle_summary(payload: dict) -> BundleSummary:
-    """Build a BundleSummary from the sidecar's JSON. Tolerant of missing
-    optional fields so a sidecar that adds keys later doesn't break parsing.
-    """
-    return BundleSummary(
-        id=str(payload.get("id") or ""),
-        printer_preset_name=str(payload.get("printer_preset_name") or ""),
-        printer=list(payload.get("printer") or []),
-        process=list(payload.get("process") or []),
-        filament=list(payload.get("filament") or []),
-        version=payload.get("version"),
-    )
-
-
 _shared_http_client: httpx.AsyncClient | None = None
+
+# Fallback for callers that don't pass one (tests, and any path that runs
+# without a DB session to read the setting from). The user-facing value is
+# ``slicer_stall_timeout_minutes`` under Settings -> Workflow -> Slicer.
+DEFAULT_SLICE_STALL_TIMEOUT_SECONDS = 15 * 60.0
+
+# How often the progress poller ticks. Also the granularity of the stall check,
+# since a missed tick is what the stall clock is counting.
+_PROGRESS_POLL_INTERVAL = 1.0
+
+
+async def get_stall_timeout_seconds(db) -> float:
+    """Read ``slicer_stall_timeout_minutes`` (Settings -> Workflow -> Slicer).
+
+    Falls back to the default on anything unparseable rather than failing the
+    slice — a bad settings row must not be the reason a print doesn't happen.
+    """
+    from backend.app.api.routes.settings import get_setting
+
+    try:
+        raw = await get_setting(db, "slicer_stall_timeout_minutes")
+    except Exception:
+        return DEFAULT_SLICE_STALL_TIMEOUT_SECONDS
+    try:
+        minutes = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_SLICE_STALL_TIMEOUT_SECONDS
+    if minutes < 1:
+        return DEFAULT_SLICE_STALL_TIMEOUT_SECONDS
+    return float(minutes) * 60.0
 
 
 def _format_sidecar_error(response: httpx.Response) -> str:
@@ -110,6 +119,62 @@ def _format_sidecar_error(response: httpx.Response) -> str:
     return (message or details or response.text)[:500]
 
 
+def _handle_slice_response(response: httpx.Response, *, export_3mf: bool) -> SliceResult:
+    """Turn a sidecar ``/slice`` HTTP response into a validated ``SliceResult``.
+
+    Shared by ``slice_with_profiles`` / ``slice_without_profiles`` so the status
+    handling and output validation live in one place.
+
+    Beyond the status check, this guards against the sidecar (or a reverse proxy
+    in front of it) returning **HTTP 200 with a body that isn't a real slice**
+    (#2671): a stock/misconfigured sidecar, a proxy interstitial or truncated
+    response, or an OrcaSlicer/BambuStudio CLI crash that produces empty output.
+    Without this check Bambuddy would store that tiny blob as a ``.gcode.3mf``,
+    let it be queued, and FTP it to the printer — a silently-broken print. When
+    a 3MF export was requested the body must be a valid ZIP (3MF container);
+    anything else is treated as a sidecar failure.
+
+    Raises:
+        SlicerInputError: 4xx from the sidecar (bad input / proxy body limit).
+        SlicerApiServerError: 5xx, or a 2xx whose body is not a valid 3MF.
+    """
+    if response.status_code == 413:
+        # A 413 almost never comes from the slicer itself — it's a reverse proxy
+        # (nginx/SWAG/Traefik) or a CDN capping the multipart upload (model +
+        # profiles). Name the real fix so the user doesn't tweak the wrong layer.
+        raise SlicerInputError(
+            "The slice request was rejected as too large (HTTP 413). A reverse proxy "
+            "in front of the slicer sidecar is capping the request body — raise "
+            "'client_max_body_size' (nginx/SWAG) or the equivalent on the proxy that "
+            "sits directly in front of the sidecar, then reload it. If the sidecar is "
+            "behind Cloudflare, note its request-size cap."
+        )
+    if response.status_code >= 500:
+        raise SlicerApiServerError(f"Slicer CLI failed ({response.status_code}): {_format_sidecar_error(response)}")
+    if response.status_code >= 400:
+        raise SlicerInputError(f"Slicer rejected input ({response.status_code}): {_format_sidecar_error(response)}")
+
+    content = response.content
+    if export_3mf and not zipfile.is_zipfile(io.BytesIO(content)):
+        # 200 OK but the body is not a 3MF zip → the sidecar did not produce a
+        # usable slice. Surface it loudly instead of persisting a corrupt file.
+        detail = _format_sidecar_error(response) if len(content) <= 500 else ""
+        raise SlicerApiServerError(
+            f"Slicer sidecar returned HTTP {response.status_code} but the body is not a valid "
+            f"3MF ({len(content)} bytes). This usually means a misconfigured sidecar, an "
+            f"OrcaSlicer/BambuStudio CLI crash producing no output, or a reverse proxy returning "
+            f"an error page or truncating the response — verify the sidecar URL and any proxy in "
+            f"front of it." + (f" Body: {detail}" if detail else "")
+        )
+
+    return SliceResult(
+        content=content,
+        print_time_seconds=_safe_int(response.headers.get("x-print-time-seconds")),
+        filament_used_g=_safe_float(response.headers.get("x-filament-used-g")),
+        filament_used_mm=_safe_float(response.headers.get("x-filament-used-mm")),
+    )
+
+
 def set_shared_http_client(client: httpx.AsyncClient | None) -> None:
     """Register an app-scoped client so per-request services can pool transport."""
     global _shared_http_client
@@ -127,6 +192,65 @@ def _guess_model_content_type(filename: str) -> str:
     return "application/octet-stream"
 
 
+class _Liveness:
+    """Tracks when the slicer last showed a sign of life.
+
+    ``deadline`` is what the slice waits against, and it moves forward on every
+    genuine progress update. A slice therefore fails only after the configured
+    window of *silence*, however long the whole thing has been running (#2730).
+
+    ``progress_supported`` stays False for sidecars that never answer the
+    progress endpoint. Those give us nothing to judge liveness by, so the caller
+    treats the same window as a total-elapsed ceiling rather than pretending a
+    stall can be detected.
+    """
+
+    def __init__(self, window_seconds: float, poll_interval: float = _PROGRESS_POLL_INTERVAL) -> None:
+        # Liveness can only be observed as often as the poller ticks, so a
+        # window shorter than a few ticks would expire in the gap between two
+        # polls and fail every slice instantly, however healthy. The settings
+        # schema already floors the user-facing value at a minute; this guards
+        # the constructor, which tests and any future caller can pass anything.
+        self.window_seconds = max(window_seconds, poll_interval * 3)
+        self.progress_supported = False
+        self.started_at = time.monotonic()
+        self._last_alive = self.started_at
+
+    def saw_progress_endpoint(self) -> None:
+        self.progress_supported = True
+
+    def mark_alive(self) -> None:
+        self._last_alive = time.monotonic()
+
+    @property
+    def deadline(self) -> float:
+        """Monotonic time at which we stop waiting."""
+        base = self._last_alive if self.progress_supported else self.started_at
+        return base + self.window_seconds
+
+    def silent_for(self) -> float:
+        return time.monotonic() - self._last_alive
+
+    def elapsed(self) -> float:
+        return time.monotonic() - self.started_at
+
+    def timeout_message(self) -> str:
+        minutes = self.window_seconds / 60
+        if self.progress_supported:
+            return (
+                f"The slicer stopped reporting progress for {minutes:.0f} minutes "
+                f"(slicing had been running for {self.elapsed() / 60:.0f} minutes). "
+                "Raise 'Slicer stall timeout' under Settings -> Workflow -> Slicer if this model "
+                "legitimately needs longer between progress updates."
+            )
+        return (
+            f"Slicing did not finish within {minutes:.0f} minutes, and this sidecar does not "
+            "report progress, so there was no way to tell a slow model from a stalled one. "
+            "Raise 'Slicer stall timeout' under Settings -> Workflow -> Slicer, or update the "
+            "sidecar to a version that reports progress."
+        )
+
+
 class SlicerApiService:
     """Talks to an OrcaSlicer / BambuStudio API sidecar."""
 
@@ -135,10 +259,25 @@ class SlicerApiService:
         base_url: str,
         *,
         client: httpx.AsyncClient | None = None,
-        timeout_seconds: float = 300.0,
+        timeout_seconds: float = DEFAULT_SLICE_STALL_TIMEOUT_SECONDS,
     ) -> None:
+        """``timeout_seconds`` bounds *silence*, not total slicing time (#2730).
+
+        While a slice is running Bambuddy polls the sidecar's progress channel
+        once a second, so it can tell a model that is merely slow from one that
+        has stopped: the clock is reset by every progress update, and only runs
+        out when the slicer has said nothing for this long. A heavy model that
+        keeps reporting will run to completion however long it takes.
+
+        Sidecars too old to report progress have no liveness signal to offer, so
+        for those the same number bounds total elapsed time — the pre-#2730
+        behaviour, but configurable and no longer five minutes flat.
+        """
         self.base_url = base_url.rstrip("/")
         self.timeout_seconds = timeout_seconds
+        # Instance-level so tests can compress the timing; production always
+        # uses the module default.
+        self.progress_poll_interval = _PROGRESS_POLL_INTERVAL
         if client is not None:
             self._client = client
             self._owns_client = False
@@ -191,106 +330,12 @@ class SlicerApiService:
             raise SlicerApiUnavailableError(f"Slicer sidecar /profiles/bundled returned {response.status_code}")
         return response.json()
 
-    async def import_bundle(
-        self,
-        zip_bytes: bytes,
-        *,
-        filename: str = "bundle.bbscfg",
-    ) -> BundleSummary:
-        """POST /profiles/bundle — upload a BambuStudio Printer Preset Bundle.
-
-        Idempotent on the sidecar side: re-uploading the same file yields the
-        same id (deterministic SHA-256 prefix of the zip content) and the
-        sidecar reuses its existing extracted directory, so re-importing is
-        always safe.
-
-        Raises:
-            SlicerInputError: 4xx — bundle isn't a valid .bbscfg, or fails the
-                sidecar's path-traversal / manifest validation.
-            SlicerApiUnavailableError: connection error or 5xx.
-        """
-        files = {"file": (filename, zip_bytes, "application/zip")}
-        try:
-            response = await self._client.post(
-                f"{self.base_url}/profiles/bundle",
-                files=files,
-                timeout=60.0,
-            )
-        except httpx.RequestError as exc:
-            raise SlicerApiUnavailableError(f"Slicer sidecar unreachable: {exc}") from exc
-        if response.status_code >= 500:
-            raise SlicerApiServerError(
-                f"Slicer sidecar /profiles/bundle failed ({response.status_code}): {_format_sidecar_error(response)}",
-            )
-        if response.status_code >= 400:
-            raise SlicerInputError(
-                f"Slicer sidecar rejected bundle ({response.status_code}): {_format_sidecar_error(response)}",
-            )
-        return _parse_bundle_summary(response.json())
-
-    async def list_bundles(self) -> list[BundleSummary]:
-        """GET /profiles/bundles — list every imported bundle and its presets.
-
-        Returns an empty list when the sidecar's bundle store is empty (the
-        sidecar returns ``[]`` rather than 404 in that case). Network errors
-        and 5xx surface as ``SlicerApiUnavailableError`` so callers can
-        decide whether to render an empty UI or a "sidecar offline" banner.
-        """
-        try:
-            response = await self._client.get(f"{self.base_url}/profiles/bundles", timeout=10.0)
-        except httpx.RequestError as exc:
-            raise SlicerApiUnavailableError(f"Slicer sidecar unreachable: {exc}") from exc
-        if response.status_code >= 400:
-            raise SlicerApiUnavailableError(
-                f"Slicer sidecar /profiles/bundles returned {response.status_code}",
-            )
-        payload = response.json()
-        if not isinstance(payload, list):
-            raise SlicerApiServerError("Slicer sidecar returned non-array bundle list")
-        return [_parse_bundle_summary(b) for b in payload if isinstance(b, dict)]
-
-    async def get_bundle(self, bundle_id: str) -> BundleSummary:
-        """GET /profiles/bundles/<id> — single bundle summary.
-
-        Raises:
-            BundleNotFoundError: 404 — id does not exist on the sidecar.
-            SlicerApiUnavailableError: connection error or 5xx.
-        """
-        try:
-            response = await self._client.get(
-                f"{self.base_url}/profiles/bundles/{bundle_id}",
-                timeout=10.0,
-            )
-        except httpx.RequestError as exc:
-            raise SlicerApiUnavailableError(f"Slicer sidecar unreachable: {exc}") from exc
-        if response.status_code == 404:
-            raise BundleNotFoundError(f"Bundle {bundle_id!r} not found on sidecar")
-        if response.status_code >= 400:
-            raise SlicerApiUnavailableError(
-                f"Slicer sidecar /profiles/bundles/{bundle_id} returned {response.status_code}",
-            )
-        return _parse_bundle_summary(response.json())
-
-    async def delete_bundle(self, bundle_id: str) -> None:
-        """DELETE /profiles/bundles/<id> — remove a stored bundle."""
-        try:
-            response = await self._client.delete(
-                f"{self.base_url}/profiles/bundles/{bundle_id}",
-                timeout=10.0,
-            )
-        except httpx.RequestError as exc:
-            raise SlicerApiUnavailableError(f"Slicer sidecar unreachable: {exc}") from exc
-        if response.status_code == 404:
-            raise BundleNotFoundError(f"Bundle {bundle_id!r} not found on sidecar")
-        if response.status_code >= 400:
-            raise SlicerApiUnavailableError(
-                f"Slicer sidecar DELETE /profiles/bundles/{bundle_id} returned {response.status_code}",
-            )
-
     async def _poll_progress(
         self,
         request_id: str,
         on_progress: Callable[[dict], None],
+        *,
+        liveness: "_Liveness | None" = None,
     ) -> None:
         """Poll the sidecar's progress endpoint at ~1Hz and forward each
         snapshot to ``on_progress``. Runs until cancelled.
@@ -306,14 +351,27 @@ class SlicerApiService:
         slice grace expiry) just costs a few wasted GETs that the cancel
         will stop. Network errors and non-JSON 5xx are swallowed; the
         next tick retries.
+
+        When ``liveness`` is supplied this doubles as the stall watchdog: every
+        200 carrying a *changed* payload marks the slicer alive, which is what
+        keeps the slice's deadline moving (#2730). An unchanged payload
+        deliberately does not count — the sidecar re-serves its last snapshot on
+        every poll, so treating a repeat as progress would leave the watchdog
+        unable to detect a stall at all.
         """
         url = f"{self.base_url}/slice/progress/{request_id}"
+        last_payload: dict | None = None
         while True:
             try:
                 response = await self._client.get(url, timeout=5.0)
                 if response.status_code == 200:
                     payload = response.json()
                     if isinstance(payload, dict):
+                        if liveness is not None:
+                            liveness.saw_progress_endpoint()
+                            if payload != last_payload:
+                                liveness.mark_alive()
+                        last_payload = payload
                         on_progress(payload)
                 # 404 / other 4xx = no progress available (yet, or ever
                 # for older sidecars). Keep polling — the outer slice
@@ -323,9 +381,84 @@ class SlicerApiService:
                 # returns a non-JSON 5xx. Don't crash the poller.
                 pass
             try:
-                await asyncio.sleep(1.0)
+                await asyncio.sleep(self.progress_poll_interval)
             except asyncio.CancelledError:
                 return
+
+    async def _post_slice(
+        self,
+        *,
+        files: list | dict,
+        data: dict,
+        request_id: str | None,
+        on_progress: Callable[[dict], None] | None,
+    ) -> httpx.Response:
+        """POST /slice, supervised by the progress channel rather than a clock.
+
+        Before #2730 this was a plain ``httpx`` call with a flat 300 s timeout on
+        every phase. A genuinely heavy model — the reporter's was a MakerWorld
+        model that Bambu Studio also took a long time over — hit the ceiling
+        while it was still slicing perfectly happily, and because
+        ``httpx.ReadTimeout`` is a ``RequestError`` it was reported as "Slicer
+        sidecar unreachable". Meanwhile Bambuddy was polling the sidecar's
+        progress endpoint once a second and could see the thing working.
+
+        So the read timeout comes off the HTTP call and the poller supervises
+        instead: the deadline is pushed forward by every progress update, and
+        only a genuine silence ends the wait. Connect and pool keep short
+        timeouts — a sidecar that won't accept the connection at all is
+        unreachable, and should still say so quickly.
+        """
+        liveness = _Liveness(self.timeout_seconds, self.progress_poll_interval)
+
+        # Poll whenever we have a request_id, even if the caller wants no
+        # progress callbacks: the poll is what makes stall detection possible,
+        # and one GET per second is cheaper than a wrongly-cancelled slice.
+        progress_task: asyncio.Task | None = None
+        if request_id is not None:
+            progress_task = asyncio.create_task(
+                self._poll_progress(request_id, on_progress or (lambda _payload: None), liveness=liveness),
+                name=f"slicer-progress-{request_id}",
+            )
+
+        post_task = asyncio.create_task(
+            self._client.post(
+                f"{self.base_url}/slice",
+                files=files,
+                data=data,
+                timeout=httpx.Timeout(connect=30.0, read=None, write=None, pool=30.0),
+            ),
+            name="slicer-slice-post",
+        )
+
+        try:
+            while True:
+                remaining = liveness.deadline - time.monotonic()
+                if remaining <= 0:
+                    post_task.cancel()
+                    logger.warning(
+                        "Slice abandoned after %.0fs (silent for %.0fs, progress channel %s)",
+                        liveness.elapsed(),
+                        liveness.silent_for(),
+                        "available" if liveness.progress_supported else "unavailable",
+                    )
+                    raise SlicerTimeoutError(liveness.timeout_message())
+                # Re-check at poll granularity so a progress update that lands
+                # mid-wait extends the deadline promptly.
+                done, _pending = await asyncio.wait({post_task}, timeout=min(remaining, self.progress_poll_interval))
+                if post_task in done:
+                    break
+        finally:
+            if progress_task is not None:
+                progress_task.cancel()
+            # Await both so neither is left pending — a cancelled POST still
+            # needs its connection released back to the pool.
+            await asyncio.gather(post_task, progress_task or asyncio.sleep(0), return_exceptions=True)
+
+        try:
+            return post_task.result()
+        except httpx.RequestError as exc:
+            raise SlicerApiUnavailableError(f"Slicer sidecar unreachable: {exc}") from exc
 
     async def slice_with_profiles(
         self,
@@ -402,149 +535,8 @@ class SlicerApiService:
         # and surfaces structured updates via on_progress. Uses a
         # short-tick poll (1s) since the slicer emits stage changes
         # several times per minute on complex models.
-        progress_task: asyncio.Task | None = None
-        if request_id is not None and on_progress is not None:
-            progress_task = asyncio.create_task(
-                self._poll_progress(request_id, on_progress),
-                name=f"slicer-progress-{request_id}",
-            )
-
-        try:
-            response = await self._client.post(
-                f"{self.base_url}/slice",
-                files=files,
-                data=data,
-                timeout=self.timeout_seconds,
-            )
-        except httpx.RequestError as exc:
-            raise SlicerApiUnavailableError(f"Slicer sidecar unreachable: {exc}") from exc
-        finally:
-            if progress_task is not None:
-                progress_task.cancel()
-                try:
-                    await progress_task
-                except (asyncio.CancelledError, Exception):
-                    pass  # Polling errors must not fail the slice.
-
-        if response.status_code >= 500:
-            raise SlicerApiServerError(f"Slicer CLI failed ({response.status_code}): {_format_sidecar_error(response)}")
-        if response.status_code >= 400:
-            raise SlicerInputError(f"Slicer rejected input ({response.status_code}): {_format_sidecar_error(response)}")
-
-        return SliceResult(
-            content=response.content,
-            print_time_seconds=_safe_int(response.headers.get("x-print-time-seconds")),
-            filament_used_g=_safe_float(response.headers.get("x-filament-used-g")),
-            filament_used_mm=_safe_float(response.headers.get("x-filament-used-mm")),
-        )
-
-    async def slice_with_bundle(
-        self,
-        *,
-        model_bytes: bytes,
-        model_filename: str,
-        bundle_id: str,
-        printer_name: str,
-        process_name: str,
-        filament_names: list[str],
-        plate: int | None = None,
-        export_3mf: bool = False,
-        arrange: bool = False,
-        bed_type: str | None = None,
-        request_id: str | None = None,
-        on_progress: Callable[[dict], None] | None = None,
-    ) -> SliceResult:
-        """POST /slice with bundle id + per-category preset names.
-
-        Asks the sidecar to materialize the printer / process / filament
-        JSONs from a previously-imported `.bbscfg`, instead of accepting
-        them as multipart attachments. Equivalent to
-        ``slice_with_profiles`` from the user's perspective — same return
-        shape, same 4xx/5xx semantics, same progress-poll wiring — but
-        the sidecar saves the round-trip of re-uploading the JSONs every
-        time a user kicks off a slice with the same bundle.
-
-        ``filament_names`` is plate-slot-ordered: index 0 is slot 1, etc.
-        Single-color callers pass a one-element list. The sidecar joins
-        them as semicolon-separated `--load-filaments` for the CLI.
-
-        Raises:
-            SlicerInputError: 4xx — bundle / preset name not found, etc.
-            SlicerApiServerError: sidecar 5xx (CLI failure on resolved
-                triplet — same conditions that fail slice_with_profiles).
-            SlicerApiUnavailableError: connection error.
-        """
-        files = {
-            "file": (model_filename, model_bytes, _guess_model_content_type(model_filename)),
-        }
-        data: dict[str, str | list[str]] = {
-            "bundle": bundle_id,
-            "printerName": printer_name,
-            "processName": process_name,
-        }
-        # The sidecar's SlicingSettings supports both `filamentName` (single
-        # legacy field, kept for clients that pre-date multi-color) and
-        # `filamentNames` (semicolon/comma-separated, matches multi-color
-        # uploads). Always send the array form so a single-slot case still
-        # ends up in the same code path on the sidecar.
-        data["filamentNames"] = ";".join(filament_names)
-        if plate is not None:
-            data["plate"] = str(plate)
-        if export_3mf:
-            data["exportType"] = "3mf"
-        if arrange:
-            # See slice_with_profiles for the rationale: cross-class re-slices
-            # (#1493) need --arrange so BS repositions objects for the target
-            # bed instead of inheriting the source printer's coordinate layout.
-            data["arrange"] = "true"
-        if bed_type is not None:
-            # #1337: bed-plate override flows through to the sidecar as a
-            # standalone field. The sidecar wraps this as --curr_bed_type on
-            # the CLI invocation, overriding whatever the bundle's process
-            # JSON specifies. Bambuddy can't patch the bundle's JSON locally
-            # (the sidecar materialises it from disk), so this round-trip is
-            # the only path. Silently no-ops on sidecar versions that don't
-            # yet recognise the field — the user's slice still runs with the
-            # bundle's default plate, no crash.
-            data["bedType"] = bed_type
-        if request_id is not None:
-            data["requestId"] = request_id
-
-        progress_task: asyncio.Task | None = None
-        if request_id is not None and on_progress is not None:
-            progress_task = asyncio.create_task(
-                self._poll_progress(request_id, on_progress),
-                name=f"slicer-progress-{request_id}",
-            )
-
-        try:
-            response = await self._client.post(
-                f"{self.base_url}/slice",
-                files=files,
-                data=data,
-                timeout=self.timeout_seconds,
-            )
-        except httpx.RequestError as exc:
-            raise SlicerApiUnavailableError(f"Slicer sidecar unreachable: {exc}") from exc
-        finally:
-            if progress_task is not None:
-                progress_task.cancel()
-                try:
-                    await progress_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-
-        if response.status_code >= 500:
-            raise SlicerApiServerError(f"Slicer CLI failed ({response.status_code}): {_format_sidecar_error(response)}")
-        if response.status_code >= 400:
-            raise SlicerInputError(f"Slicer rejected input ({response.status_code}): {_format_sidecar_error(response)}")
-
-        return SliceResult(
-            content=response.content,
-            print_time_seconds=_safe_int(response.headers.get("x-print-time-seconds")),
-            filament_used_g=_safe_float(response.headers.get("x-filament-used-g")),
-            filament_used_mm=_safe_float(response.headers.get("x-filament-used-mm")),
-        )
+        response = await self._post_slice(files=files, data=data, request_id=request_id, on_progress=on_progress)
+        return _handle_slice_response(response, export_3mf=export_3mf)
 
     async def slice_without_profiles(
         self,
@@ -588,41 +580,8 @@ class SlicerApiService:
         # embedded-settings fallback path triggered by an Orca/Bambu CLI
         # segfault on complex H2D models — both want to keep updating
         # the user's toast through the slow operation.
-        progress_task: asyncio.Task | None = None
-        if request_id is not None and on_progress is not None:
-            progress_task = asyncio.create_task(
-                self._poll_progress(request_id, on_progress),
-                name=f"slicer-progress-{request_id}",
-            )
-
-        try:
-            response = await self._client.post(
-                f"{self.base_url}/slice",
-                files=files,
-                data=data,
-                timeout=self.timeout_seconds,
-            )
-        except httpx.RequestError as exc:
-            raise SlicerApiUnavailableError(f"Slicer sidecar unreachable: {exc}") from exc
-        finally:
-            if progress_task is not None:
-                progress_task.cancel()
-                try:
-                    await progress_task
-                except (asyncio.CancelledError, Exception):
-                    pass
-
-        if response.status_code >= 500:
-            raise SlicerApiServerError(f"Slicer CLI failed ({response.status_code}): {_format_sidecar_error(response)}")
-        if response.status_code >= 400:
-            raise SlicerInputError(f"Slicer rejected input ({response.status_code}): {_format_sidecar_error(response)}")
-
-        return SliceResult(
-            content=response.content,
-            print_time_seconds=_safe_int(response.headers.get("x-print-time-seconds")),
-            filament_used_g=_safe_float(response.headers.get("x-filament-used-g")),
-            filament_used_mm=_safe_float(response.headers.get("x-filament-used-mm")),
-        )
+        response = await self._post_slice(files=files, data=data, request_id=request_id, on_progress=on_progress)
+        return _handle_slice_response(response, export_3mf=export_3mf)
 
 
 def _safe_int(value: str | None) -> int:

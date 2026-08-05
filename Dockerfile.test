@@ -37,6 +37,11 @@ ENV PYTHONUNBUFFERED=1
 ENV DATA_DIR=/app/data
 ENV TESTING=1
 
+# Test image runs pytest and exits — there is no long-running service
+# to probe. HEALTHCHECK NONE is the documented Docker opt-out and
+# silences Trivy DS-0026 without adding meaningless probe logic.
+HEALTHCHECK NONE
+
 # Default command runs pytest (excluding docker integration tests).
 # -v dropped: 5300+ "PASSED foo::bar" lines per worker eat noticeable
 # stdout I/O time and clutter test_docker.sh output. --tb=short still

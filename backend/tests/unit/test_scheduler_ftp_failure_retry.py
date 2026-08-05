@@ -13,7 +13,10 @@ The fix, exercised here:
   1. A failed FTP upload arms the post-dispatch cooldown (``_mark_printer_dispatched``)
      so the printer is parked instead of immediately re-dispatched.
   2. The item is bounced back to ``pending`` and retried up to
-     ``_max_ftp_dispatch_retries`` times before being failed for real.
+     ``DISPATCH_MAX_ATTEMPTS`` times before being failed for real. The counter is
+     upstream's persisted ``PrintQueueItem.dispatch_attempts`` (#2555), shared with
+     the start-watchdog: an item that has bounced three times stops, whichever of
+     the two causes did it.
   3. ``check_queue`` honours the resulting hold and skips the printer.
 """
 
@@ -31,7 +34,7 @@ from backend.app.models.archive import PrintArchive
 from backend.app.models.print_queue import PrintQueueItem
 from backend.app.models.printer import Printer
 from backend.app.services.bambu_ftp import UploadRejectedError
-from backend.app.services.print_scheduler import PrintScheduler
+from backend.app.services.print_scheduler import DISPATCH_MAX_ATTEMPTS, PrintScheduler
 
 PRINTER_ID = 1
 
@@ -155,7 +158,7 @@ class TestFtpFailureRetryThenFail:
         """First (max-1) failures bounce the item back to pending; the last fails it."""
         engine, session_maker = await _make_db(tmp_path)
         scheduler = PrintScheduler()
-        assert scheduler._max_ftp_dispatch_retries == 3
+        assert DISPATCH_MAX_ATTEMPTS == 3
 
         # Attempts 1 and 2 → requeued as pending, no failure notification.
         for expected_attempt in (1, 2):
@@ -163,30 +166,37 @@ class TestFtpFailureRetryThenFail:
             assert item.status == "pending", f"attempt {expected_attempt} should requeue"
             assert item.started_at is None
             assert item.completed_at is None
-            assert scheduler._ftp_dispatch_attempts.get(500) == expected_attempt
+            assert item.dispatch_attempts == expected_attempt
             notif.on_queue_job_failed.assert_not_called()
 
-        # Attempt 3 → hard failure, notification sent, counter cleared.
+        # Attempt 3 → hard failure, notification sent.
         item, notif, _ = await _dispatch_once(scheduler, session_maker, tmp_path, uploaded=False)
         assert item.status == "failed"
         assert item.completed_at is not None
         assert "3 attempts" in (item.error_message or "")
         notif.on_queue_job_failed.assert_awaited_once()
-        assert 500 not in scheduler._ftp_dispatch_attempts
+        assert item.dispatch_attempts == 3
         await engine.dispose()
 
 
 class TestFtpRetryCounterIsolation:
     @pytest.mark.asyncio
     async def test_counter_is_keyed_per_item(self, tmp_path):
-        """A failure on item 500 must not consume another item's retry budget."""
+        """A failure on item 500 must not consume another item's retry budget.
+
+        The counter lives on the queue row itself, so isolation is structural: a
+        different item carries its own ``dispatch_attempts``, still at its 0 default.
+        """
         engine, session_maker = await _make_db(tmp_path)
         scheduler = PrintScheduler()
 
-        await _dispatch_once(scheduler, session_maker, tmp_path, uploaded=False)
-        assert scheduler._ftp_dispatch_attempts == {500: 1}
-        # A different item id would start its own count at 0.
-        assert scheduler._ftp_dispatch_attempts.get(999) is None
+        item, _, _ = await _dispatch_once(scheduler, session_maker, tmp_path, uploaded=False)
+        assert item.dispatch_attempts == 1
+        async with session_maker() as db:
+            other = PrintQueueItem(id=999, printer_id=PRINTER_ID, status="pending", position=1)
+            db.add(other)
+            await db.commit()
+            assert (other.dispatch_attempts or 0) == 0
         await engine.dispose()
 
 
@@ -241,7 +251,7 @@ class TestFtpWedgeReconnect:
         # and the printer is parked in the dispatch-hold cooldown meanwhile.
         assert item.status == "pending"
         assert item.started_at is None
-        assert scheduler._ftp_dispatch_attempts.get(500) == 1
+        assert item.dispatch_attempts == 1
         assert scheduler._printer_in_dispatch_hold(PRINTER_ID) is True
         notif.on_queue_job_failed.assert_not_called()
         await engine.dispose()
