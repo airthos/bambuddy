@@ -137,6 +137,28 @@ async def start_session(
                 select(CameraRecordingSession).where(CameraRecordingSession.archive_id == archive_id)
             )
             existing_row = existing.scalar_one_or_none()
+            if existing_row is not None and existing_row.status != "recording":
+                # print_archives ids aren't AUTOINCREMENT: hard-deleting the newest
+                # archive hands its id to the next one. A leftover row from that
+                # deleted job must not be revived — it would graft this print onto
+                # the old session, keeping the old printer_id/started_at, so the
+                # timeline draws it on the wrong printer weeks in the past.
+                archive = await db.get(PrintArchive, archive_id)
+                if (
+                    existing_row.printer_id != printer_id
+                    or archive is None
+                    or (archive.created_at is not None and existing_row.started_at < archive.created_at)
+                ):
+                    from backend.app.services.camera_recording_purge import camera_recording_purge_service
+
+                    logger.warning(
+                        "Sentry: discarding stale recording row for reused archive id %s (was printer %s, started %s)",
+                        archive_id,
+                        existing_row.printer_id,
+                        existing_row.started_at,
+                    )
+                    await camera_recording_purge_service.delete_one(db, archive_id)
+                    existing_row = None
             if existing_row is not None:
                 if existing_row.status == "recording":
                     return False  # a live row with no in-memory session is reconcile_on_startup's job, not ours

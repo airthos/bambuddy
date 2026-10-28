@@ -1569,6 +1569,16 @@ class ArchiveService:
         await self.db.delete(archive)
         await self.db.commit()
 
+        # The Sentry recording's ondelete=CASCADE never fires (SQLite FKs are off),
+        # and archive ids get reused once the newest one is deleted — a surviving
+        # recording would be revived by the next print that inherits this id.
+        try:
+            from backend.app.services.camera_recording_purge import camera_recording_purge_service
+
+            await camera_recording_purge_service.delete_one(self.db, archive_id)
+        except Exception as e:
+            logger.warning(f"Failed to delete Sentry recording for archive {archive_id}: {e}")
+
         # Only delete files AFTER the DB commit succeeds to avoid orphaned records
         if dir_to_delete:
             shutil.rmtree(dir_to_delete, ignore_errors=True)

@@ -187,6 +187,93 @@ async def test_start_session_idempotent_per_archive(monkeypatch, db_session, pri
     await _wait_for_status(recorder_session_maker, archive.id, "completed")
 
 
+async def _add_leftover_row(db_session, tmp_path, archive_id: int, printer_id: int, *, started_at=None):
+    from datetime import datetime
+
+    framelog = tmp_path / f"leftover-{archive_id}.framelog"
+    framelog.write_bytes(b"old-jpeg")
+    db_session.add(
+        CameraRecordingSession(
+            archive_id=archive_id,
+            printer_id=printer_id,
+            status="completed",
+            started_at=started_at or datetime.utcnow(),
+            file_path=str(framelog),
+            frame_count=7,
+            size_bytes=8,
+        )
+    )
+    db_session.add(CameraRecordingFrame(archive_id=archive_id, seq=0, ts_ms=0, offset=0, length=8))
+    await db_session.commit()
+    return framelog
+
+
+async def _assert_fresh_session(recorder_session_maker, archive_id: int, printer_id: int, old_framelog) -> None:
+    async with recorder_session_maker() as fresh_db:
+        query = select(CameraRecordingSession).where(CameraRecordingSession.archive_id == archive_id)
+        row = (await fresh_db.execute(query)).scalar_one()
+        assert row.printer_id == printer_id
+        assert row.frame_count == 0
+        assert row.file_path != str(old_framelog)
+    assert camera_recorder._active_sessions[archive_id].frame_count == 0
+    assert not old_framelog.exists()
+
+
+async def test_start_session_discards_leftover_row_from_another_printer(
+    monkeypatch, db_session, printer_factory, archive_factory, tmp_path, recorder_session_maker
+):
+    """Archive ids are reused after the newest archive is hard-deleted. A
+    leftover row from the deleted job (on another printer) must not be revived
+    — the new print would inherit its printer_id and started_at."""
+    await _set_sentry_enabled(db_session, True)
+    monkeypatch.setattr(camera_routes, "generate_chamber_mjpeg_stream", _fake_chamber_stream([]))
+    old_printer = await printer_factory(model="P1S")
+    printer = await printer_factory(model="P1S")
+    archive = await archive_factory(printer.id, status="printing")
+    old_framelog = await _add_leftover_row(db_session, tmp_path, archive.id, old_printer.id)
+
+    assert await camera_recorder.start_session(printer, printer.id, archive.id) is True
+
+    await _assert_fresh_session(recorder_session_maker, archive.id, printer.id, old_framelog)
+
+
+async def test_start_session_discards_leftover_row_older_than_archive(
+    monkeypatch, db_session, printer_factory, archive_factory, tmp_path, recorder_session_maker
+):
+    """Same printer, but the row predates the archive — it belongs to a deleted
+    job that held this id before, not to an earlier attempt at this one."""
+    from datetime import datetime, timedelta
+
+    await _set_sentry_enabled(db_session, True)
+    monkeypatch.setattr(camera_routes, "generate_chamber_mjpeg_stream", _fake_chamber_stream([]))
+    printer = await printer_factory(model="P1S")
+    archive = await archive_factory(printer.id, status="printing")
+    old_framelog = await _add_leftover_row(
+        db_session, tmp_path, archive.id, printer.id, started_at=datetime.utcnow() - timedelta(days=20)
+    )
+
+    assert await camera_recorder.start_session(printer, printer.id, archive.id) is True
+
+    await _assert_fresh_session(recorder_session_maker, archive.id, printer.id, old_framelog)
+
+
+async def test_start_session_still_revives_leftover_row_for_same_job(
+    monkeypatch, db_session, printer_factory, archive_factory, tmp_path, recorder_session_maker
+):
+    """The intended revive path (an earlier, watchdog-killed attempt at this
+    same still-printing job) keeps working: same row, frame count carried on."""
+    await _set_sentry_enabled(db_session, True)
+    monkeypatch.setattr(camera_routes, "generate_chamber_mjpeg_stream", _fake_chamber_stream([]))
+    printer = await printer_factory(model="P1S")
+    archive = await archive_factory(printer.id, status="printing")
+    old_framelog = await _add_leftover_row(db_session, tmp_path, archive.id, printer.id)
+
+    assert await camera_recorder.start_session(printer, printer.id, archive.id) is True
+
+    assert camera_recorder._active_sessions[archive.id].frame_count == 7
+    assert camera_recorder._active_sessions[archive.id].file_path == old_framelog
+
+
 # ---------------------------------------------------------------------------
 # Frame pump + stop_session
 # ---------------------------------------------------------------------------
