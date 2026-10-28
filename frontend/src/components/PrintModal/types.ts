@@ -126,6 +126,7 @@ export const FARM_SCRIPT_DEFAULTS: Required<Omit<FarmScriptOptions, 'push_x'>> =
   lane_offset: 60,
   flex_cycles: 3,
   flex_speed: 300,
+  flex_drop: 20,
 };
 
 /**

@@ -58,6 +58,10 @@ class FarmScriptOptions(BaseModel):
     push_x: float | None = Field(default=None, ge=10, le=246)  # push X centre, mm (None = auto-detect)
     flex_cycles: int | None = Field(default=None, ge=0, le=10)  # FarmLoop bed flex cycles (0 = skip)
     flex_speed: int | None = Field(default=None, ge=60, le=1200)  # bed flex feedrate, mm/min
+    # mm the bed drops past the clip each flex. Clip engages at Z204 and the bed
+    # bottoms out at Z256; farm_process.py hard-caps the flex bottom at Z250, so
+    # 46 is the deepest drop that is actually honoured.
+    flex_drop: float | None = Field(default=None, ge=1, le=46)
 
 
 class PrintQueueItemCreate(BaseModel):

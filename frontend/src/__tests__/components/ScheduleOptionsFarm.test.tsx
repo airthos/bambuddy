@@ -26,17 +26,27 @@ function Harness({ onChange, initial = DEFAULT_SCHEDULE_OPTIONS }: {
 }
 
 describe('ScheduleOptionsPanel farm post-processor options', () => {
-  it('shows a collapsed summary with defaults (cooldown from settings)', () => {
+  it('opens expanded with defaults (cooldown from settings) and collapses on click', () => {
     render(<Harness onChange={vi.fn()} />);
-    expect(screen.getByText('38°C · F2000 · 3 flex')).toBeInTheDocument();
+    expect((screen.getByLabelText('Cooldown temp (°C)') as HTMLInputElement).value).toBe('38');
+    expect((screen.getByLabelText('Bed drop (mm)') as HTMLInputElement).value).toBe('20');
+    fireEvent.click(screen.getByText('38°C · F2000 · 3 flex'));
     expect(screen.queryByText('Cooldown temp (°C)')).not.toBeInTheDocument();
+  });
+
+  it('caps bed drop at the safe maximum on blur', () => {
+    const onChange = vi.fn();
+    render(<Harness onChange={onChange} />);
+    const drop = screen.getByLabelText('Bed drop (mm)') as HTMLInputElement;
+    fireEvent.change(drop, { target: { value: '60' } });
+    fireEvent.blur(drop);
+    expect(drop.value).toBe('46');
+    expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ scriptOptions: { flex_drop: 46 } }));
   });
 
   it('records only the overridden fields and drops values equal to the default', () => {
     const onChange = vi.fn();
     render(<Harness onChange={onChange} />);
-    fireEvent.click(screen.getByText('38°C · F2000 · 3 flex'));
-
     const cooldown = screen.getByLabelText('Cooldown temp (°C)') as HTMLInputElement;
     expect(cooldown.value).toBe('38');
 
@@ -50,8 +60,6 @@ describe('ScheduleOptionsPanel farm post-processor options', () => {
   it('clamps out-of-range values on blur', () => {
     const onChange = vi.fn();
     render(<Harness onChange={onChange} />);
-    fireEvent.click(screen.getByText('38°C · F2000 · 3 flex'));
-
     const flex = screen.getByLabelText('Bed flex cycles') as HTMLInputElement;
     fireEvent.change(flex, { target: { value: '99' } });
     fireEvent.blur(flex);
@@ -62,7 +70,6 @@ describe('ScheduleOptionsPanel farm post-processor options', () => {
   it('reset clears all overrides', () => {
     const onChange = vi.fn();
     render(<Harness onChange={onChange} initial={{ ...DEFAULT_SCHEDULE_OPTIONS, scriptOptions: { push_speed: 1500 } }} />);
-    fireEvent.click(screen.getByText('38°C · F1500 · 3 flex'));
     fireEvent.click(screen.getByText('Reset to defaults'));
     expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ scriptOptions: {} }));
   });

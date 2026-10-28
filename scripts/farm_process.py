@@ -65,6 +65,11 @@ from pathlib import Path
 BED_X_CENTRE  = 128
 BED_Y_BACK    = 251   # toolhead Y at start of each sweep
 BED_Y_FRONT   = 25    # toolhead Y at end of each sweep (part falls off)
+BED_Z_FLOOR   = 256   # Z with the bed fully lowered -- it bottoms out here
+# Deepest Z the bed flex may drive to: 6mm clear of the floor so a large
+# flex_drop can never run the bed into its end stop. Hard cap, applied
+# regardless of the requested drop (max drop at the default flex_z 204 = 46mm).
+FLEX_Z_SAFE_MAX = 250
 
 
 # ---------------------------------------------------------------------------
@@ -244,13 +249,15 @@ def build_end_sequence(
 
     # --- FarmLoop Stage 1 bed flex ---
     # The FarmLoop clip is at a fixed absolute Z position on the frame.
-    # flex_z = Z where the clip engages the spring steel plate (P1S default: Z230,
-    #          = 26mm up from bed floor at Z256, measured in 1mm jog clicks).
-    # flex_drop = how many mm the bed drops PAST the clip each cycle (default: 10).
+    # flex_z = Z where the clip engages the spring steel plate (P1S default: Z204,
+    #          = 26x2mm jog clicks up from the bed floor at Z256).
+    # flex_drop = how many mm the bed drops PAST the clip each cycle (default: 20).
+    #          The flex bottom is capped at FLEX_Z_SAFE_MAX so the bed never bottoms out.
     # Toolhead parks at front-left (X10 Y15) over the clip while bed cycles.
     if flex_cycles > 0:
         flex_engage_z = flex_z          # clip engages here
-        flex_bottom_z = round(flex_z + flex_drop, 2)  # full flex (bed lower)
+        flex_bottom_z = round(min(flex_z + flex_drop, FLEX_Z_SAFE_MAX), 2)  # full flex (bed lower)
+        flex_drop = round(flex_bottom_z - flex_engage_z, 2)  # actual drop after the cap
         a("; --- FarmLoop Stage 1 bed flex ---")
         a("; Toolhead stays at X65 Y265 (cooldown park). Clip engages mechanically as bed drops.")
         a("; Slower than the F600 used elsewhere -- a slow flex gives the plate more time")
@@ -511,7 +518,8 @@ def main():
     parser.add_argument("--flex-z",              type=float, default=204.0,
                         help="Absolute Z where FarmLoop clip engages (default: 204 = 26x2mm jog clicks up from Z256 floor)")
     parser.add_argument("--flex-drop",           type=float, default=20.0,
-                        help="mm bed drops past clip engagement each flex cycle (default: 20 = 10x2mm jog clicks)")
+                        help="mm bed drops past clip engagement each flex cycle (default: 20 = 10x2mm jog clicks; "
+                             "flex bottom capped at Z{})".format(FLEX_Z_SAFE_MAX))
     parser.add_argument("--flex-speed",          type=int,   default=300,
                         help="Bed flex (bending cycle) feedrate mm/min (default: 300, slower gives a cleaner bend)")
     parser.add_argument("--test",                action="store_true",
@@ -669,6 +677,7 @@ def process_inplace(
     push_x=None,
     flex_cycles: int = 3,
     flex_speed: int = 300,
+    flex_drop: float = 20.0,
 ) -> None:
     """
     BambuBuddy scheduler entry point.
@@ -679,7 +688,7 @@ def process_inplace(
     Settings -> Workflow -> Farm Post-Processor Script in the BambuBuddy UI, or
     overridden per queue item in the Print modal.
     Optional flags (--push-speed, --lane-offset, --push-x, --flex-cycles,
-    --flex-speed) carry the remaining per-item overrides from the Print modal.
+    --flex-speed, --flex-drop) carry the remaining per-item overrides from the Print modal.
     push_x=None auto-detects from the file. Modifies the file in-place, exits 0
     on success.
     """
@@ -714,6 +723,7 @@ def process_inplace(
             push_speed=push_speed,
             lane_offset=lane_offset,
             flex_cycles=flex_cycles,
+            flex_drop=flex_drop,
             flex_speed=flex_speed,
         )
         + "; EXECUTABLE_BLOCK_END\n"
@@ -744,6 +754,7 @@ def main_inplace(argv):
     parser.add_argument("--push-x",        type=float, default=None)
     parser.add_argument("--flex-cycles",   type=int,   default=3)
     parser.add_argument("--flex-speed",    type=int,   default=300)
+    parser.add_argument("--flex-drop",     type=float, default=20.0)
     args = parser.parse_args(argv)
 
     p = Path(args.path)
@@ -759,6 +770,7 @@ def main_inplace(argv):
         push_x=args.push_x,
         flex_cycles=args.flex_cycles,
         flex_speed=args.flex_speed,
+        flex_drop=args.flex_drop,
     )
 
 

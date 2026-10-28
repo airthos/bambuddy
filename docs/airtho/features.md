@@ -20,25 +20,32 @@ the codebase moves faster than this doc._
 
 - **Why:** cooldown temp / push / flex tuning was global-only (Settings) or hardcoded in
   the script, so trying a different value for one awkward part meant changing the farm.
-- **UI:** when "Run farm post-processor" is checked, a collapsed summary
-  (`35°C · F2000 · 3 flex`) sits on the right of the checkbox; clicking it opens cooldown
-  temp, push speed, push X centre (blank = auto), lane offset, bed flex cycles, flex speed —
-  all prefilled with the defaults, so the normal case is just clicking past. A green dot
+- **UI:** when "Run farm post-processor" is checked the options panel is open by default
+  (summary `35°C · F2000 · 3 flex` on the right of the checkbox collapses it): cooldown
+  temp, push speed, push X centre (blank = auto), lane offset, bed flex cycles, flex speed,
+  bed drop — all prefilled with the defaults, so the normal case is just clicking past. A green dot
   marks a customized item; "Reset to defaults" clears it. Works in create and edit mode.
 - **Storage:** `print_queue.script_options` TEXT column (JSON), **sparse** — only fields
   that differ from the default are stored. Unset fields fall through at dispatch time, so
   an untouched item keeps following the Settings cooldown even if that changes later.
   Schema `FarmScriptOptions` in `schemas/print_queue.py` carries conservative ranges
   (cooldown 20–80°C, push 300–6000, lane 0–120, push X 10–246, flex 0–10 cycles,
-  flex speed 60–1200); out-of-range → 422.
+  flex speed 60–1200, bed drop 1–46mm); out-of-range → 422.
+- **Bed drop safety (added 2026-10-28):** `flex_drop` = mm the bed drops past the FarmLoop
+  clip each flex cycle (default 20 → flex bottom Z224). The clip engages at `flex_z` Z204 and
+  the bed bottoms out at Z256 (`BED_Z_FLOOR`). The script hard-caps the flex bottom at
+  `FLEX_Z_SAFE_MAX` = Z250 (6mm clear of the floor) regardless of the requested drop, so
+  46mm is the deepest drop it honours; the UI/API range matches that cap. If `flex_z` is
+  ever recalibrated, the 46 limit in the schema and the UI field needs updating with it.
 - **Dispatch:** `print_scheduler.py` passes the parsed dict to `apply_farm_post_process`
   (`services/farm_post_process.py`), which uses `cooldown_temp` in place of the setting
-  and appends `--push-speed/--lane-offset/--push-x/--flex-cycles/--flex-speed` for set keys.
+  and appends `--push-speed/--lane-offset/--push-x/--flex-cycles/--flex-speed/--flex-drop`
+  for set keys.
 - **Defaults live in two places:** the script's `main_inplace()` and
   `FARM_SCRIPT_DEFAULTS` in `frontend/src/components/PrintModal/types.ts` (display only).
   Change both together.
-- **Not exposed on purpose:** `flex_z` / `flex_drop` — these are the FarmLoop clip's
-  physical calibration, not per-print tuning. Lane-clear sweeps stay hardcoded at F2000
+- **Not exposed on purpose:** `flex_z` — the FarmLoop clip's physical engage height is
+  calibration, not per-print tuning. Lane-clear sweeps stay hardcoded at F2000
   (`push_speed` only sets the centre lane, as before). Bulk edit doesn't touch options.
 
 ## 1b. "Prefer Recently-Used Spool" Filament Preference
@@ -196,7 +203,8 @@ Cherry-picked from `airthos/print-farm`, adds the farm's end-of-print loop seque
   `Metadata/plate_{N}.gcode.md5` for the correct plate — see Fix 4 in
   [`fixes.md`](fixes.md) for why this needed a dedicated fix.
 - **Call signature:** `farm_process.py <path_to_3mf> [plate_id] [cooldown_temp]
-  [--push-speed N] [--lane-offset MM] [--push-x MM] [--flex-cycles N] [--flex-speed N]` —
+  [--push-speed N] [--lane-offset MM] [--push-x MM] [--flex-cycles N] [--flex-speed N]
+  [--flex-drop MM]` —
   `plate_id` defaults to `1`, `cooldown_temp` to 35. The flags carry the per-print
   overrides from 1a; with none passed the output is identical to before.
 - **Archive behavior:** BamBuddy's archive stores the **original, unmodified** library

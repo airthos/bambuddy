@@ -352,3 +352,28 @@ class TestFarmProcessScriptInplace:
             assert "bed flex" not in gcode
         finally:
             source.unlink(missing_ok=True)
+
+    def test_flex_drop_flag_sets_flex_bottom(self):
+        fp = self._load_script()
+        source = _make_temp_3mf(
+            "; max_z_height: 10\n; print_x_min: 100\n; print_x_max: 140\nG1 Z10\nM400 ; wait for buffer\n"
+        )
+        try:
+            fp.main_inplace([str(source), "1", "35", "--flex-drop", "30"])
+            assert "G1 Z234.0 F300 ; flex down 1/3 (30.0mm past clip)" in self._gcode(source)
+        finally:
+            source.unlink(missing_ok=True)
+
+    def test_flex_drop_capped_before_bed_bottoms_out(self):
+        """A drop past the safe floor margin is clamped to FLEX_Z_SAFE_MAX, never the Z256 floor."""
+        fp = self._load_script()
+        source = _make_temp_3mf(
+            "; max_z_height: 10\n; print_x_min: 100\n; print_x_max: 140\nG1 Z10\nM400 ; wait for buffer\n"
+        )
+        try:
+            fp.main_inplace([str(source), "1", "35", "--flex-drop", "80"])
+            gcode = self._gcode(source)
+            assert f"G1 Z{fp.FLEX_Z_SAFE_MAX} F300 ; flex down 1/3 (46mm past clip)" in gcode
+            assert fp.FLEX_Z_SAFE_MAX < fp.BED_Z_FLOOR
+        finally:
+            source.unlink(missing_ok=True)

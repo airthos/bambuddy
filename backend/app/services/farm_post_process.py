@@ -37,6 +37,7 @@ _OPTION_FLAGS = {
     "push_x": "--push-x",
     "flex_cycles": "--flex-cycles",
     "flex_speed": "--flex-speed",
+    "flex_drop": "--flex-drop",
 }
 
 

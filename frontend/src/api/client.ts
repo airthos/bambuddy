@@ -2251,6 +2251,7 @@ export interface FarmScriptOptions {
   push_x?: number;  // Push X centre (mm); unset = auto-detect from file
   flex_cycles?: number;  // FarmLoop bed flex cycles (0 = skip)
   flex_speed?: number;  // Bed flex feedrate (mm/min)
+  flex_drop?: number;  // mm the bed drops past the clip each flex (max 46: flex bottom capped at Z250)
 }
 
 export interface PrintQueueItem {

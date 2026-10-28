@@ -34,7 +34,7 @@ export function ScheduleOptionsPanel({
   farmCooldownTemp,
 }: ScheduleOptionsProps) {
   const { t } = useTranslation();
-  const [farmOptionsOpen, setFarmOptionsOpen] = useState(false);
+  const [farmOptionsOpen, setFarmOptionsOpen] = useState(true);
   const farmOptions = options.scriptOptions;
   const farmDefaults = { ...FARM_SCRIPT_DEFAULTS, cooldown_temp: farmCooldownTemp ?? FARM_SCRIPT_DEFAULTS.cooldown_temp };
   const hasFarmOverrides = Object.keys(farmOptions).length > 0;
@@ -394,6 +394,17 @@ export function ScheduleOptionsPanel({
                   min={60}
                   max={1200}
                   onCommit={(v) => setFarmOption('flex_speed', v)}
+                />
+                {/* Clip engages at Z204, bed bottoms out at Z256; the script caps the
+                    flex bottom at Z250, so 46mm is the deepest drop it will honour. */}
+                <FarmNumberField
+                  label={t('printModal.farmFlexDrop', 'Bed drop (mm)')}
+                  value={farmOptions.flex_drop}
+                  defaultValue={farmDefaults.flex_drop}
+                  min={1}
+                  max={46}
+                  step={0.1}
+                  onCommit={(v) => setFarmOption('flex_drop', v)}
                 />
               </div>
               <div className="flex items-center justify-between gap-3">
