@@ -336,6 +336,24 @@ the first two died before proposing anything resembling them:
 4. **`reconcile_on_startup()` UNIQUE-constraint crash** — it called `start_session()`
    without `resume_row=`, which tried to `INSERT` a `CameraRecordingSession` row that
    already existed. Caught by a dedicated regression test before it hit production.
+5. **Recent prints missing from the detail timeline (2026-10-28)** — every print from
+   early October on was drawn on the wrong printer, weeks in the past. `print_archives.id`
+   isn't `AUTOINCREMENT`, so hard-deleting the newest archive hands its id to the next
+   one; `delete_archive` never removed the recording (its `ondelete=CASCADE` is inert —
+   SQLite FKs are off), and `start_session`'s revive-a-leftover-row path (meant for a
+   watchdog-killed earlier attempt at the *same* job) picked up the deleted job's row and
+   appended the new print to it, keeping the old `printer_id`/`started_at`. Fix:
+   `ArchiveService.delete_archive` now purges the recording via
+   `camera_recording_purge_service.delete_one`, and `start_session` only revives a row on
+   the same printer that started after the archive row was created — otherwise it purges
+   it and starts fresh. One-off repair (run with the service stopped): sessions 248–251
+   (archives 435–438) lost the deleted jobs' frames, had seqs renumbered from 0 and
+   printer/started_at corrected; framelog bytes were left in place (offsets unchanged,
+   retention reclaims them). Five recordings whose archives no longer existed were
+   deleted. Considered and rejected: migrating `print_archives` to `AUTOINCREMENT` —
+   a SQLite table rebuild of the busiest table for a problem fixed at both ends anyway.
+   Not fixed: several queue items can share one archive (reprints — archive 434 had
+   seven across three printers), and they still share one recording.
 
 The 2026-07-06 → 07-10 fix chain after this list is recorded in the commit log rather
 than itemized here — notably the recording-resume/orphaning cluster (`ce331fdd`,

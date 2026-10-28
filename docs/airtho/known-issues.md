@@ -52,6 +52,17 @@ Note: a related but distinct gap in the same two paths — Print Now/Reprint sil
 never running the farm post-processor at all — was fixed in Fix 9 (`95dfeae8`). That fix
 does not touch dispatch coordination; this race is still open.
 
+## Reprints share one archive, so they share one Sentry recording
+
+Found 2026-10-28 while fixing the archive-id reuse bug (see Sentry fix 5 in
+[`features.md`](features.md)). Several queue items can point at the same
+`print_archives` row (archive 434 had queue items 1665–1671 across printers 2, 3 and 4).
+Recordings are keyed 1:1 by `archive_id` (UNIQUE), so each later print revives and
+appends to the same session: the timeline shows one long block on whichever printer
+recorded first. Resolution sketch: key recordings by queue item / print run instead of
+archive, or give each dispatch its own archive row. Not fixed — rarer than the id-reuse
+case and needs a schema change.
+
 ## Farm-mode features that intentionally trade safety for uptime
 
 Not a bug, but worth stating explicitly so it isn't "fixed" by someone unfamiliar with

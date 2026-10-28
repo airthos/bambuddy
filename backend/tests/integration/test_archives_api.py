@@ -480,6 +480,46 @@ class TestArchivesAPI:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_hard_delete_purges_sentry_recording(
+        self, async_client: AsyncClient, archive_factory, printer_factory, db_session, tmp_path
+    ):
+        """Archive ids are reused once the newest archive is hard-deleted, and
+        the recording's ON DELETE CASCADE never fires under SQLite. A surviving
+        recording would be revived by the next print that inherits the id, so
+        delete_archive must remove the session row, its frame index and its
+        framelog itself."""
+        from sqlalchemy import select
+
+        from backend.app.models.camera_recording import CameraRecordingFrame, CameraRecordingSession
+        from backend.app.services.archive import ArchiveService
+
+        printer = await printer_factory()
+        archive = await archive_factory(printer.id, status="completed")
+        framelog = tmp_path / f"{archive.id}.framelog"
+        framelog.write_bytes(b"jpeg")
+        db_session.add(
+            CameraRecordingSession(
+                archive_id=archive.id, printer_id=printer.id, status="completed", file_path=str(framelog)
+            )
+        )
+        db_session.add(CameraRecordingFrame(archive_id=archive.id, seq=0, ts_ms=0, offset=0, length=4))
+        await db_session.commit()
+        archive_id = archive.id
+
+        assert await ArchiveService(db_session).delete_archive(archive_id) is True
+
+        sessions = await db_session.execute(
+            select(CameraRecordingSession).where(CameraRecordingSession.archive_id == archive_id)
+        )
+        assert sessions.scalar_one_or_none() is None
+        frames = await db_session.execute(
+            select(CameraRecordingFrame).where(CameraRecordingFrame.archive_id == archive_id)
+        )
+        assert frames.scalars().all() == []
+        assert not framelog.exists()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_print_log_thumbnail_route_lazy_nulls_missing_file(
         self, async_client: AsyncClient, archive_factory, printer_factory, db_session
     ):
