@@ -67,6 +67,9 @@ class PrintQueueItem(Base):
 
     # Farm post-process script
     script_processing: Mapped[bool] = mapped_column(Boolean, default=False)
+    # Per-item farm post-processor overrides: JSON object of FarmScriptOptions
+    # fields (sparse -- only what the user changed). null = script/Settings defaults.
+    script_options: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     # How many times the start-watchdog has reverted this item from 'printing'
     # back to 'pending' (#2555). A printer that accepts project_file but never

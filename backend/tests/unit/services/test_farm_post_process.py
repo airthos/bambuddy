@@ -251,3 +251,104 @@ class TestApplyFarmPostProcess:
             result.unlink(missing_ok=True)
         finally:
             source.unlink(missing_ok=True)
+
+    @pytest.mark.asyncio
+    async def test_per_item_options_override_settings_and_pass_flags(self, monkeypatch):
+        """Print-modal overrides: cooldown_temp beats the Settings value and the
+        other set keys become script flags; unset keys are not passed."""
+        source = _make_temp_3mf()
+        db = _mock_db_with_settings({"post_process_script": "/some/script", "farm_cooldown_temp": "42"})
+
+        captured_args = {}
+
+        class FakeProc:
+            returncode = 0
+
+            async def communicate(self):
+                return (b"", b"")
+
+        async def fake_create_subprocess_exec(*args, **kwargs):
+            captured_args["args"] = args
+            return FakeProc()
+
+        monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+        try:
+            result = await apply_farm_post_process(
+                db,
+                source,
+                1,
+                log_label="test",
+                options={"cooldown_temp": 30, "push_speed": 1500, "flex_cycles": 0},
+            )
+            assert result is not None
+            args = list(captured_args["args"])
+            assert args[3] == "30"
+            assert args[4:] == ["--push-speed", "1500", "--flex-cycles", "0"]
+            result.unlink(missing_ok=True)
+        finally:
+            source.unlink(missing_ok=True)
+
+
+class TestFarmProcessScriptInplace:
+    """The real scripts/farm_process.py in-place entry point the service calls."""
+
+    @staticmethod
+    def _load_script():
+        import importlib.util
+
+        script = Path(__file__).resolve().parents[4] / "scripts" / "farm_process.py"
+        spec = importlib.util.spec_from_file_location("farm_process", script)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _gcode(path: Path) -> str:
+        with zipfile.ZipFile(path, "r") as zf:
+            return zf.read("Metadata/plate_1.gcode").decode()
+
+    def test_legacy_positional_args_keep_defaults(self):
+        fp = self._load_script()
+        source = _make_temp_3mf(
+            "; max_z_height: 10\n; print_x_min: 100\n; print_x_max: 140\nG1 Z10\nM400 ; wait for buffer\n"
+        )
+        try:
+            fp.main_inplace([str(source), "1", "38"])
+            gcode = self._gcode(source)
+            assert "M190 S38 ; wait for bed temp (1/40)" in gcode
+            assert "G1 X120.0 Y25 F2000 ; push off center" in gcode
+            assert "flex down 3/3" in gcode
+        finally:
+            source.unlink(missing_ok=True)
+
+    def test_flags_override_end_sequence(self):
+        fp = self._load_script()
+        source = _make_temp_3mf(
+            "; max_z_height: 10\n; print_x_min: 100\n; print_x_max: 140\nG1 Z10\nM400 ; wait for buffer\n"
+        )
+        try:
+            fp.main_inplace(
+                [
+                    str(source),
+                    "1",
+                    "30",
+                    "--push-speed",
+                    "1200",
+                    "--push-x",
+                    "90",
+                    "--lane-offset",
+                    "40",
+                    "--flex-cycles",
+                    "0",
+                    "--flex-speed",
+                    "200",
+                ]
+            )
+            gcode = self._gcode(source)
+            assert "M190 S30 ; wait for bed temp (1/40)" in gcode
+            assert "G1 X90.0 Y25 F1200 ; push off center" in gcode
+            assert "G1 X130.0 Y25 F2000 ; push off right" in gcode
+            assert "G1 X50.0 Y25 F2000 ; push off left" in gcode
+            assert "bed flex" not in gcode
+        finally:
+            source.unlink(missing_ok=True)

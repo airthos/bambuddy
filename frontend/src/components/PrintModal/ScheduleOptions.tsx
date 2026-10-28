@@ -1,7 +1,9 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect, useRef, useId } from 'react';
 import { useTranslation } from 'react-i18next';
-import { Calendar, Clock, Hand, Power, Layers, Code, ListOrdered, Terminal } from 'lucide-react';
+import { Calendar, Clock, Hand, Power, Layers, Code, ListOrdered, Terminal, ChevronDown, ChevronUp, RotateCcw } from 'lucide-react';
 import type { ScheduleOptionsProps, ScheduleType } from './types';
+import { FARM_SCRIPT_DEFAULTS } from './types';
+import type { FarmScriptOptions } from '../../api/client';
 import {
   formatDateInput,
   formatTimeInput,
@@ -29,8 +31,27 @@ export function ScheduleOptionsPanel({
   printerCount = 0,
   hasGcodeSnippets = false,
   hasPostProcessScript = false,
+  farmCooldownTemp,
 }: ScheduleOptionsProps) {
   const { t } = useTranslation();
+  const [farmOptionsOpen, setFarmOptionsOpen] = useState(false);
+  const farmOptions = options.scriptOptions;
+  const farmDefaults = { ...FARM_SCRIPT_DEFAULTS, cooldown_temp: farmCooldownTemp ?? FARM_SCRIPT_DEFAULTS.cooldown_temp };
+  const hasFarmOverrides = Object.keys(farmOptions).length > 0;
+  const farmSummary = [
+    `${farmOptions.cooldown_temp ?? farmDefaults.cooldown_temp}°C`,
+    `F${farmOptions.push_speed ?? farmDefaults.push_speed}`,
+    t('printModal.farmFlexSummary', '{{count}} flex', { count: farmOptions.flex_cycles ?? farmDefaults.flex_cycles }),
+  ].join(' · ');
+  // Keep overrides sparse: a value equal to its default (or cleared) is dropped
+  // so the item follows the script/Settings default at dispatch time.
+  const setFarmOption = (key: keyof FarmScriptOptions, value: number | undefined) => {
+    const next = { ...farmOptions };
+    const fallback = key === 'push_x' ? undefined : farmDefaults[key];
+    if (value === undefined || value === fallback) delete next[key];
+    else next[key] = value;
+    onChange({ ...options, scriptOptions: next });
+  };
   const [dateValue, setDateValue] = useState('');
   const [timeValue, setTimeValue] = useState('');
   const [isDateValid, setIsDateValid] = useState(true);
@@ -293,18 +314,105 @@ export function ScheduleOptionsPanel({
 
       {/* Farm post-process script */}
       {hasPostProcessScript && (
-        <div className="flex items-center gap-2">
-          <input
-            type="checkbox"
-            id="scriptProcessing"
-            checked={options.scriptProcessing}
-            onChange={(e) => onChange({ ...options, scriptProcessing: e.target.checked })}
-            className="rounded border-bambu-dark-tertiary bg-bambu-dark text-bambu-green focus:ring-bambu-green"
-          />
-          <label htmlFor="scriptProcessing" className="text-sm flex items-center gap-1 text-bambu-gray">
-            <Terminal className="w-3.5 h-3.5" />
-            {t('printModal.scriptProcessing', 'Run farm post-processor')}
-          </label>
+        <div className="space-y-2">
+          <div className="flex items-center gap-2">
+            <input
+              type="checkbox"
+              id="scriptProcessing"
+              checked={options.scriptProcessing}
+              onChange={(e) => onChange({ ...options, scriptProcessing: e.target.checked })}
+              className="rounded border-bambu-dark-tertiary bg-bambu-dark text-bambu-green focus:ring-bambu-green"
+            />
+            <label htmlFor="scriptProcessing" className="text-sm flex items-center gap-1 text-bambu-gray">
+              <Terminal className="w-3.5 h-3.5" />
+              {t('printModal.scriptProcessing', 'Run farm post-processor')}
+            </label>
+            {options.scriptProcessing && (
+              <button
+                type="button"
+                onClick={() => setFarmOptionsOpen(!farmOptionsOpen)}
+                className="ml-auto flex items-center gap-1 text-xs text-bambu-gray hover:text-white"
+                title={t('printModal.farmOptionsCustomize', 'Customize farm post-processor options')}
+              >
+                {hasFarmOverrides && <span className="w-1.5 h-1.5 rounded-full bg-bambu-green" />}
+                {farmSummary}
+                {farmOptionsOpen ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+              </button>
+            )}
+          </div>
+
+          {options.scriptProcessing && farmOptionsOpen && (
+            <div className="ml-6 space-y-3">
+              <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                <FarmNumberField
+                  label={t('printModal.farmCooldownTemp', 'Cooldown temp (°C)')}
+                  value={farmOptions.cooldown_temp}
+                  defaultValue={farmDefaults.cooldown_temp}
+                  min={20}
+                  max={80}
+                  onCommit={(v) => setFarmOption('cooldown_temp', v)}
+                />
+                <FarmNumberField
+                  label={t('printModal.farmPushSpeed', 'Push speed (mm/min)')}
+                  value={farmOptions.push_speed}
+                  defaultValue={farmDefaults.push_speed}
+                  min={300}
+                  max={6000}
+                  onCommit={(v) => setFarmOption('push_speed', v)}
+                />
+                <FarmNumberField
+                  label={t('printModal.farmPushX', 'Push X centre (mm)')}
+                  value={farmOptions.push_x}
+                  defaultValue={undefined}
+                  placeholder={t('printModal.farmAuto', 'Auto')}
+                  min={10}
+                  max={246}
+                  step={0.1}
+                  onCommit={(v) => setFarmOption('push_x', v)}
+                />
+                <FarmNumberField
+                  label={t('printModal.farmLaneOffset', 'Lane offset (mm)')}
+                  value={farmOptions.lane_offset}
+                  defaultValue={farmDefaults.lane_offset}
+                  min={0}
+                  max={120}
+                  step={0.1}
+                  onCommit={(v) => setFarmOption('lane_offset', v)}
+                />
+                <FarmNumberField
+                  label={t('printModal.farmFlexCycles', 'Bed flex cycles')}
+                  value={farmOptions.flex_cycles}
+                  defaultValue={farmDefaults.flex_cycles}
+                  min={0}
+                  max={10}
+                  onCommit={(v) => setFarmOption('flex_cycles', v)}
+                />
+                <FarmNumberField
+                  label={t('printModal.farmFlexSpeed', 'Flex speed (mm/min)')}
+                  value={farmOptions.flex_speed}
+                  defaultValue={farmDefaults.flex_speed}
+                  min={60}
+                  max={1200}
+                  onCommit={(v) => setFarmOption('flex_speed', v)}
+                />
+              </div>
+              <div className="flex items-center justify-between gap-3">
+                <p className="text-xs text-bambu-gray">
+                  {t('printModal.farmOptionsHelp', 'Applies to this print only. Cooldown default comes from Settings → Workflow.')}
+                </p>
+                {hasFarmOverrides && (
+                  <button
+                    type="button"
+                    onClick={() => onChange({ ...options, scriptOptions: {} })}
+                    className="flex items-center gap-1 text-xs text-bambu-gray hover:text-white whitespace-nowrap"
+                  >
+                    <RotateCcw className="w-3 h-3" />
+                    {t('printModal.farmOptionsReset', 'Reset to defaults')}
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
         </div>
       )}
 
@@ -385,6 +493,77 @@ export function ScheduleOptionsPanel({
           ? t('printModal.helpSchedule')
           : t('printModal.helpQueue')}
       </p>
+    </div>
+  );
+}
+
+/**
+ * Number input for a farm post-processor option. Shows the effective value
+ * (override, else default) and keeps free-form text while typing; commits on
+ * every valid in-range edit and clamps on blur. Clearing the field reverts to
+ * the default.
+ */
+function FarmNumberField({
+  label,
+  value,
+  defaultValue,
+  placeholder,
+  min,
+  max,
+  step = 1,
+  onCommit,
+}: {
+  label: string;
+  value: number | undefined;
+  defaultValue: number | undefined;
+  placeholder?: string;
+  min: number;
+  max: number;
+  step?: number;
+  onCommit: (value: number | undefined) => void;
+}) {
+  const id = useId();
+  const effective = value ?? defaultValue;
+  const [text, setText] = useState(effective === undefined ? '' : String(effective));
+
+  // Re-sync when the value changes from outside (reset, settings load, edit mode).
+  useEffect(() => {
+    setText(effective === undefined ? '' : String(effective));
+  }, [effective]);
+
+  const parse = (raw: string) => (step < 1 ? parseFloat(raw) : parseInt(raw, 10));
+
+  return (
+    <div>
+      <label htmlFor={id} className="block text-xs text-bambu-gray mb-1">{label}</label>
+      <input
+        id={id}
+        type="number"
+        min={min}
+        max={max}
+        step={step}
+        value={text}
+        placeholder={placeholder ?? (defaultValue !== undefined ? String(defaultValue) : undefined)}
+        onChange={(e) => {
+          setText(e.target.value);
+          const n = parse(e.target.value);
+          if (!isNaN(n) && n >= min && n <= max) onCommit(n);
+        }}
+        onBlur={() => {
+          if (text.trim() === '') {
+            onCommit(undefined);
+            setText(defaultValue === undefined ? '' : String(defaultValue));
+            return;
+          }
+          const n = parse(text);
+          const clamped = isNaN(n) ? defaultValue : Math.min(max, Math.max(min, n));
+          onCommit(clamped);
+          setText(clamped === undefined ? '' : String(clamped));
+        }}
+        className={`w-full px-3 py-2 bg-bambu-dark border rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green ${
+          value !== undefined ? 'border-bambu-green/60' : 'border-bambu-dark-tertiary'
+        }`}
+      />
     </div>
   );
 }

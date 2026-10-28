@@ -2242,6 +2242,17 @@ export interface DiscoveredTasmotaDevice {
 }
 
 // Print Queue types
+// Per-item farm post-processor overrides (scripts/farm_process.py). Sparse:
+// unset keys fall through to the script defaults / Settings cooldown temp.
+export interface FarmScriptOptions {
+  cooldown_temp?: number;  // Bed release temp (°C)
+  push_speed?: number;  // Centre push feedrate (mm/min)
+  lane_offset?: number;  // Left/right lane offset from centre (mm)
+  push_x?: number;  // Push X centre (mm); unset = auto-detect from file
+  flex_cycles?: number;  // FarmLoop bed flex cycles (0 = skip)
+  flex_speed?: number;  // Bed flex feedrate (mm/min)
+}
+
 export interface PrintQueueItem {
   id: number;
   printer_id: number | null;  // null = unassigned
@@ -2314,6 +2325,7 @@ export interface PrintQueueItem {
   gcode_injection?: boolean;
   // Farm post-process script
   script_processing?: boolean;
+  script_options?: FarmScriptOptions | null;
   cleanup_library_after_dispatch?: boolean;
 }
 
@@ -2366,6 +2378,7 @@ export interface PrintQueueItemCreate {
   gcode_injection?: boolean;
   // Farm post-process script
   script_processing?: boolean;
+  script_options?: FarmScriptOptions | null;
   // Batch: create multiple copies (creates a batch if > 1)
   quantity?: number;
   // Existing batch to add this item into (multi-plate auto-batch flow).
@@ -2412,6 +2425,7 @@ export interface PrintQueueItemUpdate {
   gcode_injection?: boolean;
   // Farm post-process script
   script_processing?: boolean;
+  script_options?: FarmScriptOptions | null;
 }
 
 export interface PrintQueueBulkUpdate {

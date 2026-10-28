@@ -1,6 +1,6 @@
 # Custom Features Added in This Fork
 
-_Last updated: 2026-07-16. Verify file paths and line references against current code —
+_Last updated: 2026-10-28. Verify file paths and line references against current code —
 the codebase moves faster than this doc._
 
 ## 1. Farm Post-Processor Script Hook
@@ -11,9 +11,35 @@ the codebase moves faster than this doc._
   Settings → Workflow → Farm Post-Processor Script.
 - Script interface: receives the temp `.3mf` path + `plate_id` as args, modifies the
   file in-place, exits 0 on success.
-- Frontend checkbox "Run farm post-processor" in
-  `frontend/src/components/modals/PrintModal.tsx`.
+- `farm_cooldown_temp` setting — global bed release temp, passed as the script's 3rd arg.
+- Frontend checkbox "Run farm post-processor" in the Print modal's schedule options
+  (`frontend/src/components/PrintModal/ScheduleOptions.tsx`).
 - The concrete script used is `scripts/farm_process.py` — see item 2 below.
+
+### 1a. Per-print farm post-processor options (added 2026-10-28, branch `feature/farm-postproc-options`)
+
+- **Why:** cooldown temp / push / flex tuning was global-only (Settings) or hardcoded in
+  the script, so trying a different value for one awkward part meant changing the farm.
+- **UI:** when "Run farm post-processor" is checked, a collapsed summary
+  (`35°C · F2000 · 3 flex`) sits on the right of the checkbox; clicking it opens cooldown
+  temp, push speed, push X centre (blank = auto), lane offset, bed flex cycles, flex speed —
+  all prefilled with the defaults, so the normal case is just clicking past. A green dot
+  marks a customized item; "Reset to defaults" clears it. Works in create and edit mode.
+- **Storage:** `print_queue.script_options` TEXT column (JSON), **sparse** — only fields
+  that differ from the default are stored. Unset fields fall through at dispatch time, so
+  an untouched item keeps following the Settings cooldown even if that changes later.
+  Schema `FarmScriptOptions` in `schemas/print_queue.py` carries conservative ranges
+  (cooldown 20–80°C, push 300–6000, lane 0–120, push X 10–246, flex 0–10 cycles,
+  flex speed 60–1200); out-of-range → 422.
+- **Dispatch:** `print_scheduler.py` passes the parsed dict to `apply_farm_post_process`
+  (`services/farm_post_process.py`), which uses `cooldown_temp` in place of the setting
+  and appends `--push-speed/--lane-offset/--push-x/--flex-cycles/--flex-speed` for set keys.
+- **Defaults live in two places:** the script's `main_inplace()` and
+  `FARM_SCRIPT_DEFAULTS` in `frontend/src/components/PrintModal/types.ts` (display only).
+  Change both together.
+- **Not exposed on purpose:** `flex_z` / `flex_drop` — these are the FarmLoop clip's
+  physical calibration, not per-print tuning. Lane-clear sweeps stay hardcoded at F2000
+  (`push_speed` only sets the centre lane, as before). Bulk edit doesn't touch options.
 
 ## 1b. "Prefer Recently-Used Spool" Filament Preference
 
@@ -169,8 +195,10 @@ Cherry-picked from `airthos/print-farm`, adds the farm's end-of-print loop seque
 - **Plate-aware:** reads/writes `Metadata/plate_{N}.gcode` and
   `Metadata/plate_{N}.gcode.md5` for the correct plate — see Fix 4 in
   [`fixes.md`](fixes.md) for why this needed a dedicated fix.
-- **Call signature:** `farm_process.py <path_to_3mf> [plate_id]` — `plate_id` defaults
-  to `1`.
+- **Call signature:** `farm_process.py <path_to_3mf> [plate_id] [cooldown_temp]
+  [--push-speed N] [--lane-offset MM] [--push-x MM] [--flex-cycles N] [--flex-speed N]` —
+  `plate_id` defaults to `1`, `cooldown_temp` to 35. The flags carry the per-print
+  overrides from 1a; with none passed the output is identical to before.
 - **Archive behavior:** BamBuddy's archive stores the **original, unmodified** library
   file. The farm script only ever runs on a temp copy that gets FTP'd to the printer.
   So the archive viewer showing unprocessed gcode is expected, not a bug — don't

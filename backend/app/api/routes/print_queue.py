@@ -24,6 +24,7 @@ from backend.app.models.printer import Printer
 from backend.app.models.project import Project
 from backend.app.models.user import User
 from backend.app.schemas.print_queue import (
+    FarmScriptOptions,
     PrintBatchCreate,
     PrintBatchResponse,
     PrintBatchUngroupResponse,
@@ -119,6 +120,15 @@ def _extract_filament_types_from_3mf(file_path: Path, plate_id: int | None = Non
 _extract_print_time_from_3mf = extract_print_time_from_3mf
 
 
+def _dump_script_options(options: FarmScriptOptions | None) -> str | None:
+    """Serialize farm post-processor overrides sparsely (unset fields fall
+    through to the script/Settings defaults at dispatch). Empty -> NULL."""
+    if options is None:
+        return None
+    sparse = options.model_dump(exclude_none=True)
+    return json.dumps(sparse) if sparse else None
+
+
 async def _resolve_source_path(db: AsyncSession, item: PrintQueueItem) -> Path | None:
     """Resolve an existing queue item's source 3MF on disk, or None."""
     if item.archive_id:
@@ -171,6 +181,13 @@ def _enrich_response(item: PrintQueueItem) -> PrintQueueItemResponse:
             nozzle_mapping_parsed = json.loads(item.nozzle_mapping)
         except json.JSONDecodeError:
             nozzle_mapping_parsed = None
+
+    script_options_parsed = None
+    if item.script_options:
+        try:
+            script_options_parsed = json.loads(item.script_options)
+        except json.JSONDecodeError:
+            script_options_parsed = None
 
     nozzles_info_parsed = None
     if item.nozzles_info:
@@ -225,6 +242,7 @@ def _enrich_response(item: PrintQueueItem) -> PrintQueueItemResponse:
         "gcode_injection": item.gcode_injection,
         # Farm post-process script
         "script_processing": item.script_processing,
+        "script_options": script_options_parsed,
         # H2C rack-swap nozzle pick (#1780)
         "nozzle_mapping": nozzle_mapping_parsed,
         "nozzles_info": nozzles_info_parsed,
@@ -736,6 +754,7 @@ async def add_to_queue(
             preheat_chamber_target_override=data.preheat_chamber_target_override,
             gcode_injection=data.gcode_injection,
             script_processing=data.script_processing,
+            script_options=_dump_script_options(data.script_options),
             cleanup_library_after_dispatch=data.cleanup_library_after_dispatch,
             project_id=data.project_id,
             position=start_position + i,
@@ -1222,6 +1241,10 @@ async def update_queue_item(
                 update_data.get("plate_id", item.plate_id),
             )
         update_data["filament_overrides"] = json.dumps(overrides) if overrides else None
+
+    # Serialize farm post-processor overrides to JSON for TEXT column storage
+    if "script_options" in update_data:
+        update_data["script_options"] = _dump_script_options(data.script_options)
 
     # Serialize H2C rack-swap nozzle pick (#1780) to JSON for TEXT column
     # storage; same Text-as-opaque-blob convention as ams_mapping above.

@@ -1,4 +1,4 @@
-import type { PrintQueueItem, Printer, CalibrationMode } from '../../api/client';
+import type { PrintQueueItem, Printer, CalibrationMode, FarmScriptOptions } from '../../api/client';
 
 export type { CalibrationMode };
 
@@ -90,6 +90,8 @@ export interface ScheduleOptions {
   autoOffAfter: boolean;
   gcodeInjection: boolean;
   scriptProcessing: boolean;
+  /** Farm post-processor overrides (sparse; empty = use defaults) */
+  scriptOptions: FarmScriptOptions;
   staggerEnabled: boolean;
   staggerGroupSize: number;
   staggerIntervalMinutes: number;
@@ -106,9 +108,24 @@ export const DEFAULT_SCHEDULE_OPTIONS: ScheduleOptions = {
   autoOffAfter: false,
   gcodeInjection: false,
   scriptProcessing: true,
+  scriptOptions: {},
   staggerEnabled: false,
   staggerGroupSize: 2,
   staggerIntervalMinutes: 5,
+};
+
+/**
+ * Defaults scripts/farm_process.py applies when an option isn't overridden.
+ * Keep in sync with the script's process_inplace()/main_inplace() defaults.
+ * cooldown_temp is a fallback only -- the real default is the
+ * farm_cooldown_temp setting (Settings -> Workflow).
+ */
+export const FARM_SCRIPT_DEFAULTS: Required<Omit<FarmScriptOptions, 'push_x'>> = {
+  cooldown_temp: 35,
+  push_speed: 2000,
+  lane_offset: 60,
+  flex_cycles: 3,
+  flex_speed: 300,
 };
 
 /**
@@ -268,4 +285,6 @@ export interface ScheduleOptionsProps {
   hasGcodeSnippets?: boolean;
   /** Whether a farm post-process script is configured in settings */
   hasPostProcessScript?: boolean;
+  /** Global farm_cooldown_temp setting, shown as the cooldown default */
+  farmCooldownTemp?: number;
 }

@@ -139,6 +139,10 @@ export function PrintModal({
         autoOffAfter: queueItem.auto_off_after,
         gcodeInjection: queueItem.gcode_injection ?? false,
         scriptProcessing: queueItem.script_processing ?? false,
+        // The API echoes unset override keys as null; keep only real overrides.
+        scriptOptions: Object.fromEntries(
+          Object.entries(queueItem.script_options ?? {}).filter(([, v]) => v != null),
+        ),
         staggerEnabled: false,
         staggerGroupSize: DEFAULT_SCHEDULE_OPTIONS.staggerGroupSize,
         staggerIntervalMinutes: DEFAULT_SCHEDULE_OPTIONS.staggerIntervalMinutes,
@@ -916,8 +920,14 @@ export function PrintModal({
       asapInsertionCounts.set(scopeKey, insertPosition + itemCount - 1);
     };
 
+    // Farm post-processor overrides are sparse; send null when nothing was changed
+    // so the item keeps following the script/Settings defaults at dispatch time.
+    const scriptOptionsPayload = Object.keys(scheduleOptions.scriptOptions).length > 0
+      ? scheduleOptions.scriptOptions
+      : null;
+
     // Common queue data for create and edit modes
-    const getQueueData = (printerId: number | null, plateOverride?: number | null): PrintQueueItemCreate => {
+    const getQueueData =(printerId: number | null, plateOverride?: number | null): PrintQueueItemCreate => {
       const plateId = plateOverride !== undefined ? plateOverride : selectedPlate;
       return {
       printer_id: assignmentMode === 'printer' ? printerId : null,
@@ -931,6 +941,7 @@ export function PrintModal({
       auto_off_after: scheduleOptions.autoOffAfter,
       gcode_injection: scheduleOptions.gcodeInjection,
       script_processing: scheduleOptions.scriptProcessing,
+      script_options: scriptOptionsPayload,
       manual_start: scheduleOptions.scheduleType === 'queue' && scheduleOptions.requireManualStart,
       // When the user clicks "Print Anyway" on the frontend deficit warning,
       // persist that acknowledgement so the scheduler doesn't immediately
@@ -968,6 +979,7 @@ export function PrintModal({
               auto_off_after: scheduleOptions.autoOffAfter,
               gcode_injection: scheduleOptions.gcodeInjection,
               script_processing: scheduleOptions.scriptProcessing,
+              script_options: scriptOptionsPayload,
               manual_start: scheduleOptions.scheduleType === 'queue' && scheduleOptions.requireManualStart,
               ams_mapping: undefined,
               plate_id: plateId,
@@ -1024,6 +1036,7 @@ export function PrintModal({
                 auto_off_after: scheduleOptions.autoOffAfter,
                 gcode_injection: scheduleOptions.gcodeInjection,
                 script_processing: scheduleOptions.scriptProcessing,
+                script_options: scriptOptionsPayload,
                 manual_start: scheduleOptions.scheduleType === 'queue' && scheduleOptions.requireManualStart,
                 ams_mapping: printerMapping,
                 plate_id: plateId,
@@ -1501,6 +1514,7 @@ export function PrintModal({
               printerCount={selectedPrinters.length}
               hasGcodeSnippets={!!settings?.gcode_snippets}
               hasPostProcessScript={!!settings?.post_process_script}
+              farmCooldownTemp={settings?.farm_cooldown_temp}
             />
 
             {/* Error message */}

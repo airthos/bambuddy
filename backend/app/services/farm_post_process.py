@@ -29,6 +29,16 @@ logger = logging.getLogger(__name__)
 
 _TIMEOUT_SECONDS = 120
 
+# Per-item override (FarmScriptOptions field) -> farm_process.py flag.
+# cooldown_temp is not here: it rides the legacy 3rd positional arg.
+_OPTION_FLAGS = {
+    "push_speed": "--push-speed",
+    "lane_offset": "--lane-offset",
+    "push_x": "--push-x",
+    "flex_cycles": "--flex-cycles",
+    "flex_speed": "--flex-speed",
+}
+
 
 async def _read_post_process_script_setting(db: AsyncSession) -> str | None:
     result = await db.execute(select(Settings).where(Settings.key == "post_process_script"))
@@ -48,6 +58,7 @@ async def apply_farm_post_process(
     plate_id: int | None,
     *,
     log_label: str,
+    options: dict | None = None,
 ) -> Path | None:
     """Run the configured farm post-processor script against a copy of file_path.
 
@@ -56,13 +67,24 @@ async def apply_farm_post_process(
     the script isn't configured, fails, or times out; callers should fall back
     to the original file_path in that case. Never raises — a broken script
     must not block a print from starting.
+
+    `options` is the queue item's sparse FarmScriptOptions dict; any key it
+    sets overrides the script default (cooldown_temp overrides the Settings
+    value). Unset keys aren't passed, so the script keeps its own defaults.
     """
+    options = options or {}
     script_path = await _read_post_process_script_setting(db)
     if not script_path or not script_path.strip():
         logger.warning("%s: script_processing enabled but post_process_script not configured", log_label)
         return None
 
-    cooldown_temp = await _read_farm_cooldown_temp_setting(db)
+    cooldown_temp = options.get("cooldown_temp")
+    if cooldown_temp is None:
+        cooldown_temp = await _read_farm_cooldown_temp_setting(db)
+    extra_args: list[str] = []
+    for key, flag in _OPTION_FLAGS.items():
+        if options.get(key) is not None:
+            extra_args += [flag, str(options[key])]
 
     with tempfile.NamedTemporaryFile(delete=False, suffix=".3mf") as tmp:
         script_out_path = Path(tmp.name)
@@ -75,12 +97,18 @@ async def apply_farm_post_process(
             str(script_out_path),
             str(plate_id or 1),
             str(cooldown_temp),
+            *extra_args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         _, stderr = await asyncio.wait_for(proc.communicate(), timeout=_TIMEOUT_SECONDS)
         if proc.returncode == 0:
-            logger.info("%s: post_process_script applied", log_label)
+            logger.info(
+                "%s: post_process_script applied (cooldown=%sC%s)",
+                log_label,
+                cooldown_temp,
+                f", overrides={' '.join(extra_args)}" if extra_args else "",
+            )
             return script_out_path
         script_out_path.unlink(missing_ok=True)
         logger.warning(

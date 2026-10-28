@@ -660,15 +660,28 @@ def main():
     print("Open in BambuStudio and click 'Print Plate'. Do NOT re-slice.")
 
 
-def process_inplace(path: Path, plate_id: int = 1, cooldown_temp: int = 35) -> None:
+def process_inplace(
+    path: Path,
+    plate_id: int = 1,
+    cooldown_temp: int = 35,
+    push_speed: int = 2000,
+    lane_offset: float = 60.0,
+    push_x=None,
+    flex_cycles: int = 3,
+    flex_speed: int = 300,
+) -> None:
     """
     BambuBuddy scheduler entry point.
 
     Called with a single argument: path to a temp 3MF copy.
     Optional second argument: plate number (1-based, default 1).
     Optional third argument: bed release temp in C (default 35), configured via
-    Settings -> Workflow -> Farm Post-Processor Script in the BambuBuddy UI.
-    Modifies the file in-place using default settings, exits 0 on success.
+    Settings -> Workflow -> Farm Post-Processor Script in the BambuBuddy UI, or
+    overridden per queue item in the Print modal.
+    Optional flags (--push-speed, --lane-offset, --push-x, --flex-cycles,
+    --flex-speed) carry the remaining per-item overrides from the Print modal.
+    push_x=None auto-detects from the file. Modifies the file in-place, exits 0
+    on success.
     """
     lines, plate_json = read_input_3mf(path, plate_id=plate_id)
 
@@ -681,19 +694,28 @@ def process_inplace(path: Path, plate_id: int = 1, cooldown_temp: int = 35) -> N
         print("ERROR: cannot determine max_z_height", file=sys.stderr)
         sys.exit(1)
 
-    x_min = header.get("print_x_min")
-    x_max = header.get("print_x_max")
-    if x_min is not None and x_max is not None:
-        push_x = round((x_min + x_max) / 2, 1)
-    else:
-        push_x = push_x_from_plate_json(plate_json) or 120.0
+    if push_x is None:
+        x_min = header.get("print_x_min")
+        x_max = header.get("print_x_max")
+        if x_min is not None and x_max is not None:
+            push_x = round((x_min + x_max) / 2, 1)
+        else:
+            push_x = push_x_from_plate_json(plate_json) or 120.0
 
     kept_lines, _ = strip_end_gcode(lines)
 
     end_block = (
         "; FEATURE: Custom\n"
         "; MACHINE_END_GCODE_START\n"
-        + build_end_sequence(max_z=max_z, cooldown_temp=cooldown_temp, push_x=push_x, flex_speed=300)
+        + build_end_sequence(
+            max_z=max_z,
+            cooldown_temp=cooldown_temp,
+            push_x=push_x,
+            push_speed=push_speed,
+            lane_offset=lane_offset,
+            flex_cycles=flex_cycles,
+            flex_speed=flex_speed,
+        )
         + "; EXECUTABLE_BLOCK_END\n"
     )
 
@@ -711,18 +733,42 @@ def process_inplace(path: Path, plate_id: int = 1, cooldown_temp: int = 35) -> N
         raise
 
 
+def main_inplace(argv):
+    """Parse the BambuBuddy calling convention: path [plate_id] [cooldown_temp] [flags]."""
+    parser = argparse.ArgumentParser(description="BambuBuddy in-place farm post-process")
+    parser.add_argument("path")
+    parser.add_argument("plate_id",        nargs="?", type=int,   default=1)
+    parser.add_argument("cooldown_temp",   nargs="?", type=int,   default=35)
+    parser.add_argument("--push-speed",    type=int,   default=2000)
+    parser.add_argument("--lane-offset",   type=float, default=60.0)
+    parser.add_argument("--push-x",        type=float, default=None)
+    parser.add_argument("--flex-cycles",   type=int,   default=3)
+    parser.add_argument("--flex-speed",    type=int,   default=300)
+    args = parser.parse_args(argv)
+
+    p = Path(args.path)
+    if not p.exists():
+        print("ERROR: not found: {}".format(p), file=sys.stderr)
+        sys.exit(1)
+    process_inplace(
+        p,
+        plate_id=args.plate_id,
+        cooldown_temp=args.cooldown_temp,
+        push_speed=args.push_speed,
+        lane_offset=args.lane_offset,
+        push_x=args.push_x,
+        flex_cycles=args.flex_cycles,
+        flex_speed=args.flex_speed,
+    )
+
+
 if __name__ == "__main__":
-    # BambuBuddy calling convention: path [plate_id] [cooldown_temp]
-    # Single positional arg (no flags) triggers in-place mode.
+    # BambuBuddy calling convention: path [plate_id] [cooldown_temp] [--push-speed N ...]
+    # A positional first arg (no leading flag) triggers in-place mode.
     # Optional second arg is the plate number (1-based, default 1).
     # Optional third arg is the bed release temp in C (default 35).
+    # Optional flags carry per-queue-item overrides from the Print modal.
     if len(sys.argv) >= 2 and not sys.argv[1].startswith("-"):
-        p = Path(sys.argv[1])
-        if not p.exists():
-            print("ERROR: not found: {}".format(p), file=sys.stderr)
-            sys.exit(1)
-        plate_id = int(sys.argv[2]) if len(sys.argv) >= 3 else 1
-        cooldown_temp = int(sys.argv[3]) if len(sys.argv) >= 4 else 35
-        process_inplace(p, plate_id=plate_id, cooldown_temp=cooldown_temp)
+        main_inplace(sys.argv[1:])
     else:
         main()

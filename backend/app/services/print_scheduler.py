@@ -3557,8 +3557,14 @@ class PrintScheduler:
         # `Metadata/plate_{N}.gcode` inside the 3MF and our script recomputes the
         # md5, so chaining is safe).
         if item.script_processing:
+            script_options = None
+            if item.script_options:
+                try:
+                    script_options = json.loads(item.script_options)
+                except json.JSONDecodeError:
+                    logger.warning("Queue item %s: invalid script_options, using defaults", item.id)
             processed_path = await apply_farm_post_process(
-                db, file_path, item.plate_id, log_label=f"Queue item {item.id}"
+                db, file_path, item.plate_id, log_label=f"Queue item {item.id}", options=script_options
             )
             if processed_path is not None:
                 if injected_path and injected_path.exists():

@@ -42,6 +42,24 @@ def _coerce_tristate(v: object) -> object:
 TriState = Annotated[Literal["off", "on", "auto"], BeforeValidator(_coerce_tristate)]
 
 
+class FarmScriptOptions(BaseModel):
+    """Per-item overrides for the farm post-processor (`scripts/farm_process.py`).
+
+    Every field is optional: an unset field falls through to the script's own
+    default (or, for cooldown_temp, the global `farm_cooldown_temp` setting), so
+    an item queued without touching the options keeps following Settings. Ranges
+    are deliberately conservative -- these values drive physical motion on
+    unattended printers.
+    """
+
+    cooldown_temp: int | None = Field(default=None, ge=20, le=80)  # bed release temp, C
+    push_speed: int | None = Field(default=None, ge=300, le=6000)  # centre push feedrate, mm/min
+    lane_offset: float | None = Field(default=None, ge=0, le=120)  # left/right lane offset from centre, mm
+    push_x: float | None = Field(default=None, ge=10, le=246)  # push X centre, mm (None = auto-detect)
+    flex_cycles: int | None = Field(default=None, ge=0, le=10)  # FarmLoop bed flex cycles (0 = skip)
+    flex_speed: int | None = Field(default=None, ge=60, le=1200)  # bed flex feedrate, mm/min
+
+
 class PrintQueueItemCreate(BaseModel):
     printer_id: int | None = None  # None = unassigned, user assigns later
     target_model: str | None = None  # Target printer model (mutually exclusive with printer_id)
@@ -87,6 +105,7 @@ class PrintQueueItemCreate(BaseModel):
     gcode_injection: bool = False
     # Farm post-process script
     script_processing: bool = False
+    script_options: FarmScriptOptions | None = None
     # Batch: create multiple copies (creates a batch if > 1)
     quantity: int = 1
     # Existing batch to add this item into. When set, the item's batch_id is
@@ -126,6 +145,7 @@ class PrintQueueItemUpdate(BaseModel):
     gcode_injection: bool | None = None
     # Farm post-process script
     script_processing: bool | None = None
+    script_options: FarmScriptOptions | None = None
     # H2C dual-nozzle-rack slicer pick (#1780). list[int] per-filament
     # physical nozzle position IDs from BambuStudio's project_file MQTT
     # body; sent back to the printer verbatim on dispatch.
@@ -220,6 +240,7 @@ class PrintQueueItemResponse(BaseModel):
     gcode_injection: bool = False
     # Farm post-process script
     script_processing: bool = False
+    script_options: FarmScriptOptions | None = None
     cleanup_library_after_dispatch: bool = False
 
     # H2C dual-nozzle-rack slicer pick (#1780). Surface for any future
