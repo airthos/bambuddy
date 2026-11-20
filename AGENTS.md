@@ -1,7 +1,9 @@
 # Agent Guide — Airtho's BamBuddy Fork
 
 This is `airthos/bambuddy`, a fork of [maziggy/bambuddy](https://github.com/maziggy/bambuddy)
-(currently tracking `v0.2.4.3` + fork-specific commits) that runs Airtho's in-house 3D print
+(currently tracking upstream `v1.3.1` + fork-specific commits — see
+[`docs/airtho/upstream-sync.md`](docs/airtho/upstream-sync.md) for the sync history and
+an inventory of every fork change) that runs Airtho's in-house 3D print
 farm. This file is the entry point for **any agent, on any computer, in any harness**
 (Claude Code, Cursor, Codex, plain chat with repo access, etc.) picking up work here.
 

@@ -1,4 +1,7 @@
+import type { KProfileWriteResult } from '../utils/kprofileWrite';
+import type { BambuCatalogColor } from '../utils/colors';
 import type { ArchivePlatesResponse, LibraryFilePlatesResponse } from '../types/plates';
+import { batched, byField, byId } from './batch';
 
 const API_BASE = '/api/v1';
 
@@ -64,9 +67,21 @@ export function getAuthToken(): string | null {
   return authToken;
 }
 
-// Stream token for image/video URLs loaded via <img>/<video> tags
-// (these can't send Authorization headers, so a query param token is used)
+// Query-param tokens for <img>/<video> src URLs, which can't carry an
+// Authorization header. There are two, and which one a URL takes is decided
+// by what the URL points at, not by convenience:
+//
+//   streamToken — live camera only. Minting one costs camera:view.
+//   mediaToken  — thumbnails, previews, timelapses, covers, icons. Minted by
+//                 any signed-in user and carries their identity, so those
+//                 routes can apply the same ownership rules as everywhere else.
+//
+// Before #3025 the stream token served both, which meant a user could not see
+// a library thumbnail without also being granted the live feed of the room the
+// printer sits in — and, because a stream token names nobody, those routes had
+// no identity to scope by and served any row to any holder.
 let streamToken: string | null = null;
+let mediaToken: string | null = null;
 
 export function setStreamToken(token: string | null) {
   streamToken = token;
@@ -76,11 +91,26 @@ export function getStreamToken(): string | null {
   return streamToken;
 }
 
-/** Append the stream token to a URL if available (for <img>/<video> src). */
+export function setMediaToken(token: string | null) {
+  mediaToken = token;
+}
+
+export function getMediaToken(): string | null {
+  return mediaToken;
+}
+
+/** Append the camera stream token to a URL if available (live camera only). */
 export function withStreamToken(url: string): string {
   if (!streamToken) return url;
   const sep = url.includes('?') ? '&' : '?';
   return `${url}${sep}token=${encodeURIComponent(streamToken)}`;
+}
+
+/** Append the media token to a URL if available (for <img>/<video> src). */
+export function withMediaToken(url: string): string {
+  if (!mediaToken) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}token=${encodeURIComponent(mediaToken)}`;
 }
 
 function parseContentDispositionFilename(header: string | null): string | null {
@@ -98,6 +128,23 @@ function parseContentDispositionFilename(header: string | null): string | null {
 function buildSlicerUrlFilename(filename: string): string {
   const safe = filename.replace(/[/\\?#]/g, '_');
   return safe.toLowerCase().endsWith('.3mf') ? safe : `${safe}.3mf`;
+}
+
+/** POST JSON and return the response body as a Blob (label PDFs and images). */
+async function postForBlob(endpoint: string, data: unknown, signal?: AbortSignal): Promise<Blob> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+  const response = await fetch(`${API_BASE}${endpoint}`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(data),
+    signal,
+  });
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(typeof error.detail === 'string' ? error.detail : `HTTP ${response.status}`);
+  }
+  return response.blob();
 }
 
 async function request<T>(
@@ -343,6 +390,25 @@ export interface LongLivedCameraToken {
   token: string | null;
 }
 
+// An external application that signs users in with their Bambuddy account.
+// `client_secret` is present only in the create / rotate responses.
+export interface ConnectedApp {
+  id: number;
+  name: string;
+  client_id: string;
+  redirect_uri: string;
+  enabled: boolean;
+  created_at: string;
+  last_used_at: string | null;
+  client_secret?: string;
+}
+
+export interface ConnectAuthorizeInfo {
+  app_name: string;
+  username: string;
+  already_granted: boolean;
+}
+
 // One row of the token-authenticated Cam Wall feed (#2531). Deliberately
 // smaller than PrinterStatus: no serial, no IP, no print filename — a kiosk URL
 // is not a secret, so the payload behind it must not be either.
@@ -366,6 +432,7 @@ export interface CamWallPrinter {
 export interface OverlayStatus {
   id: number;
   name: string;
+  model: string | null;
   camera_rotation: number;
   connected: boolean;
   state: string | null;
@@ -376,10 +443,61 @@ export interface OverlayStatus {
   layer_num: number | null;
   total_layers: number | null;
   stg_cur_name: string | null;
+  // Nozzle / bed / chamber readings for the overlay's temperature fields
+  // (#1422). Only the keys a viewer is shown; chamber is absent on models
+  // without a real sensor.
+  temperatures: Record<string, number>;
   time_format: 'system' | '12h' | '24h';
 }
 
 // Printer types
+// Printer locations (groups) and their appearance (#2962). `id` is null for a
+// location only printers carry, with no row of its own yet.
+export interface PrinterLocation {
+  id: number | null;
+  name: string;
+  icon: string | null;
+  color: string | null;
+  printer_count: number;
+}
+
+export interface PrinterLocationUpdate {
+  name: string;
+  new_name?: string;
+  icon?: string | null;
+  color?: string | null;
+}
+
+export interface WLEDPresets {
+  idle: number | null;
+  prepare: number | null;
+  printing: number | null;
+  paused: number | null;
+  finished: number | null;
+  error: number | null;
+  queue_waiting: number | null;
+  filament_problem: number | null;
+  hms_error: number | null;
+  offline: number | null;
+}
+
+export interface WLEDConfig {
+  enabled: boolean;
+  base_url: string | null;
+  presets: WLEDPresets;
+  finished_timeout_seconds: number | null;
+}
+
+export interface WLEDPreset {
+  id: number;
+  name: string;
+}
+
+export interface WLEDConnectionInfo {
+  name: string | null;
+  version: string | null;
+}
+
 export interface Printer {
   id: number;
   name: string;
@@ -403,8 +521,11 @@ export interface Printer {
   external_camera_enabled: boolean;
   external_camera_snapshot_url: string | null;  // optional single-frame override (#1177)
   camera_rotation: number;  // 0, 90, 180, 270 degrees
+  camera_light_auto: boolean;  // picked for the chamber light when camera_light_mode is 'selected' (#1655)
   plate_detection_enabled: boolean;  // Check plate before print
   plate_detection_roi?: PlateDetectionROI;  // ROI for plate detection
+  wear_cost_per_hour: number | null;  // Wear cost per printing hour (#694)
+  wled_config: WLEDConfig | null;
   created_at: string;
   updated_at: string;
 }
@@ -413,7 +534,9 @@ export interface HMSError {
   code: string;
   attr: number;  // Attribute value for constructing wiki URL
   module: number;
-  severity: number;  // 1=fatal, 2=serious, 3=common, 4=info
+  // Bambu's alert level: 1 error (task stopped), 2 warning (task paused),
+  // 3 notification, 0 invalid (#2728).
+  severity: number;
   actions?: string[];  // List of user-facing action keys (e.g. "CHECK_FILAMENT")
   job_id?: string;  // Optional job ID for actions that require it (e.g. "CHECK_ASSISTANT")
   // Canonical hex identifier the firmware matches against — 8 chars for
@@ -421,6 +544,11 @@ export interface HMSError {
   // this back as HmsActionBody.print_error so we don't truncate the 64-bit
   // identifier into the silent-rejection short code (#1830).
   full_code?: string;
+  // The backend's catalogue sentence for this fault (#2926), from the table
+  // generated out of Bambu Studio for this printer model (#2728). English only.
+  // Null when Bambu publishes no text for the code. The frontend has no table of
+  // its own: this field decides both the text and whether the fault counts.
+  description?: string | null;
 }
 
 export interface HMSActionBody {
@@ -458,16 +586,48 @@ export interface AMSUnit {
   serial_number: string;  // AMS unit serial number (from MQTT sn field)
   sw_ver: string;         // AMS firmware version (from get_version info.module ams/* entry)
   dry_time: number;       // Minutes remaining (0 = not drying, >0 = drying active)
+  dry_countdown_stalled?: boolean; // Timer set but countdown not ticking (never started or paused)
   dry_status: number;     // 0=Off, 1=Checking, 2=Drying, 3=Cooling, 4=Stopping, 5=Error
   dry_sub_status: number; // 0=Off, 1=Heating, 2=Dehumidify
   dry_sf_reason: number[]; // Cannot-dry reasons (1=InsufficientPower, 8=NeedPluginPower)
   dry_target_temp: number | null; // Active-cycle target °C (Bambu does not echo)
   dry_filament: string | null;    // Active-cycle filament name we sent
-  module_type: string;    // "ams", "n3f", "n3s"
+  module_type: string;    // "ams", "ams_f1", "n3f", "n3s", "n10a" (H3C AMS 3H)
+  ams_type?: number | null;  // Bambu Studio's AMS type (utils/trayIds AmsType), 6 = AMS 3H
+  // The AMS 3H dryer: its two slots (tray ids 0-8) and that zone's humidity (%) and temperature.
+  dryer_slots?: number[];
+  dryer_humidity?: number | null;
+  dryer_temp?: number | null;
+}
+
+export interface ScheduledDrying {
+  id: number;
+  printer_id: number;
+  ams_id: number;
+  temp: number;
+  duration_hours: number;
+  filament: string;
+  rotate_tray: boolean;
+  start_after: string | null;  // UTC ISO with Z suffix, like the queue routes
+  status: string;
+  waiting_reason: string | null;
+  error_message: string | null;
+  // Why a failed run failed (screen_only / unsupported / did_not_start); null on
+  // rows that failed before codes existed, which show error_message instead.
+  error_code?: string | null;
+  created_at: string;
+  started_at: string | null;
+  completed_at: string | null;
 }
 
 export interface NozzleInfo {
-  nozzle_type: string;  // "stainless_steel" or "hardened_steel"
+  // Two vocabularies live in this field, by printer generation. Legacy
+  // printers (X1/P1) report the nozzle MATERIAL -- "stainless_steel",
+  // "hardened_steel". H2-series report a FLOW code -- "HH01" (high flow),
+  // "HS01" (standard); measured on an H2D. utils/nozzleFlow reads only the
+  // latter and treats anything else as "unknown", which is what makes the
+  // material spelling harmless here.
+  nozzle_type: string;
   nozzle_diameter: string;  // e.g., "0.4"
 }
 
@@ -476,12 +636,14 @@ export interface NozzleRackSlot {
   nozzle_type: string;
   nozzle_diameter: string;
   wear: number | null;
+  print_time_s?: number | null;  // H2C: seconds this nozzle has printed (#1908); null when not reported
   stat: number | null;  // Nozzle status (e.g. mounted/docked)
   max_temp: number;
   serial_number: string;
   filament_color: string;  // RGBA hex ("00000000" = no filament)
   filament_id: string;
   filament_type: string;  // Material type (e.g. "PLA", "PETG")
+  addr_id?: number | null;  // H3C: home rack position 0-8 (the mounted hotend reports id 0)
 }
 
 export interface PrintOptions {
@@ -506,12 +668,42 @@ export interface PrintOptions {
 
 export interface FilaSwitchState {
   installed: boolean;
-  // in[track] = currently loaded slot for that track (-1 = empty)
+  // Raw wire arrays, ordered **In-B first, then In-A** (BambuStudio's SwitchPos
+  // enum). in[] values are snow-encoded (bits 8-15 = AMS id, bits 0-7 = slot,
+  // -1 = empty); out[] values are the extruder each *outlet* terminates at, or
+  // 0xE when unset. Neither array says which inlet is currently routed to which
+  // outlet — that pairing is not reported. For per-AMS side information use
+  // PrinterStatus.ams_switch_inlet instead.
   in_slots: number[];
-  // out[track] = extruder this track terminates at (0 = right, 1 = left)
   out_extruders: number[];
   stat: number;
   info: number;
+  // Whether every AMS is bound to one of the switch's two inlets. Until it is,
+  // the switch cannot route a load anywhere and the printer has to be set up
+  // first ("Manual AMS Setup" on its screen).
+  ready: boolean;
+}
+
+// Which AMS slot one hotend is currently fed from. ams_id/slot_id are null when
+// the hotend holds nothing. Keyed by extruder id ('0' = right, '1' = left).
+// tray_now cannot answer this — it is one value for the whole printer, so on a
+// dual-nozzle machine it names only one of the two loaded hotends.
+export interface ExtruderSlot {
+  ams_id: number | null;
+  slot_id: number | null;
+  has_filament: boolean;
+}
+
+// Which FTS inlet an AMS is plumbed into: 'A' | 'B'.
+export type FtsInlet = 'A' | 'B';
+
+// A video device the server can see, for a USB camera (GET /printers/usb-cameras).
+export interface UsbCamera {
+  device: string;
+  name: string;
+  capabilities: string[];
+  driver?: string;
+  formats?: string[];
 }
 
 export interface PrinterStatus {
@@ -544,7 +736,8 @@ export interface PrinterStatus {
   } | null;
   cover_url: string | null;
   hms_errors: HMSError[];
-  ams: AMSUnit[];
+  // Live updates send null when no AMS is attached; the REST status sends [].
+  ams: AMSUnit[] | null;
   ams_exists: boolean;
   vt_tray: AMSTray[];  // Virtual tray / external spool(s)
   store_to_sdcard: boolean;  // Store sent files on SD card
@@ -553,7 +746,10 @@ export interface PrinterStatus {
   wifi_signal: number | null;  // WiFi signal strength in dBm
   wired_network: boolean;  // Ethernet connection detected
   door_open: boolean;  // Enclosure door open (models with a door sensor: X1/X1C/X1E/X2D/P2S/H2*)
-  nozzles: NozzleInfo[];  // Nozzle hardware info (index 0=left/primary, 1=right)
+  // Indexed by EXTRUDER id: [0] is the right hotend, [1] the left. Measured
+  // on an H2D with 0.4 left / 0.6 right. Read it through the helpers in
+  // utils/amsHelpers rather than indexing it directly.
+  nozzles: NozzleInfo[];
   nozzle_rack: NozzleRackSlot[];  // H2C 6-nozzle tool-changer rack
   print_options: PrintOptions | null;  // AI detection and print options
   // Calibration stage tracking
@@ -579,10 +775,22 @@ export interface PrinterStatus {
   // AMS slots aren't tied to a specific extruder; the FTS routes any slot to
   // either extruder, so per-extruder slot filtering must be skipped.
   fila_switch: FilaSwitchState | null;
+  // Per-AMS FTS inlet binding, {ams_id: 'A' | 'B'}, as set on the printer's
+  // "Manual AMS Setup" screen. Empty unless a switch is installed. An AMS with
+  // an entry here reaches BOTH nozzles through the switch, which is why it has
+  // no ams_extruder_map entry and must not be badged left or right.
+  ams_switch_inlet: Record<string, FtsInlet>;
+  // Which AMS slot each hotend is fed from, keyed by extruder id as a string.
+  // Empty on printers that don't report it (everything but the H2/X2 series).
+  extruder_slots: Record<string, ExtruderSlot>;
   // Currently loaded tray (global tray ID, 255 = no filament loaded, 254 = external spool)
   tray_now: number;
+  // The trays this print has drawn from, in order: [global tray ID, layer of the
+  // switch]. A tray outside the job's AMS mapping is a backup spool the printer
+  // switched to (AMS Filament Backup). Reset at the start of each print.
+  tray_change_log?: [number, number][];
   // Runout / filament-replacement guidance (#2587). Populated only while PAUSED.
-  // Global tray IDs (ams_id*4+slot, 128-135 = AMS-HT, 254 = external), matching
+  // Global tray IDs (ams_id*4+slot, 28-36 = H3C AMS 3H, 128-135 = AMS-HT, 254 = external; utils/trayIds), matching
   // the same numbering as tray_now so the AMS graphic can highlight them.
   //   expected_tray = the slot the firmware now expects filament in (null = idle,
   //                   not paused, or unresolvable → "check the printer").
@@ -599,6 +807,9 @@ export interface PrinterStatus {
   last_ams_update: number;
   // Number of printable objects in current print (for skip objects feature)
   printable_objects_count: number;
+  // The next pause the slicer put into the running print (#2984). minutes is
+  // null while the printer reports no time left yet.
+  next_pause?: { layer: number; minutes: number | null } | null;
   // Fan speeds (0-100 percentage, null if not available for this model)
   cooling_fan_speed: number | null;  // Part cooling fan
   big_fan1_speed: number | null;     // Auxiliary fan
@@ -632,7 +843,7 @@ export interface PrinterCreate {
   ip_address: string;
   access_code: string;
   model?: string;
-  location?: string;
+  location?: string | null;
   auto_archive?: boolean;
   // Maintenance Mode flag (#1476). Backend already gates MQTT, queue dispatch,
   // scheduler, metrics and the print picker on this; toggling via PATCH
@@ -643,8 +854,11 @@ export interface PrinterCreate {
   external_camera_enabled?: boolean;
   external_camera_snapshot_url?: string | null;
   camera_rotation?: number;
+  camera_light_auto?: boolean;
   plate_detection_enabled?: boolean;
   plate_detection_roi?: PlateDetectionROI;
+  wear_cost_per_hour?: number | null;
+  wled_config?: WLEDConfig | null;
 }
 
 // Plate Detection
@@ -698,6 +912,35 @@ export interface ArchiveDuplicate {
   match_type: 'exact' | 'similar';  // 'exact' = hash match, 'similar' = name match
 }
 
+export interface ArchivePrinterMediaFile {
+  name: string;
+  path: string;
+  size: number;
+  mtime: string | null;
+  kind: 'timelapse' | 'ipcam';
+}
+
+export interface ArchivePrinterMedia {
+  archive_id: number;
+  printer_id: number | null;
+  local_timelapse: { name: string; size: number } | null;
+  remote_files: ArchivePrinterMediaFile[];
+  warnings: Array<'printer_missing' | 'timelapse_unavailable' | 'ipcam_unavailable' | 'printer_files_forbidden'>;
+}
+
+/** A timelapse editor re-encode, run in the background. */
+export interface TimelapseJob {
+  status: 'running' | 'completed' | 'failed' | 'cancelled';
+  /** Share done, 0 to 1; null before ffmpeg's first report. */
+  progress: number | null;
+  output_path: string | null;
+  message: string | null;
+  error: string | null;
+}
+
+/** How a post-print outcome verdict reached the archive (#1898). */
+export type VerdictSource = 'dialog' | 'link' | 'plate_clear' | 'printer_card' | 'api' | 'reaction';
+
 export interface Archive {
   id: number;
   printer_id: number | null;
@@ -721,6 +964,7 @@ export interface Archive {
   print_time_seconds: number | null;
   actual_time_seconds: number | null;  // Computed from started_at/completed_at
   time_accuracy: number | null;  // Percentage: 100 = perfect, >100 = faster than estimated
+  time_estimate_seconds?: number | null;  // The latest print's plate estimate, what time_accuracy compares with
   filament_used_grams: number | null;
   filament_type: string | null;
   filament_color: string | null;
@@ -744,9 +988,25 @@ export interface Archive {
   cost: number | null;
   photos: string[] | null;
   failure_reason: string | null;
+  // Post-print outcome confirmation (#1898)
+  user_verdict: 'good' | 'reject' | null;
+  // How the verdict arrived; 'reaction' is written by the Telegram reaction
+  // handler (#3046) and is labelled here so it reads correctly once that lands.
+  user_verdict_source: VerdictSource | null;
+  user_verdict_at: string | null;
+  confirm_requested: boolean;
+  // The run whose outcome this shows, when it shows one run of the archive
+  // (a plate printed on its own) rather than its latest (#1898).
+  run_id?: number | null;
+  // The latest print of the archive (among those the caller may see), whose
+  // figures the per-print fields show (archive redesign).
+  latest_run_id?: number | null;
+  // How many videos its prints have; timelapse_path is the latest print's only.
+  timelapse_count?: number;
   quantity: number;
   energy_kwh: number | null;
   energy_cost: number | null;
+  wear_cost: number | null;  // Printer wear (#694)
   created_at: string;
   // User tracking (Issue #206)
   created_by_id: number | null;
@@ -773,6 +1033,7 @@ export interface ArchiveSlim {
   cost: number | null;
   energy_kwh: number | null;
   energy_cost: number | null;
+  wear_cost: number | null;  // Printer wear (#694)
   quantity: number;
   created_at: string;
 }
@@ -781,6 +1042,7 @@ export interface PrintLogEntry {
   id: number;
   archive_id: number | null;
   print_name: string | null;
+  plate_id?: number | null;
   printer_name: string | null;
   printer_id: number | null;
   status: string;
@@ -793,7 +1055,20 @@ export interface PrintLogEntry {
   cost: number | null;
   energy_kwh: number | null;
   energy_cost: number | null;
+  wear_cost: number | null;  // Printer wear (#694)
   failure_reason: string | null;
+  user_verdict?: 'good' | 'reject' | null;
+  user_verdict_source?: string | null;
+  confirm_requested?: boolean | null;
+  duration_unmeasured?: boolean | null;
+  quantity?: number | null;
+  // This print's own (archive redesign): note, finish photos, video.
+  notes?: string | null;
+  photos?: string[] | null;
+  timelapse_path?: string | null;
+  // The slicer's estimate for the plate it printed; in an archive's runs list.
+  estimate_seconds?: number | null;
+  estimate_grams?: number | null;
   thumbnail_path: string | null;
   created_by_id: number | null;
   created_by_username: string | null;
@@ -803,6 +1078,8 @@ export interface PrintLogEntry {
 export interface PrintLogResponse {
   items: PrintLogEntry[];
   total: number;
+  // The print log only: archives of its prints that were deleted.
+  deleted_archive_ids?: number[];
 }
 
 export interface ArchiveStats {
@@ -815,10 +1092,14 @@ export interface ArchiveStats {
   total_cost: number;
   prints_by_filament_type: Record<string, number>;
   prints_by_printer: Record<string, number>;
+  // Name each printer id was last recorded under in the print log, so history
+  // belonging to a deleted printer keeps its label.
+  printer_names?: Record<string, string>;
   average_time_accuracy: number | null;
   time_accuracy_by_printer: Record<string, number> | null;
   total_energy_kwh: number;
   total_energy_cost: number;
+  total_wear_cost: number;  // Printer wear (#694)
   // True when a date-filtered total-consumption query is running on incomplete
   // snapshot history (e.g. right after upgrade, before hourly snapshots have
   // a baseline). UI should explain why the number may undercount.
@@ -835,6 +1116,11 @@ export interface FailureAnalysis {
   total_prints: number;
   failed_prints: number;
   failure_rate: number;
+  // Quality dimension (#1898): completed prints the user rejected. Optional
+  // so a frontend build against an older backend degrades gracefully.
+  rejected_prints?: number;
+  yield_rate?: number;
+  rejects_by_reason?: Record<string, number>;
   failures_by_reason: Record<string, number>;
   failures_by_filament: Record<string, number>;
   failures_by_printer: Record<string, number>;
@@ -855,11 +1141,27 @@ export interface FailureAnalysis {
   }>;
 }
 
+/**
+ * Send the browser's zone with calendar dates: the server reads a date as a
+ * day in it, else in its own TZ, which shifted every day for a browser away
+ * from the server (DB-C12). Only when a date is set.
+ */
+function addDayZone(params: URLSearchParams): void {
+  if (!params.has('date_from') && !params.has('date_to')) return;
+  try {
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    if (zone) params.set('tz', zone);
+  } catch {
+    // No Intl zone: the server's TZ applies.
+  }
+}
+
 export interface BulkUploadResult {
   uploaded: number;
   failed: number;
-  results: Array<{ filename: string; id: number; status: string }>;
-  errors: Array<{ filename: string; error: string }>;
+  /** `index` is the file's position in the request. */
+  results: Array<{ index: number; filename: string; id: number; status: string }>;
+  errors: Array<{ index: number; filename: string; error: string }>;
 }
 
 // Archive Comparison types
@@ -906,17 +1208,6 @@ export interface ArchiveComparison {
   success_correlation: SuccessCorrelation;
 }
 
-export interface SimilarArchive {
-  archive: {
-    id: number;
-    print_name: string;
-    status: string;
-    created_at: string | null;
-  };
-  match_reason: string;
-  match_score: number;
-}
-
 // Project types
 export interface ProjectStats {
   total_archives: number;
@@ -932,6 +1223,7 @@ export interface ProjectStats {
   estimated_cost: number;
   total_energy_kwh: number;
   total_energy_cost: number;
+  total_wear_cost: number;  // Printer wear (#694)
   remaining_prints: number | null;  // Remaining plates
   remaining_parts: number | null;  // Remaining parts
   bom_total_items: number;
@@ -939,12 +1231,21 @@ export interface ProjectStats {
   bom_cost: number;
 }
 
+// A sub-project as listed on its parent's page. The figures cover the child's
+// own subtree, so the listed rows add up to the parent's roll-up minus the
+// parent's own prints (#1264).
 export interface ProjectChildPreview {
   id: number;
   name: string;
   color: string | null;
   status: string;
   progress_percent: number | null;
+  descendant_count: number;
+  total_archives: number;
+  completed_prints: number;
+  total_print_time_hours: number;
+  total_filament_grams: number;
+  total_cost: number;  // Filament + energy + BOM, matching the parent's cost card
 }
 
 export interface Project {
@@ -967,9 +1268,13 @@ export interface Project {
   parent_id: number | null;
   parent_name: string | null;
   children: ProjectChildPreview[];
+  descendant_count: number;  // Sub-projects at any depth beneath this one (#1264)
   created_at: string;
   updated_at: string;
   stats?: ProjectStats;
+  // This project's numbers combined with every sub-project's. Null when there
+  // are none, since it would only repeat `stats` (#1264).
+  rollup_stats?: ProjectStats | null;
   url: string | null;  // External link rendered next to project name on the card (#1155)
   cover_image_filename: string | null;  // Filename within project attachments dir (#1155)
 }
@@ -1016,6 +1321,8 @@ export interface ProjectListItem {
   failed_count: number;  // Sum of quantities for failed prints
   queue_count: number;
   progress_percent: number | null;  // Plates progress
+  parent_id: number | null;  // #1264 — set when this is a sub-project
+  child_count: number;  // #1264 — direct sub-projects only
   archives: ArchivePreview[];
   url: string | null;  // #1155
   cover_image_filename: string | null;  // #1155
@@ -1168,6 +1475,7 @@ export interface APIKey {
   can_manage_projects: boolean;
   can_access_cloud: boolean;
   can_update_energy_cost: boolean;
+  can_send_notifications: boolean;
   printer_ids: number[] | null;
   enabled: boolean;
   last_used: string | null;
@@ -1187,29 +1495,13 @@ export interface APIKeyCreate {
   can_manage_projects?: boolean;
   can_access_cloud?: boolean;
   can_update_energy_cost?: boolean;
+  can_send_notifications?: boolean;
   printer_ids?: number[] | null;
   expires_at?: string | null;
 }
 
 export interface APIKeyCreateResponse extends APIKey {
   key: string;  // Full key, only shown on creation
-}
-
-export interface APIKeyUpdate {
-  name?: string;
-  can_queue?: boolean;
-  can_control_printer?: boolean;
-  can_read_status?: boolean;
-  can_manage_library?: boolean;
-  can_manage_inventory?: boolean;
-  can_manage_maintenance?: boolean;
-  can_manage_archives?: boolean;
-  can_manage_projects?: boolean;
-  can_access_cloud?: boolean;
-  can_update_energy_cost?: boolean;
-  printer_ids?: number[] | null;
-  enabled?: boolean;
-  expires_at?: string | null;
 }
 
 /**
@@ -1229,9 +1521,16 @@ export interface AppSettings {
   currency: string;
   energy_cost_per_kwh: number;
   energy_tracking_mode: 'print' | 'total';
+  // Where the electricity price comes from (#1251). With 'homeassistant',
+  // energy_cost_per_kwh holds the sensor's last reading and is read-only.
+  energy_price_source: 'fixed' | 'homeassistant';
+  energy_price_ha_entity: string;
   check_updates: boolean;
   check_printer_firmware: boolean;
   include_beta_updates: boolean;
+  // Announcements from the Bambuddy maintainers (a signed file on GitHub).
+  announcements_enabled?: boolean;
+  announcements_all_users?: boolean;
   // #1589: false hides the local username/password form on the login page;
   // BAMBUDDY_LOCAL_LOGIN=true on the server flips the reported value back to
   // true so the env-var recovery path is visible to the SPA.
@@ -1243,11 +1542,16 @@ export interface AppSettings {
   ams_humidity_fair: number;  // <= this is orange, > is red
   ams_temp_good: number;      // <= this is green/blue
   ams_temp_fair: number;      // <= this is orange, > is red
+  // Separate from the display band (#2905). null = unset, which the backend
+  // resolves to ams_temp_fair so existing installs are unaffected.
+  ams_temp_alarm: number | null;
   ams_history_retention_days: number;  // days to keep AMS sensor history
+  printer_sensor_history_retention_days?: number;  // days to keep printer heater history
   // Queue auto-drying settings
   queue_drying_enabled: boolean;  // Auto-dry AMS between queued prints
   queue_drying_block: boolean;  // Block queue until drying completes
   ambient_drying_enabled: boolean;  // Auto-dry idle printers based on humidity regardless of queue
+  ambient_drying_sustained_minutes: number;  // Minutes humidity must stay above threshold before ambient auto-dry starts (0 = instant)
   print_drying_enabled: boolean;  // Continue drying while a print is running on capable hardware
   drying_presets: string;  // JSON blob of drying presets per filament type
   ams_humidity_thresholds: string;  // JSON blob of per-filament humidity thresholds (#1605)
@@ -1298,6 +1602,8 @@ export interface AppSettings {
   mqtt_use_tls: boolean;
   // External URL for notifications
   external_url: string;
+  // Directory holding docker-compose.yml, shown in the update instructions (#2664)
+  docker_compose_dir: string;
   // Home Assistant integration
   ha_enabled: boolean;
   ha_url: string;
@@ -1306,15 +1612,20 @@ export interface AppSettings {
   ha_token_from_env: boolean;
   ha_env_managed: boolean;
   // File Manager / Library settings
-  library_archive_mode: 'always' | 'never' | 'ask';
   library_disk_warning_gb: number;
   // Camera view settings
   camera_view_mode: 'window' | 'embedded';
+  // Chamber light while the camera is in use (#1655)
+  camera_light_mode: 'off' | 'all' | 'selected';
+  camera_light_delay: number;  // seconds a snapshot waits after the light came on
   // Preferred slicer (server-side API / sidecar)
   preferred_slicer: 'bambu_studio' | 'orcaslicer';
   // Desktop "Open in Slicer" override (#1329). Null inherits from
   // preferred_slicer so existing installs behave identically.
   open_in_slicer: 'bambu_studio' | 'orcaslicer' | null;
+  // Where slicing runs, independent of which slicer binary the sidecar drives.
+  // Only 'sidecar' is implemented today; see lib/sliceEngines.ts.
+  slice_engine: 'sidecar' | 'browser';
   // Use the slicer-API sidecar for slicing (in-app modal) vs desktop URI scheme
   use_slicer_api: boolean;
   // Per-install sidecar URLs. Empty string falls back to the env defaults.
@@ -1329,6 +1640,8 @@ export interface AppSettings {
   prometheus_token: string;
   // Bed cooled threshold
   bed_cooled_threshold: number;
+  // Minutes before a slicer pause to send the pause heads-up (#2984)
+  pause_warning_minutes: number;
   // Inventory low stock threshold
   low_stock_threshold: number;
   // Session policy (#1706) — admin-set ceiling, hours, [1, 720]
@@ -1342,9 +1655,20 @@ export interface AppSettings {
   default_layer_inspect: boolean;
   default_timelapse: boolean;
   default_nozzle_offset_cali: CalibrationMode;
+  // Default for the per-job "ask for outcome afterwards" toggle (#1898)
+  default_confirm_outcome: boolean;
+  // Also ask for prints Bambuddy archived but did not dispatch (#1898)
+  confirm_outcome_external_prints: boolean;
+  // Count unanswered outcome prompts as "good" when the plate is released (#1898)
+  confirm_default_good_on_plate_clear: boolean;
   // Staggered batch start defaults
   stagger_group_size: number;
   stagger_interval_minutes: number;
+  // Finance budget reset window
+  billing_enabled: boolean;
+  printer_kill_switch_enabled: boolean;
+  finance_budget_reset_day: number;
+  finance_budget_reset_timezone: string;
   // Plate-clear confirmation
   require_plate_clear: boolean;
   // Shortest job first scheduling
@@ -1362,6 +1686,9 @@ export interface AppSettings {
   preheat_filament_targets: string;
   preheat_max_wait_seconds: number;
   preheat_soak_seconds: number;
+  queue_keep_bed_warm: boolean;
+  queue_keep_warm_bed_temp: number;
+  queue_keep_warm_max_minutes: number;
   // User-configurable presets for the printer-card popovers (JSON arrays of 3 ints).
   // Empty string = use built-in defaults.
   nozzle_temp_presets: string;
@@ -1383,11 +1710,19 @@ export interface AppSettings {
   ldap_default_group: string;
   obico_enabled: boolean;
   obico_ml_url: string;
+  bambuddy_internal_url: string;
   obico_ml_token: string;
   obico_sensitivity: 'low' | 'medium' | 'high';
   obico_action: 'notify' | 'pause' | 'pause_and_off';
   obico_poll_interval: number;
   obico_enabled_printers: string;
+  octoeverywhere_enabled: boolean;
+  octoeverywhere_api_key: string;
+  octoeverywhere_api_key_configured: boolean;
+  octoeverywhere_confidence: OctoEverywhereConfidence;
+  octoeverywhere_action: 'notify' | 'pause' | 'pause_and_off';
+  octoeverywhere_enabled_printers: string;
+  octoeverywhere_poll_interval: number;
   // Inventory forecasting global lead time
   forecast_global_lead_time_days: number;
   // Sentry mode (per-job camera recording)
@@ -1398,9 +1733,20 @@ export interface AppSettings {
   sentry_interval_enabled: boolean;
   sentry_interval_minutes: number;
   sentry_interval_retention_days: number;
+  location_sensor_poll_interval: number;
+  // JSON map of sensor category → {alertAbove, alertBelow, notifyOnAlert},
+  // seeding new storage-location sensor bindings. Empty = built-in defaults.
+  // Server-backed so two admins seed the same alert rules and a restore
+  // brings them back; see utils/locationSensorDefaults.ts.
+  location_sensor_alert_defaults: string;
 }
 
-export type AppSettingsUpdate = Partial<AppSettings>;
+export type AppSettingsUpdate = Partial<Omit<AppSettings, 'octoeverywhere_api_key_configured'>>;
+
+// Settings as a page sees them: everything from GET /settings for a user who
+// may read it, otherwise the subset /settings/ui-preferences and
+// /settings/ui-flags serve, which reports G-code snippets only as set or not.
+export type UiSettings = Partial<AppSettings> & { has_gcode_snippets?: boolean };
 
 // MQTT relay status
 export interface MQTTStatus {
@@ -1426,6 +1772,12 @@ export interface CloudLoginResponse {
   message: string;
   verification_type?: 'email' | 'totp' | null;
   tfa_key?: string | null;
+  /**
+   * Machine-readable cause of a failure. 'captcha' means Bambu's anti-abuse
+   * layer is challenging this network and no credential will be accepted until
+   * it clears — the UI must explain that in place rather than toast `message`.
+   */
+  reason?: 'captcha' | string | null;
 }
 
 // Orca Cloud types — paste-flow PKCE handshake against auth.orcaslicer.com.
@@ -1524,6 +1876,69 @@ export interface MakerworldRecentImport {
   created_at: string;
 }
 
+// Manyfold integration (#1471): a self-hosted model library, browsed and
+// searched, with single files imported into the library.
+export interface ManyfoldConfig {
+  url: string;
+  client_id: string;
+  /** The secret itself is never returned. */
+  has_client_secret: boolean;
+  configured: boolean;
+}
+
+export interface ManyfoldConfigInput {
+  url: string;
+  client_id: string;
+  /** Empty or left out keeps the stored secret. */
+  client_secret?: string;
+}
+
+export interface ManyfoldStatus {
+  configured: boolean;
+  url: string;
+}
+
+export interface ManyfoldModelSummary {
+  id: string;
+  name: string;
+}
+
+export interface ManyfoldModelList {
+  total: number;
+  page: number;
+  has_next: boolean;
+  has_previous: boolean;
+  models: ManyfoldModelSummary[];
+}
+
+export interface ManyfoldFile {
+  id: string;
+  name: string;
+  mime: string;
+  importable: boolean;
+  /** Set while the file imported earlier is still in the library. */
+  library_file: { id: number; filename: string; folder_id: number | null } | null;
+}
+
+export interface ManyfoldModel {
+  id: string;
+  name: string;
+  caption: string | null;
+  description: string | null;
+  license: string | null;
+  tags: string[];
+  url: string;
+  has_preview: boolean;
+  files: ManyfoldFile[];
+}
+
+export interface ManyfoldImportResponse {
+  library_file_id: number;
+  filename: string;
+  folder_id: number | null;
+  was_existing: boolean;
+}
+
 export interface SlicerSetting {
   setting_id: string;
   name: string;
@@ -1532,6 +1947,9 @@ export interface SlicerSetting {
   user_id: string | null;
   updated_time: string | null;
   is_custom: boolean;
+  // The id Bambu Studio puts in an AMS slot for the preset; not derivable
+  // from setting_id for every preset (#3387). Absent from older backends.
+  filament_id?: string | null;
 }
 
 export interface SpoolCatalogEntry {
@@ -1560,12 +1978,6 @@ export interface ColorCatalogEntry {
   // #1154: optional multi-colour gradient stops + visual effect.
   extra_colors?: string | null;
   effect_type?: string | null;
-}
-
-export interface ColorLookupResult {
-  found: boolean;
-  hex_color: string | null;
-  material: string | null;
 }
 
 export interface SlicerSettingsResponse {
@@ -1625,6 +2037,30 @@ export interface PresetRef {
   source: PresetSource;
   id: string;
 }
+/**
+ * Why a preset's effective values are unavailable.
+ *
+ * `sidecar_outdated` is the one that matters in practice: an install pulls its
+ * sidecar as `SIDECAR_TAG:-latest` regardless of which Bambuddy channel it is
+ * on, so a user can perfectly well be running a current Bambuddy against a
+ * sidecar that predates this endpoint. That has a one-line fix, and saying so
+ * beats a generic "could not read the values".
+ */
+export type SlicerPresetValuesReason =
+  | 'ok'
+  | 'sidecar_outdated'
+  | 'sidecar_unavailable'
+  | 'not_configured'
+  | 'preset_unresolved';
+
+export interface SlicerPresetValues {
+  /** False when the sidecar could not supply values; `values` is then empty. */
+  resolved: boolean;
+  /** Flattened key -> value map, in the string forms a process preset stores. */
+  values: Record<string, string | string[]>;
+  reason: SlicerPresetValuesReason;
+}
+
 export interface SliceRequest {
   printer_preset_id?: number;
   process_preset_id?: number;
@@ -1637,19 +2073,42 @@ export interface SliceRequest {
   // backend validator promotes a singular into a one-element list when this
   // is omitted, so legacy single-color clients keep working unchanged.
   filament_presets?: PresetRef[];
+  // Per-slot filament colour as `#RRGGBB` / `#RRGGBBAA`, same plate order as
+  // `filament_presets` (#2977). Neither slicer stores a colour on a filament
+  // *preset* -- it is a per-project property -- so without this every sliced
+  // file records the CLI's built-in #00AE42 and the print dialog reports a
+  // colour mismatch against whatever is loaded in the AMS. An empty string in
+  // any position hands that slot back to the backend's fallback chain (the
+  // preset's own default_filament_colour, then the source plate's colour).
+  filament_colours?: string[];
   plate?: number;
   export_3mf?: boolean;
   // Build-plate override (#1337). When omitted, the slicer uses the process
-  // preset's curr_bed_type as-is. Canonical values match BambuStudio /
-  // OrcaSlicer's enum: "Cool Plate", "Engineering Plate", "High Temp Plate",
-  // "Textured PEI Plate", "Smooth PEI Plate", "Cool Plate (SuperTack)",
-  // "Supertack Plate".
+  // preset's curr_bed_type as-is. A name from BambuStudio / OrcaSlicer's
+  // enum: "Cool Plate", "Engineering Plate", "High Temp Plate" (Smooth PEI),
+  // "Textured PEI Plate", "Supertack Plate", or OrcaSlicer's "Textured Cool
+  // Plate" (refused when Bambu Studio slices); the backend refuses others (#3359).
   bed_type?: string | null;
   // "Slice as designed" (#2611). 3MF only: slice using the file's embedded
   // project_settings.config (the designer's own wall count, infill, etc.)
   // instead of the picked profile triplet. The preset refs above are still
   // required by the backend validator but go unused on this path.
   use_embedded_settings?: boolean;
+  // Process settings the user edited in the slice modal's settings panel,
+  // already serialised into the string forms a process preset stores ("1" for
+  // a bool, "20%" for a percent, a list for the per-extruder vectors). Patched
+  // onto the resolved process JSON after the designer's carried tweaks, so an
+  // explicit choice here wins. Omitted when the panel is untouched.
+  process_overrides?: Record<string, string | string[]>;
+  // Design settings carried from the source 3MF (#2622) — a list of keys the
+  // file flags as changed from the system preset, not values.
+  design_overrides?: string[];
+  // Layout passes the slicer runs before slicing (#2548), both off by
+  // default because they move or rotate the objects the user laid out.
+  // Unlike the fields above these are CLI actions rather than profile
+  // values, so they apply on the embedded-settings path too.
+  auto_orient?: boolean;
+  auto_arrange?: boolean;
 }
 
 // GET /api/v1/slicer/presets — unified listing across cloud / local / standard.
@@ -1671,22 +2130,65 @@ export interface UnifiedPreset {
   // the process / filament dropdowns by the selected printer using this when
   // present (#1325).
   compatible_printers?: string[] | null;
+  // Printer presets only: the preset it was saved from, for the local and
+  // OrcaSlicer Cloud tiers (#3250).
+  inherits?: string | null;
 }
 export interface UnifiedPresetsBySlot {
   printer: UnifiedPreset[];
   process: UnifiedPreset[];
   filament: UnifiedPreset[];
 }
+// What is loaded in each connected printer, for the SliceModal's
+// "only connected printers" / "only loaded spools" filters (#3172).
+export interface LoadedSpoolPreset {
+  preset_id: string;
+  preset_name: string;
+  preset_source: string;
+  tray_info_idx?: string | null;
+}
+export interface LoadedSpoolTray {
+  ams_id: number;
+  tray_id: number;
+  tray_type: string | null;
+  tray_sub_brands: string | null;
+  tray_color: string | null;
+  tray_info_idx: string | null;
+  exists: boolean | null;
+  state: number | null;
+  saved_preset: LoadedSpoolPreset | null;
+}
+export interface LoadedSpoolUnit {
+  id: number;
+  is_ams_ht: boolean;
+  trays: LoadedSpoolTray[];
+}
+export interface LoadedSpoolPrinter {
+  id: number;
+  name: string;
+  model: string | null;
+  ams: LoadedSpoolUnit[];
+  // Holders with a spool in them; external_holders counts all of them (two
+  // on a dual-nozzle printer, labelled left and right).
+  external: LoadedSpoolTray[];
+  external_holders: number;
+}
+export interface LoadedSpoolsResponse {
+  printers: LoadedSpoolPrinter[];
+}
 export interface UnifiedPresetsResponse {
   // Priority order: local > orca_cloud > cloud > standard. No cross-tier
-  // dedup — every tier surfaces its full list so the user can pick from
-  // any source. The order drives auto-pick + visual group rendering only.
+  // dedup (apart from stock_aliases below) — every tier surfaces its full
+  // list so the user can pick from any source. The order drives auto-pick + visual group rendering only.
   orca_cloud: UnifiedPresetsBySlot;
   cloud: UnifiedPresetsBySlot;
   local: UnifiedPresetsBySlot;
   standard: UnifiedPresetsBySlot;
   cloud_status: SlicerCloudStatus;
   orca_cloud_status: SlicerCloudStatus;
+  // Standard presets that Bambu Cloud's stock list also has are left out of
+  // the standard tier (#3386); each "standard:<id>" maps to its cloud twin.
+  stock_aliases?: Record<string, PresetRef>;
 }
 
 // Slicer Pipelines (#1425) — named bundles of preset slots the SliceModal
@@ -1776,7 +2278,8 @@ export interface PipelineJob {
     | 'printing'
     | 'completed'
     | 'failed'
-    | 'cancelled';
+    | 'cancelled'
+    | 'unknown';
   error_message: string | null;
   dispatched_at: string | null;
   completed_at: string | null;
@@ -1829,6 +2332,11 @@ export interface SliceResponse {
   filament_used_g: number;
   filament_used_mm: number;
   used_embedded_settings: boolean;
+  /** Why the result could not be written to the external folder the source
+   * lives in, and so went to managed storage instead. Null on every normal
+   * slice. Surfaced to the user — a file filed somewhere they aren't looking
+   * with no signal is what made #2810 invisible from the UI. */
+  external_write_fallback?: string | null;
 }
 
 export interface SliceArchiveResponse {
@@ -2201,6 +2709,131 @@ export interface HATestConnectionResult {
   error: string | null;
 }
 
+// A Home Assistant entity bound to a printer for display on its card (#1148, #448).
+// Read-only: unlike a SmartPlug there is nothing here to switch.
+export interface PrinterHASensor {
+  id: number;
+  printer_id: number;
+  name: string;
+  entity_id: string;
+  kind: 'binary' | 'numeric';
+  device_class: string | null;  // HA's own class: "door", "temperature", ...
+  unit: string | null;  // numeric sensors only
+  // What counts as needing attention. Binary sensors use alert_state, numeric
+  // ones the thresholds; all null means the sensor is display-only.
+  alert_state: 'on' | 'off' | null;
+  alert_above: number | null;
+  alert_below: number | null;
+  block_print: boolean;  // hold the printer's queue while alerting
+  notify_on_alert: boolean;
+  show_on_printer_card: boolean;
+  sort_order: number;
+  last_state: string | null;
+  last_changed: string | null;
+  last_checked: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PrinterHASensorReading {
+  id: number;
+  name: string;
+  entity_id: string;
+  kind: 'binary' | 'numeric';
+  device_class: string | null;
+  unit: string | null;
+  state: string | null;  // null when unreadable or not yet polled
+  value: number | null;  // numeric sensors only
+  alerting: boolean;
+  block_print: boolean;
+  reachable: boolean;
+  last_changed: string | null;
+}
+
+export interface PrinterHASensorCreate {
+  printer_id: number;
+  name: string;
+  entity_id: string;
+  kind: 'binary' | 'numeric';
+  device_class?: string | null;
+  unit?: string | null;
+  alert_state?: 'on' | 'off' | null;
+  alert_above?: number | null;
+  alert_below?: number | null;
+  block_print?: boolean;
+  notify_on_alert?: boolean;
+  show_on_printer_card?: boolean;
+  sort_order?: number;
+}
+
+export type PrinterHASensorUpdate = Partial<Omit<PrinterHASensorCreate, 'printer_id'>>;
+
+export interface LocationHASensor {
+  id: number;
+  location_id: number;
+  name: string;
+  entity_id: string;
+  kind: 'binary' | 'numeric';
+  device_class: string | null;
+  unit: string | null;
+  alert_state: 'on' | 'off' | null;
+  alert_above: number | null;
+  alert_below: number | null;
+  notify_on_alert: boolean;
+  show_on_card: boolean;
+  sort_order: number;
+  last_state: string | null;
+  last_changed: string | null;
+  last_checked: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface LocationHASensorReading {
+  id: number;
+  name: string;
+  entity_id: string;
+  kind: 'binary' | 'numeric';
+  device_class: string | null;
+  unit: string | null;
+  state: string | null;
+  value: number | null;
+  alerting: boolean;
+  reachable: boolean;
+  alert_state: string | null;
+  alert_above: number | null;
+  alert_below: number | null;
+  last_changed: string | null;
+  show_on_card: boolean;
+}
+
+export interface LocationHASensorCreate {
+  location_id: number;
+  name: string;
+  entity_id: string;
+  kind: 'binary' | 'numeric';
+  device_class?: string | null;
+  unit?: string | null;
+  alert_state?: 'on' | 'off' | null;
+  alert_above?: number | null;
+  alert_below?: number | null;
+  notify_on_alert?: boolean;
+  show_on_card?: boolean;
+  sort_order?: number;
+}
+
+export type LocationHASensorUpdate = Partial<Omit<LocationHASensorCreate, 'location_id'>>;
+
+// An entity offered by the binding picker.
+export interface HADisplayEntity {
+  entity_id: string;
+  friendly_name: string;
+  state: string | null;
+  domain: string;  // "binary_sensor" | "sensor"
+  device_class: string | null;
+  unit_of_measurement: string | null;
+}
+
 export interface SmartPlugEnergy {
   power: number | null;  // Current watts
   voltage: number | null;  // Volts
@@ -2260,10 +2893,21 @@ export interface PrintQueueItem {
   target_model: string | null;  // Target printer model for model-based assignment
   target_location: string | null;  // Target location filter for model-based assignment
   required_filament_types: string[] | null;  // Required filament types for model-based assignment
-  waiting_reason: string | null;  // Why a model-based job hasn't started yet
+  waiting_reason: string | null;  // Why this job hasn't started yet (empty once it can)
+  // Cross-model alternatives (#671), in priority order. Empty for ordinary
+  // items. Present until dispatch resolves one, after which library_file_id and
+  // target_model name the candidate that actually ran.
+  variants?: Array<{
+    library_file_id: number;
+    filename: string;
+    target_model: string;
+    position: number;
+  }>;
   // Either archive_id OR library_file_id must be set (archive created at print start)
   archive_id: number | null;
   library_file_id: number | null;
+  cost_center_id: number | null;
+  estimated_cost: number | null;
   position: number;
   scheduled_time: string | null;
   require_previous_success: boolean;
@@ -2293,6 +2937,8 @@ export interface PrintQueueItem {
   timelapse: boolean;
   use_ams: boolean;
   nozzle_offset_cali: CalibrationMode;
+  // Ask for a post-print outcome verdict when this job completes (#1898)
+  confirm_outcome: boolean;
   preheat_override: 'inherit' | 'on' | 'off';
   preheat_chamber_target_override: number | null;
   status: 'pending' | 'printing' | 'completed' | 'failed' | 'skipped' | 'cancelled';
@@ -2328,6 +2974,54 @@ export interface PrintQueueItem {
   script_processing?: boolean;
   script_options?: FarmScriptOptions | null;
   cleanup_library_after_dispatch?: boolean;
+  /** Which rack position each filament group prints from, on a nozzle-rack
+   *  machine (#1784): `{ [group_id]: 1-based position }`. Re-checked against
+   *  the live rack at dispatch; omit to have the dispatcher assign them. */
+  nozzle_rack_choice?: Record<number, number> | null;
+  /** Slots sent with a spool of another colour than the file asks for
+   *  (#3279). Worked out when the job is sent; null when every slot got its
+   *  colour or nothing could be compared. */
+  color_substitutions?: ColorSubstitution[] | null;
+}
+
+/** One slot printed in another colour than the file asked for (#3279). */
+export interface ColorSubstitution {
+  slot_id: number;
+  type: string;
+  /** `#RRGGBB` the file asks for, after overrides. */
+  wanted: string;
+  /** `#RRGGBB` of the spool the slot was sent with. */
+  got: string;
+  tray: number;
+}
+
+export interface PrintBatchPlateTarget {
+  plate_id: number | null;
+  plate_name?: string | null;
+  quantity_target: number;
+  sort_order?: number;
+}
+
+export interface PrintBatchPlateProgress {
+  plate_id: number | null;
+  plate_name: string | null;
+  quantity_target: number;
+  dispatched: number;
+  remaining: number;
+  pending_count: number;
+  printing_count: number;
+  completed_count: number;
+  failed_count: number;
+  cancelled_count: number;
+  skipped_count: number;
+  /** Measured from finished runs; null until one has produced a cost. */
+  actual_cost: number | null;
+  estimated_remaining_cost: number | null;
+  filament_used_grams: number | null;
+  print_time_seconds: number;
+  /** False when this plate owes runs but has no queue item left to clone
+   *  their configuration from, so queueing it could only fail (#2960). */
+  can_dispatch: boolean;
 }
 
 export interface PrintBatch {
@@ -2338,27 +3032,47 @@ export interface PrintBatch {
   quantity: number;
   status: string;
   created_at: string;
+  completed_at: string | null;
   created_by_id: number | null;
   created_by_username: string | null;
+  project_id: number | null;
+  due_date: string | null;
+  notes: string | null;
+  /** Set when an integration (e.g. a shop connector) created the batch. */
+  external_source: string | null;
+  external_ref: string | null;
   pending_count: number;
   printing_count: number;
   completed_count: number;
   failed_count: number;
   cancelled_count: number;
+  skipped_count: number;
+  /** False for batches created before per-plate targets existed (#342):
+   *  they report progress but owe nothing and cannot be dispatched from. */
+  has_targets: boolean;
+  target_count: number;
+  remaining_count: number;
+  /** Of remaining_count, how many runs can actually be queued (#2960). */
+  dispatchable_count: number;
+  actual_cost: number | null;
+  estimated_remaining_cost: number | null;
+  filament_used_grams: number | null;
+  print_time_seconds: number;
+  plates: PrintBatchPlateProgress[];
 }
 
 export interface PrintQueueItemCreate {
   printer_id?: number | null;  // null = unassigned
   target_model?: string | null;  // Target printer model (mutually exclusive with printer_id)
   target_location?: string | null;  // Target location filter (only used with target_model)
-  filament_overrides?: Array<{ slot_id: number; type: string; color: string; color_name?: string; force_color_match?: boolean }> | null;
+  filament_overrides?: Array<{ slot_id: number; type: string; color: string; color_name?: string; tray_info_idx?: string; force_color_match?: boolean }> | null;
   archive_id?: number | null;
   library_file_id?: number | null;
   scheduled_time?: string | null;
   require_previous_success?: boolean;
   auto_off_after?: boolean;
   manual_start?: boolean;  // Requires manual trigger to start (staged)
-  insert_at_top?: boolean;  // Insert ahead of other pending items in the same queue scope
+  insert_at_top?: boolean;  // Insert ahead of other pending items (one queue order across all printers, #3200)
   insert_position?: number | null;  // 1-indexed insertion position for priority queueing
   // PrintModal "Print Anyway" on the deficit warning — persisted so the
   // scheduler doesn't immediately re-flag this item (#1698-followup).
@@ -2373,6 +3087,8 @@ export interface PrintQueueItemCreate {
   timelapse?: boolean;
   use_ams?: boolean;
   nozzle_offset_cali?: CalibrationMode;
+  // Ask for a post-print outcome verdict when this job completes (#1898)
+  confirm_outcome?: boolean;
   preheat_override?: 'inherit' | 'on' | 'off';
   preheat_chamber_target_override?: number | null;
   // Auto-print G-code injection
@@ -2386,8 +3102,30 @@ export interface PrintQueueItemCreate {
   batch_id?: number | null;
   // Project to associate the resulting archive with
   project_id?: number;
+  cost_center_id?: number | null;
+  estimated_cost?: number | null;
   // Delete transient uploaded library file after scheduler creates the archive
   cleanup_library_after_dispatch?: boolean;
+  // Cross-model alternatives (#671): several sliced files, one job, whichever
+  // printer frees up first. Mutually exclusive with printer_id (a named printer
+  // defeats the point) and with archive_id/library_file_id (these ARE the files).
+  // Order is priority — index 0 wins when several printers are idle at once.
+  variants?: QueueVariantCreate[];
+  /** Which rack position each filament group prints from, on a nozzle-rack
+   *  machine (#1784): `{ [group_id]: 1-based position }`. Re-checked against
+   *  the live rack at dispatch; omit to have the dispatcher assign them. */
+  nozzle_rack_choice?: Record<number, number> | null;
+}
+
+/** One candidate file for a cross-model queue item (#671). */
+export interface QueueVariantCreate {
+  library_file_id: number;
+  /** Read from the file's own sliced_for_model unless it declares none. */
+  target_model?: string | null;
+  plate_id?: number | null;
+  ams_mapping?: number[] | null;
+  nozzle_mapping?: number[] | null;
+  filament_overrides?: Array<{ slot_id: number; type: string; color: string; color_name?: string; tray_info_idx?: string; force_color_match?: boolean }> | null;
 }
 
 export interface PrintBatchCreate {
@@ -2398,13 +3136,37 @@ export interface PrintBatchCreate {
    *  (manual "Group as batch"). When omitted/empty, an empty batch is
    *  returned so the client can pass batch_id on subsequent addToQueue calls. */
   item_ids?: number[];
+  /** Per-plate targets. Omitting them creates a plain grouping batch. */
+  plates?: PrintBatchPlateTarget[];
+  project_id?: number | null;
+  due_date?: string | null;
+  notes?: string | null;
+}
+
+export interface PrintBatchUpdate {
+  name?: string;
+  status?: 'active' | 'cancelled';
+  /** Replaces the full target set — a plate omitted here is removed. */
+  plates?: PrintBatchPlateTarget[];
+  project_id?: number | null;
+  due_date?: string | null;
+  notes?: string | null;
+}
+
+export interface PrintBatchDispatchRequest {
+  plate_id?: number | null;
+  only_plate?: boolean;
+  /** Cap on items created across all plates; omit to queue everything owed. */
+  limit?: number;
 }
 
 export interface PrintQueueItemUpdate {
   printer_id?: number | null;  // null = unassign
+  // A deliberate filament substitution in the mapping (#2799); see PrintModal.
+  skip_filament_check?: boolean;
   target_model?: string | null;  // Target printer model (mutually exclusive with printer_id)
   target_location?: string | null;  // Target location filter (only used with target_model)
-  filament_overrides?: Array<{ slot_id: number; type: string; color: string; color_name?: string; force_color_match?: boolean }> | null;
+  filament_overrides?: Array<{ slot_id: number; type: string; color: string; color_name?: string; tray_info_idx?: string; force_color_match?: boolean }> | null;
   position?: number;
   scheduled_time?: string | null;
   require_previous_success?: boolean;
@@ -2420,6 +3182,8 @@ export interface PrintQueueItemUpdate {
   timelapse?: boolean;
   use_ams?: boolean;
   nozzle_offset_cali?: CalibrationMode;
+  // Ask for a post-print outcome verdict when this job completes (#1898)
+  confirm_outcome?: boolean;
   preheat_override?: 'inherit' | 'on' | 'off';
   preheat_chamber_target_override?: number | null;
   // Auto-print G-code injection
@@ -2427,6 +3191,12 @@ export interface PrintQueueItemUpdate {
   // Farm post-process script
   script_processing?: boolean;
   script_options?: FarmScriptOptions | null;
+  cost_center_id?: number | null;
+  estimated_cost?: number | null;
+  /** Which rack position each filament group prints from, on a nozzle-rack
+   *  machine (#1784): `{ [group_id]: 1-based position }`. Re-checked against
+   *  the live rack at dispatch; omit to have the dispatcher assign them. */
+  nozzle_rack_choice?: Record<number, number> | null;
 }
 
 export interface PrintQueueBulkUpdate {
@@ -2444,12 +3214,16 @@ export interface PrintQueueBulkUpdate {
   timelapse?: boolean;
   use_ams?: boolean;
   nozzle_offset_cali?: CalibrationMode;
+  // Ask for a post-print outcome verdict when this job completes (#1898)
+  confirm_outcome?: boolean;
   preheat_override?: 'inherit' | 'on' | 'off';
   preheat_chamber_target_override?: number | null;
   // Auto-print G-code injection
   gcode_injection?: boolean;
   // Farm post-process script
   script_processing?: boolean;
+  cost_center_id?: number | null;
+  estimated_cost?: number | null;
 }
 
 export interface PrintQueueBulkUpdateResponse {
@@ -2529,6 +3303,9 @@ export interface SlotPresetMapping {
   tray_id: number;
   preset_id: string;
   preset_name: string;
+  // Filament id the slot was configured with alongside this preset; null for
+  // rows that predate it or whose writer did not know it (#3216).
+  tray_info_idx?: string | null;
 }
 
 // Filament types
@@ -2552,7 +3329,9 @@ export interface Filament {
 }
 
 // Notification Provider types
-export type ProviderType = 'callmebot' | 'ntfy' | 'pushover' | 'telegram' | 'email' | 'discord' | 'webhook' | 'homeassistant' | 'bark';
+export type ProviderType = 'callmebot' | 'ntfy' | 'pushover' | 'telegram' | 'email' | 'discord' | 'webhook' | 'homeassistant' | 'bark' | 'gotify' | 'notify';
+// How a Telegram provider collects the outcome verdict (#3046)
+export type TelegramVerdictMode = 'buttons' | 'reactions' | 'both';
 
 export interface NotificationProvider {
   id: number;
@@ -2560,6 +3339,7 @@ export interface NotificationProvider {
   provider_type: ProviderType;
   enabled: boolean;
   config: Record<string, unknown>;
+  attach_photo: boolean;
   // Print lifecycle events
   on_print_start: boolean;
   on_print_complete: boolean;
@@ -2567,6 +3347,7 @@ export interface NotificationProvider {
   on_print_stopped: boolean;
   on_print_progress: boolean;
   on_print_missing_spool_assignment: boolean;
+  on_billing_charge_failed: boolean;
   // Printer status events
   on_printer_offline: boolean;
   on_printer_error: boolean;
@@ -2576,16 +3357,24 @@ export interface NotificationProvider {
   // AMS environmental alarms (regular AMS)
   on_ams_humidity_high: boolean;
   on_ams_temperature_high: boolean;
+  on_ams_drying_suspended: boolean;
   // AMS-HT environmental alarms
   on_ams_ht_humidity_high: boolean;
   on_ams_ht_temperature_high: boolean;
   // Build plate detection
   on_plate_not_empty: boolean;
   on_plate_clear_required: boolean;
+  // Post-print outcome confirmation (#1898)
+  on_print_confirm_request: boolean;
+  telegram_verdict_mode: TelegramVerdictMode;
   // Bed cooled
   on_bed_cooled: boolean;
+  on_ha_sensor_alert: boolean;
+  on_location_ha_sensor_alert: boolean;
   // First layer complete
   on_first_layer_complete: boolean;
+  on_print_pause_upcoming: boolean;
+  on_app_message: boolean;
   // Inventory stock alerts
   on_stock_reorder_alert: boolean;
   on_stock_break_alert: boolean;
@@ -2620,6 +3409,7 @@ export interface NotificationProviderCreate {
   provider_type: ProviderType;
   enabled?: boolean;
   config: Record<string, unknown>;
+  attach_photo?: boolean;
   // Print lifecycle events
   on_print_start?: boolean;
   on_print_complete?: boolean;
@@ -2627,6 +3417,7 @@ export interface NotificationProviderCreate {
   on_print_stopped?: boolean;
   on_print_progress?: boolean;
   on_print_missing_spool_assignment?: boolean;
+  on_billing_charge_failed?: boolean;
   // Printer status events
   on_printer_offline?: boolean;
   on_printer_error?: boolean;
@@ -2636,16 +3427,24 @@ export interface NotificationProviderCreate {
   // AMS environmental alarms (regular AMS)
   on_ams_humidity_high?: boolean;
   on_ams_temperature_high?: boolean;
+  on_ams_drying_suspended?: boolean;
   // AMS-HT environmental alarms
   on_ams_ht_humidity_high?: boolean;
   on_ams_ht_temperature_high?: boolean;
   // Build plate detection
   on_plate_not_empty?: boolean;
   on_plate_clear_required?: boolean;
+  // Post-print outcome confirmation (#1898)
+  on_print_confirm_request?: boolean;
+  telegram_verdict_mode?: TelegramVerdictMode;
   // Bed cooled
   on_bed_cooled?: boolean;
+  on_ha_sensor_alert?: boolean;
+  on_location_ha_sensor_alert?: boolean;
   // First layer complete
   on_first_layer_complete?: boolean;
+  on_print_pause_upcoming?: boolean;
+  on_app_message?: boolean;
   // Inventory stock alerts
   on_stock_reorder_alert?: boolean;
   on_stock_break_alert?: boolean;
@@ -2673,6 +3472,7 @@ export interface NotificationProviderUpdate {
   provider_type?: ProviderType;
   enabled?: boolean;
   config?: Record<string, unknown>;
+  attach_photo?: boolean;
   // Print lifecycle events
   on_print_start?: boolean;
   on_print_complete?: boolean;
@@ -2680,6 +3480,7 @@ export interface NotificationProviderUpdate {
   on_print_stopped?: boolean;
   on_print_progress?: boolean;
   on_print_missing_spool_assignment?: boolean;
+  on_billing_charge_failed?: boolean;
   // Printer status events
   on_printer_offline?: boolean;
   on_printer_error?: boolean;
@@ -2689,16 +3490,24 @@ export interface NotificationProviderUpdate {
   // AMS environmental alarms (regular AMS)
   on_ams_humidity_high?: boolean;
   on_ams_temperature_high?: boolean;
+  on_ams_drying_suspended?: boolean;
   // AMS-HT environmental alarms
   on_ams_ht_humidity_high?: boolean;
   on_ams_ht_temperature_high?: boolean;
   // Build plate detection
   on_plate_not_empty?: boolean;
   on_plate_clear_required?: boolean;
+  // Post-print outcome confirmation (#1898)
+  on_print_confirm_request?: boolean;
+  telegram_verdict_mode?: TelegramVerdictMode;
   // Bed cooled
   on_bed_cooled?: boolean;
+  on_ha_sensor_alert?: boolean;
+  on_location_ha_sensor_alert?: boolean;
   // First layer complete
   on_first_layer_complete?: boolean;
+  on_print_pause_upcoming?: boolean;
+  on_app_message?: boolean;
   // Inventory stock alerts
   on_stock_reorder_alert?: boolean;
   on_stock_break_alert?: boolean;
@@ -2789,10 +3598,92 @@ export interface GitHubBackupStatus {
   configured: boolean;
   enabled: boolean;
   is_running: boolean;
+  restore_running: boolean;
   progress: string | null;
   last_backup_at: string | null;
   last_backup_status: string | null;
   next_scheduled_run: string | null;
+}
+
+// Restore from a Git backup (#2656). Cloud profiles are absent deliberately —
+// the backup collector never writes them, so there is nothing to restore.
+export type RestoreCategory = 'kprofiles' | 'settings' | 'spools' | 'archives';
+
+export interface GitHubCommitInfo {
+  sha: string;
+  message: string;
+  author: string;
+  date: string;
+}
+
+export interface GitHubCommitListResponse {
+  success: boolean;
+  message: string;
+  branch: string;
+  commits: GitHubCommitInfo[];
+}
+
+/**
+ * Values the server interpolates into a translated note or preview detail.
+ * Kept to strings and numbers on purpose — anything richer would have to be
+ * formatted server-side and could not be translated.
+ */
+export type GitHubRestoreParams = Record<string, string | number>;
+
+export interface GitHubRestorePreviewCategory {
+  category: RestoreCategory;
+  available: boolean;
+  item_count: number;
+  /** English rendering. Used as i18next's defaultValue, never shown on its own. */
+  detail: string | null;
+  /** Key under backup.restoreFromGit.details, or null when there is no caveat. */
+  detail_code: string | null;
+  detail_params: GitHubRestoreParams;
+}
+
+export interface GitHubRestorePreview {
+  success: boolean;
+  message: string;
+  ref: string;
+  commit: GitHubCommitInfo | null;
+  metadata_version: string | null;
+  categories: GitHubRestorePreviewCategory[];
+}
+
+export interface GitHubRestoreRequest {
+  ref?: string;
+  categories: RestoreCategory[];
+  overwrite_existing?: boolean;
+}
+
+/**
+ * One tally note, as a translation code plus its parameters (#2656).
+ *
+ * Same contract as {@link LocalBackupPathCheck} one card down: the server picks
+ * the code and supplies typed params, and the client renders
+ * ``t(`backup.restoreFromGit.notes.${code}`, { ...params, defaultValue: message })``.
+ * A code the client does not know yet falls back to the English `message`
+ * rather than showing the raw key.
+ */
+export interface GitHubRestoreNote {
+  code: string;
+  params: GitHubRestoreParams;
+  message: string;
+}
+
+export interface GitHubRestoreCategoryResult {
+  restored: number;
+  skipped: number;
+  failed: number;
+  notes: GitHubRestoreNote[];
+}
+
+export interface GitHubRestoreResponse {
+  success: boolean;
+  message: string;
+  log_id: number | null;
+  ref: string | null;
+  results: Record<string, GitHubRestoreCategoryResult>;
 }
 
 export interface LocalBackupStatus {
@@ -2845,7 +3736,7 @@ export interface ObicoStatus {
   is_running: boolean;
   last_error: string | null;
   per_printer: Record<string, { class: string; frame_count: number; score: number }>;
-  thresholds: { low: number; high: number };
+  thresholds: { low: number; high: number; pause?: number };
   history: ObicoDetectionEvent[];
   enabled: boolean;
   ml_url: string;
@@ -2875,6 +3766,54 @@ export interface ObicoTestConnection {
   auth_ok: boolean | null;
 }
 
+// How sure Gadget must be before suggesting a warning or pause (API levels 1-5).
+export type OctoEverywhereConfidence = 'lowest' | 'low' | 'medium' | 'high' | 'highest';
+
+export interface OctoEverywhereDetection {
+  class: 'safe' | 'warning' | 'failure' | 'error' | 'unknown';
+  print_quality: number | null;
+  frame_count: number;
+  error?: string | null;
+  error_code: string | null;
+}
+
+export interface OctoEverywhereDetectionEvent {
+  timestamp: string;
+  printer_id: number;
+  class: OctoEverywhereDetection['class'];
+  print_quality: number | null;
+}
+
+export interface OctoEverywhereStatus {
+  enabled: boolean;
+  api_key_configured: boolean;
+  confidence: OctoEverywhereConfidence;
+  action: 'notify' | 'pause' | 'pause_and_off';
+  poll_interval: number;
+  is_running: boolean;
+  last_error: string | null;
+  last_error_code: string | null;
+  per_printer: Record<string, OctoEverywhereDetection>;
+  history: OctoEverywhereDetectionEvent[];
+  notifications: { configured: boolean; uncovered_printers: number[] };
+}
+
+export interface OctoEverywherePrinterStatus {
+  enabled: boolean;
+  // null = all printers are monitored
+  monitored_printers: number[] | null;
+  per_printer: Record<string, OctoEverywhereDetection>;
+  last_error: string | null;
+  last_error_code: string | null;
+}
+
+export interface OctoEverywhereTestConnection {
+  ok: boolean;
+  status_code: number | null;
+  error: string | null;
+  error_code: string | null;
+}
+
 export interface GitHubTestConnectionResponse {
   success: boolean;
   message: string;
@@ -2896,6 +3835,9 @@ export interface GitHubBackupTriggerResponse {
 export interface NotificationTestRequest {
   provider_type: ProviderType;
   config: Record<string, unknown>;
+  attach_photo?: boolean;
+  /** The saved provider being edited: its stored secrets fill in the placeholders. */
+  provider_id?: number;
 }
 
 export interface NotificationTestResponse {
@@ -2919,6 +3861,23 @@ export interface PushoverConfig {
   user_key: string;
   app_token: string;
   priority?: number;
+}
+
+export interface NotifyConfig {
+  device_id: string;
+  token: string;
+  icon_url?: string;
+  group_type?: string;
+  live_activities?: boolean;
+  lock_screen_widgets?: boolean;
+  live_activity_privacy?: boolean;
+  live_activity_stage?: boolean;
+  live_activity_style?: 'bar' | 'segments' | 'none';
+  live_activity_metrics?: ('progress' | 'eta' | 'layers' | 'nozzle' | 'bed' | 'chamber')[];
+  live_activity_button_url?: string;
+  live_activity_symbol?: string;
+  live_activity_tint?: string;
+  time_sensitive?: boolean;
 }
 
 export interface TelegramConfig {
@@ -2957,6 +3916,7 @@ export interface EventVariablesResponse {
   event_type: string;
   event_name: string;
   variables: string[];
+  supports_photo: boolean;
 }
 
 export interface TemplatePreviewRequest {
@@ -2999,6 +3959,15 @@ export interface SpoolmanStatus {
   enabled: boolean;
   connected: boolean;
   url: string | null;
+  native_tags?: boolean;  // Spoolman 0.27+ links tags natively
+}
+
+export interface SpoolmanTagMigrationReport {
+  dry_run: boolean;
+  moved: number[];
+  already: number;
+  slot_ids: number;
+  conflicts: Array<{ spool_id: number; tag: string; holder: number }>;  // holder -1: a filament holds the tag
 }
 
 export interface SkippedSpool {
@@ -3062,6 +4031,79 @@ export type SpoolLabelTemplate =
   | 'avery_5160'
   | 'avery_l7160';
 
+// Mirror of backend.app.services.label_renderer.LabelField, in print order (#2981).
+export const SPOOL_LABEL_FIELDS = [
+  'brand',
+  'material',
+  'hex',
+  'name',
+  'location',
+  'material_number',
+  'temps',
+  'weight',
+  'note',
+  'added',
+  'qr',
+  'spool_id',
+] as const;
+export type SpoolLabelField = (typeof SPOOL_LABEL_FIELDS)[number];
+// Mirror of DEFAULT_LABEL_FIELDS: what a label carried before fields were selectable.
+export const DEFAULT_SPOOL_LABEL_FIELDS: SpoolLabelField[] = [
+  'brand',
+  'material',
+  'hex',
+  'name',
+  'location',
+  'qr',
+  'spool_id',
+];
+
+// A sheet of identical labels in a grid, in millimetres (#3296). Mirror of
+// backend.app.schemas.label_template.SheetLayoutSpec.
+export type LabelPageSize = 'a4' | 'letter';
+export interface LabelSheetLayout {
+  page: LabelPageSize;
+  label_w_mm: number;
+  label_h_mm: number;
+  cols: number;
+  rows: number;
+  top_mm: number;
+  left_mm: number;
+  col_gap_mm: number;
+  row_gap_mm: number;
+}
+
+// A custom sheet saved under a name, shared by everyone on the install.
+export interface SavedLabelTemplate {
+  id: number;
+  name: string;
+  layout: LabelSheetLayout;
+  created_at: string;
+  updated_at: string;
+}
+
+// A built-in template, or "custom" with the sheet itself in ``layout``.
+export type SpoolLabelRequestTemplate = SpoolLabelTemplate | 'custom';
+
+export interface PrintSpoolLabelsRequest {
+  spool_ids: number[];
+  template: SpoolLabelRequestTemplate;
+  layout?: LabelSheetLayout;
+  monochrome: boolean;
+  starting_position: number;
+  fields?: SpoolLabelField[];
+  format?: 'pdf' | 'png';
+  dpi?: 203 | 300 | 600;
+}
+
+export interface PreviewSpoolLabelRequest {
+  spool_id: number;
+  template: SpoolLabelRequestTemplate;
+  layout?: LabelSheetLayout;
+  monochrome: boolean;
+  fields: SpoolLabelField[];
+}
+
 export interface InventorySpool {
   id: number;
   material: string;
@@ -3080,6 +4122,9 @@ export interface InventorySpool {
   brand: string | null;
   label_weight: number;
   core_weight: number;
+  // Spoolman-backed inventory only: true when the spool has no tare of its
+  // own and core_weight is the filament type's. Absent for local spools (#2908).
+  core_weight_is_inherited?: boolean;
   core_weight_catalog_id: number | null;
   weight_used: number;
   // Anchor for the resettable "Total Consumed" display (#1390). The
@@ -3095,6 +4140,13 @@ export interface InventorySpool {
   note: string | null;
   added_full: boolean | null;
   last_used: string | null;
+  // Spoolman mode: when the spool was first printed with (#3407).
+  first_used?: string | null;
+  // Last drying (#2863): stamped when an AMS drying run of at least half its
+  // length ends, or set by hand. Temperature and hours are null when unknown.
+  last_dried_at?: string | null;
+  last_dried_temp?: number | null;
+  last_dried_hours?: number | null;
   encode_time: string | null;
   tag_uid: string | null;
   tray_uuid: string | null;
@@ -3104,14 +4156,84 @@ export interface InventorySpool {
   created_at: string;
   updated_at: string;
   cost_per_kg: number | null;
+  // Spoolman mode: what prints are charged per kg, the spool's own price or
+  // else its filament's. Display only; the form edits cost_per_kg.
+  effective_cost_per_kg?: number | null;
   last_scale_weight: number | null;
   last_weighed_at: string | null;
   // User-defined category + per-spool low-stock threshold override (#729).
   category: string | null;
   low_stock_threshold_pct: number | null;
+  // Internal material / article number (#2870) — the purchasing identifier
+  // shared by all spools of the same product.
+  material_number: string | null;
   k_profiles?: SpoolKProfile[];
   storage_location?: string | null;
   location_id?: number | null;
+  // Supplier assignments (#2988). Absent in Spoolman mode — Spoolman's
+  // vendor is the manufacturer, not the seller, so there is no mapping.
+  suppliers?: SpoolSupplierLink[];
+}
+
+// ── Suppliers (#2988) ──────────────────────────────────────────────────────
+
+/** Where filament is bought — distinct from brand (who made it). */
+export interface Supplier {
+  id: number;
+  name: string;
+  website: string | null;
+  customer_number: string | null;
+  note: string | null;
+  /** Spools referencing this supplier; a referenced supplier cannot be deleted. */
+  spool_count: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SupplierInput {
+  name: string;
+  website?: string | null;
+  customer_number?: string | null;
+  note?: string | null;
+}
+
+/** One spool-to-supplier assignment as written by the spool dialog. */
+export interface SpoolSupplierLinkInput {
+  supplier_id: number;
+  /** The supplier's own article number — NOT the internal material number. */
+  supplier_article_number?: string | null;
+  /** Quoted price for comparison — never the cost basis (spool.cost_per_kg). */
+  quoted_price_per_kg?: number | null;
+  /** Marks where this concrete spool was actually bought. */
+  is_purchase_source?: boolean;
+}
+
+export interface SpoolSupplierLink {
+  id: number;
+  supplier_id: number;
+  supplier_name: string;
+  supplier_article_number: string | null;
+  quoted_price_per_kg: number | null;
+  is_purchase_source: boolean;
+}
+
+/** Per-supplier inventory aggregate (#2988), purchase-source spools only. */
+export interface SupplierStats {
+  supplier_id: number;
+  supplier_name: string;
+  spool_count: number;
+  remaining_g: number;
+  consumed_g: number;
+  cost: number;
+}
+
+/** Per-material-number inventory aggregate (#2870). */
+export interface MaterialNumberStats {
+  material_number: string;
+  spool_count: number;
+  remaining_g: number;
+  consumed_g: number;
+  cost: number;
 }
 
 export interface SpoolmanBulkCreateResult {
@@ -3161,7 +4283,10 @@ export interface CsvImportResult {
 
 export interface SpoolUsageRecord {
   id: number;
-  spool_id: number;
+  // null: the spool was deleted, its usage kept
+  spool_id: number | null;
+  // Spoolman mode: the Spoolman spool charged (#3407); spool_id is null then.
+  spoolman_spool_id?: number | null;
   printer_id: number | null;
   print_name: string | null;
   weight_used: number;
@@ -3196,6 +4321,119 @@ export interface SpoolKProfileInput {
   setting_id?: string | null;
 }
 
+/**
+ * One per-printer-model override of a spool's slicer filament preset.
+ *
+ * A cloud or Orca preset is bound to a printer model ("@BBL X1C"), so the
+ * spool's single `slicer_filament` is wrong as soon as the spool is used on a
+ * second model. `nozzle_diameter` is "" for the model's own default and a bare
+ * decimal ("0.2") for a per-hotend exception; the backend resolves
+ * exact (model, diameter) -> (model, "") -> the spool's own preset.
+ */
+export interface SlotSpoolDefaults {
+  slicer_filament: string | null;
+  slicer_filament_name: string | null;
+  cali_idx: number | null;
+  k_value: number | null;
+  profile_name: string | null;
+  extruder: number | null;
+  nozzle_diameter: string;
+}
+
+export interface SpoolFilamentPresetInput {
+  printer_model: string;
+  nozzle_diameter: string;
+  slicer_filament: string | null;
+  slicer_filament_name: string | null;
+}
+
+export interface SpoolFilamentPreset extends SpoolFilamentPresetInput {
+  id: number;
+  spool_id: number;
+  created_at: string;
+}
+
+/**
+ * What a new spool of one product starts with (#1326): the slicer preset, the
+ * per-model preset overrides and the K profiles. `color_name` "" is the
+ * default for every colour of the product; one with a colour wins over it per
+ * preset and per hotend. Shared by both inventory modes.
+ */
+export interface ProfileDefaultKey {
+  brand: string;
+  material: string;
+  subtype: string;
+  color_name: string;
+}
+
+export interface ProfileDefaultInput extends ProfileDefaultKey {
+  slicer_filament: string | null;
+  slicer_filament_name: string | null;
+  presets: SpoolFilamentPresetInput[];
+  k_profiles: SpoolKProfileInput[];
+}
+
+export interface ProfileDefault extends ProfileDefaultInput {
+  id: number;
+  updated_at: string;
+}
+
+/** Both levels of a product's default merged, as a create applies them. */
+export interface ResolvedProfileDefault {
+  slicer_filament: string | null;
+  slicer_filament_name: string | null;
+  presets: SpoolFilamentPresetInput[];
+  k_profiles: SpoolKProfileInput[];
+  default_ids: number[];
+}
+
+/** One inventory-bound AMS slot, as returned by `/printers/{id}/inventory-remain`. */
+export interface SlotMaterial {
+  ams_id: number;
+  tray_id: number;
+  global_tray_id: number;
+  /** Opaque grouping key from the backend. Two slots back each other up under
+   *  AMS Filament Backup only when both `material_key` and `extruder` match.
+   *  Never parse it — the format belongs to the backend's identity rule. */
+  material_key: string;
+  remaining_g: number;
+  /** 0 = right / single nozzle, 1 = left. */
+  extruder: number;
+  /** How the bound spool should be *named* — display only, never matched on.
+   *  The printer has no brand field and reports no sub-brand for a
+   *  third-party spool, so this is the only place a slot's real identity
+   *  exists. Null when the binding resolves to a spool we cannot describe. */
+  spool?: SlotSpoolIdentity | null;
+  /** Per-kg rate a print off this spool is charged at; null when unpriced,
+   *  which is charged at the default rate. Optional for an older backend. */
+  cost_per_kg?: number | null;
+}
+
+/** Display identity of an inventory-bound slot. See `SlotMaterial.spool`. */
+export interface SlotSpoolIdentity {
+  brand: string | null;
+  material: string | null;
+  subtype: string | null;
+  color_name: string | null;
+  rgba: string | null;
+  /** Comma-separated hex stops for a multi-colour spool, and the effect
+   *  overlay — the two things a tray record cannot carry, so a slot swatch
+   *  can be drawn the way the inventory row draws it (#3159).
+   *
+   *  Optional rather than required: the backend sends both keys on every
+   *  binding, but a frontend running against an older one gets neither, and
+   *  every reader here already falls back to a solid swatch. */
+  extra_colors?: string | null;
+  effect_type?: string | null;
+}
+
+export interface InventoryRemainResponse {
+  /** Currently-loaded, inventory-bound slots only — drives the prefer-lowest sort. */
+  inventory_remain_g: Record<string, number>;
+  /** Every inventory binding on the printer, with identity + extruder side. */
+  slot_materials: SlotMaterial[];
+}
+
 export interface SpoolAssignment {
   id: number;
   spool_id: number;
@@ -3210,6 +4448,7 @@ export interface SpoolAssignment {
   pending_config?: boolean;  // Slot was empty at assign time; will configure on insert
   created_at: string;
   ams_label?: string | null;  // User-defined friendly name for the AMS unit
+  printer_model?: string | null;  // names a rack printer's external inputs "Ext-n" (utils/trayIds)
 }
 
 export interface FilamentSkuSettings {
@@ -3267,6 +4506,10 @@ export interface UpdateCheckResult {
   is_windows_installer?: boolean;
   update_method?: 'docker' | 'git' | 'ha_addon' | 'windows_installer';
   installer_download_url?: string | null;
+  // Best-effort guess at the compose directory (#2664). Prefill only — the
+  // value the user saved lives on AppSettings.docker_compose_dir, so clearing
+  // that field falls back to this guess instead of resurrecting the old value.
+  compose_dir_detected?: string | null;
 }
 
 export interface UpdateStatus {
@@ -3330,25 +4573,6 @@ export interface PrinterMaintenanceOverview {
   warning_count: number;
 }
 
-export interface MaintenanceHistory {
-  id: number;
-  printer_maintenance_id: number;
-  performed_at: string;
-  hours_at_maintenance: number;
-  notes: string | null;
-}
-
-export interface MaintenanceSummary {
-  total_due: number;
-  total_warning: number;
-  printers_with_issues: Array<{
-    printer_id: number;
-    printer_name: string;
-    due_count: number;
-    warning_count: number;
-  }>;
-}
-
 // External Links (sidebar)
 export interface ExternalLink {
   id: number;
@@ -3360,6 +4584,8 @@ export interface ExternalLink {
   sort_order: number;
   created_at: string;
   updated_at: string;
+  /** Count reported by the app the link points to, while it keeps reporting. */
+  badge_count?: number | null;
 }
 
 export interface ExternalLinkCreate {
@@ -3376,6 +4602,114 @@ export interface ExternalLinkUpdate {
   open_in_new_tab?: boolean;
 }
 
+// Finance types
+export interface CostCenterSummary {
+  id: number;
+  name: string;
+  is_private: boolean;
+  owner_user_id: number | null;
+  is_active: boolean;
+  total_balance: number;
+  total_budget: number | null;
+  monthly_budget: number | null;
+  budget_mode: 'none' | 'total' | 'monthly';
+  budget_limit: number | null;
+  budget_used: number | null;
+  budget_available: number | null;
+  can_print: boolean;
+}
+
+export interface CostCenterCreateRequest {
+  name: string;
+  total_budget?: number | null;
+  monthly_budget?: number | null;
+  is_active?: boolean;
+}
+
+export interface CostCenterBudgetUpdateRequest {
+  total_budget?: number | null;
+  monthly_budget?: number | null;
+}
+
+export interface CostCenterUpdateRequest {
+  name?: string;
+  is_active?: boolean;
+}
+
+export interface CostCenterMemberRequest {
+  user_id: number;
+  can_print?: boolean;
+}
+
+export interface CostCenterMemberResponse {
+  id: number;
+  cost_center_id: number;
+  user_id: number;
+  can_print: boolean;
+  created_at: string;
+}
+
+export interface CostCenterDetail extends CostCenterSummary {
+  members: CostCenterMemberResponse[];
+}
+
+export interface WalletBalance {
+  user_id: number;
+  balance: number;
+  currency: string;
+  updated_at: string | null;
+}
+
+export type WalletTransactionType = 'print_charge' | 'deposit' | 'withdraw' | 'manual_adjustment';
+
+export interface WalletTransaction {
+  id: number;
+  user_id: number | null; // null once the user is deleted
+  cost_center_id: number | null;
+  transaction_type: WalletTransactionType;
+  amount: number;
+  balance_after: number | null;
+  description: string | null;
+  created_by_user_id: number | null;
+  print_run_id: string | null;
+  print_archive_id: number | null;
+  print_queue_id: number | null;
+  created_at: string;
+}
+
+export interface WalletTransactionListResponse {
+  items: WalletTransaction[];
+  total: number;
+  limit: number;
+  offset: number;
+}
+
+export interface WalletAdjustmentRequest {
+  amount: number;
+  description?: string;
+  cost_center_id?: number | null;
+}
+
+export interface WalletAdjustmentResponse {
+  transaction: WalletTransaction;
+  balance: WalletBalance;
+}
+
+export interface TransactionEditRequest {
+  user_id?: number | null;
+  cost_center_id?: number | null;
+  amount?: number | null;
+  description?: string | null;
+}
+
+export interface ManualPrintRequest {
+  user_id: number;
+  cost_center_id: number;
+  amount: number;
+  description?: string | null;
+  created_at?: string | null;
+}
+
 // Permission type - all available permissions
 export type Permission =
   | 'printers:read' | 'printers:create' | 'printers:update' | 'printers:delete' | 'printers:control' | 'printers:files' | 'printers:ams_rfid' | 'printers:clear_plate'
@@ -3384,7 +4718,7 @@ export type Permission =
   | 'archives:reprint_own' | 'archives:reprint_all' | 'archives:purge'
   | 'queue:read' | 'queue:read_own' | 'queue:read_all' | 'queue:create'
   | 'queue:update_own' | 'queue:update_all' | 'queue:delete_own' | 'queue:delete_all'
-  | 'queue:reorder'
+  | 'queue:reorder' | 'queue:start_unreviewed'
   | 'library:read' | 'library:read_own' | 'library:read_all' | 'library:upload'
   | 'library:update_own' | 'library:update_all' | 'library:delete_own' | 'library:delete_all'
   | 'library:purge'
@@ -3402,14 +4736,16 @@ export type Permission =
   | 'discovery:scan'
   | 'firmware:read' | 'firmware:update'
   | 'ams_history:read'
+  | 'cost_centers:read_own' | 'cost_centers:read_all' | 'cost_centers:modify' | 'cost_centers:create'
   | 'stats:read' | 'stats:filter_by_user'
   | 'system:read'
   | 'settings:read' | 'settings:update' | 'settings:backup' | 'settings:restore'
   | 'github:backup' | 'github:restore'
   | 'cloud:auth' | 'orca_cloud:auth'
   | 'makerworld:view' | 'makerworld:import'
+  | 'manyfold:view' | 'manyfold:import'
   | 'api_keys:read' | 'api_keys:create' | 'api_keys:update' | 'api_keys:delete'
-  | 'users:read' | 'users:create' | 'users:update' | 'users:delete'
+  | 'users:read' | 'users:read_slim' | 'users:create' | 'users:update' | 'users:delete'
   | 'groups:read' | 'groups:create' | 'groups:update' | 'groups:delete'
   | 'pipelines:read' | 'pipelines:write' | 'pipelines:run'
   | 'websocket:connect';
@@ -3426,6 +4762,11 @@ export interface Group {
   description: string | null;
   permissions: Permission[];
   is_system: boolean;
+  /** Members only see the printers in printer_ids plus every printer in locations (#1727) */
+  restrict_printers: boolean;
+  printer_ids: number[];
+  /** Matched against Printer.location, so printers added there later are included */
+  locations: string[];
   user_count: number;
   created_at: string;
   updated_at: string;
@@ -3439,12 +4780,18 @@ export interface GroupCreate {
   name: string;
   description?: string;
   permissions: Permission[];
+  restrict_printers?: boolean;
+  printer_ids?: number[];
+  locations?: string[];
 }
 
 export interface GroupUpdate {
   name?: string;
   description?: string;
   permissions?: Permission[];
+  restrict_printers?: boolean;
+  printer_ids?: number[];
+  locations?: string[];
 }
 
 export interface PermissionInfo {
@@ -3497,6 +4844,17 @@ export interface UserResponse {
   groups: GroupBrief[];
   permissions: Permission[];  // All permissions from groups
   created_at: string;
+}
+
+/**
+ * Just enough to label an owner id (#1894). Backed by GET /users/slim, which
+ * is readable with `users:read_slim` as well as the admin-level `users:read`
+ * -- use it anywhere a screen only needs to turn a `created_by_id` into a
+ * name, so operators are not forced into the full listing to get one.
+ */
+export interface UserSlim {
+  id: number;
+  username: string;
 }
 
 export interface UserCreate {
@@ -3593,6 +4951,16 @@ export interface TwoFAVerifyRequest {
 export type SameOriginUrl = string & { readonly __brand: 'SameOriginUrl' };
 
 // OIDC interfaces
+/** What the unauthenticated GET /auth/oidc/providers returns (#3107): only
+ *  what the login page renders. The full provider, group sync config
+ *  included, needs the admin-only /auth/oidc/providers/all. */
+export interface OIDCProviderPublic {
+  id: number;
+  name: string;
+  has_icon: boolean;
+  is_autologin: boolean;
+}
+
 export interface OIDCProvider {
   id: number;
   name: string;
@@ -3604,6 +4972,9 @@ export interface OIDCProvider {
   auto_link_existing_accounts: boolean;
   email_claim: string;
   require_email_verified: boolean;
+  // #3107 — group sync. Empty mapping = sync off (default).
+  group_claim?: string;
+  group_mapping?: Record<string, string>;
   icon_url?: string | null;
   default_group_id?: number | null;
   // True when the backend has cached icon bytes for this provider.
@@ -3635,6 +5006,9 @@ export interface OIDCProviderCreate {
   auto_link_existing_accounts?: boolean;
   email_claim?: string;
   require_email_verified?: boolean;
+  // #3107 — group sync. Omit both to leave them unchanged on update.
+  group_claim?: string;
+  group_mapping?: Record<string, string>;
   icon_url?: string | null;
   default_group_id?: number | null;
   is_autologin?: boolean;  // #1589
@@ -3650,6 +5024,9 @@ export interface OIDCLink {
 
 export interface TestSMTPRequest {
   test_recipient: string;
+  // The form's settings, tested before they are saved. An empty password
+  // keeps the saved one.
+  smtp?: SMTPSettings;
 }
 
 export interface TestSMTPResponse {
@@ -3690,6 +5067,15 @@ export interface EncryptionStatus {
   migration_error_count: number;
 }
 
+export interface LDAPTestRequest {
+  ldap_server_url?: string;
+  ldap_bind_dn?: string;
+  ldap_bind_password?: string;
+  ldap_search_base?: string;
+  ldap_user_filter?: string;
+  ldap_security?: string;
+}
+
 export interface LDAPTestResponse {
   success: boolean;
   message: string;
@@ -3714,7 +5100,136 @@ export interface AuthStatus {
 }
 
 // API functions
+export interface QueueHistoryFilters {
+  printerId?: number | null;
+  status?: string;
+  location?: string;
+}
+
+export interface QueueHistoryParams extends QueueHistoryFilters {
+  sortBy?: 'date' | 'name' | 'printer';
+  // Flips the default order: newest first by date, A to Z by name or printer.
+  reverse?: boolean;
+  limit?: number;
+  offset?: number;
+}
+
+export interface QueueHistoryPage {
+  // The page in display order, then any other runs of the batches on it.
+  items: PrintQueueItem[];
+  total: number;
+  locations: string[];
+}
+
+function queueHistorySearch(params: QueueHistoryParams): URLSearchParams {
+  const search = new URLSearchParams();
+  if (params.printerId) search.set('printer_id', String(params.printerId));
+  if (params.status) search.set('status', params.status);
+  if (params.location) search.set('location', params.location);
+  if (params.sortBy) search.set('sort_by', params.sortBy);
+  if (params.reverse) search.set('reverse', 'true');
+  if (params.limit !== undefined) search.set('limit', String(params.limit));
+  if (params.offset) search.set('offset', String(params.offset));
+  return search;
+}
+
+// Per-printer reads that a page showing every printer makes once per printer,
+// coalesced into one bulk request per few milliseconds (see ./batch). Each
+// keeps its single-printer request for a lone id.
+const idsParam = (ids: number[]) => `ids=${ids.join(',')}`;
+
+const printerStatusBatch = batched(
+  (id) => request<PrinterStatus>(`/printers/${id}/status`),
+  async (ids) => byField(await request<PrinterStatus[]>(`/bulk/printer-statuses?${idsParam(ids)}`), (s) => s.id),
+);
+
+const slotPresetsBatch = batched(
+  (id) => request<Record<number, SlotPresetMapping>>(`/printers/${id}/slot-presets`),
+  async (ids) => byId(await request<Record<string, Record<number, SlotPresetMapping>>>(`/bulk/slot-presets?${idsParam(ids)}`)),
+);
+
+const amsLabelsBatch = batched(
+  (id) => request<Record<number, string>>(`/printers/${id}/ams-labels`),
+  async (ids) => byId(await request<Record<string, Record<number, string>>>(`/bulk/ams-labels?${idsParam(ids)}`)),
+);
+
+type PrinterCardPlugs = { plug: SmartPlug | null; scripts: SmartPlug[] };
+const cardPlugs = async (ids: number[]) =>
+  byId(await request<Record<string, PrinterCardPlugs>>(`/bulk/card-plugs?${idsParam(ids)}`));
+
+const smartPlugBatch = batched(
+  (id) => request<SmartPlug | null>(`/smart-plugs/by-printer/${id}`),
+  async (ids) => new Map([...(await cardPlugs(ids))].map(([id, plugs]) => [id, plugs.plug])),
+);
+
+const scriptPlugsBatch = batched(
+  (id) => request<SmartPlug[]>(`/smart-plugs/by-printer/${id}/scripts`),
+  async (ids) => new Map([...(await cardPlugs(ids))].map(([id, plugs]) => [id, plugs.scripts])),
+);
+
+const haSensorReadingsBatch = batched(
+  (id) => request<PrinterHASensorReading[]>(`/ha-sensors/by-printer/${id}/readings`),
+  async (ids) => byId(await request<Record<string, PrinterHASensorReading[]>>(`/bulk/ha-sensor-readings?${idsParam(ids)}`)),
+);
+
+const firmwareUpdateBatch = batched(
+  (id) => request<FirmwareUpdateInfo>(`/firmware/updates/${id}`),
+  async (ids) =>
+    byField(await request<FirmwareUpdateInfo[]>(`/bulk/firmware-updates?${idsParam(ids)}`), (u) => u.printer_id),
+);
+
+// One batcher per status asked for: the bulk route takes a single status list.
+const printerQueueBatches = new Map<string, (id: number) => Promise<PrintQueueItem[]>>();
+const printerQueueBatch = (status: string) => {
+  let batch = printerQueueBatches.get(status);
+  if (!batch) {
+    batch = batched(
+      (id) => request<PrintQueueItem[]>(`/queue/?printer_id=${id}&status=${encodeURIComponent(status)}`),
+      async (ids) =>
+        byId(
+          await request<Record<string, PrintQueueItem[]>>(
+            `/bulk/printer-queues?${idsParam(ids)}&status=${encodeURIComponent(status)}`,
+          ),
+        ),
+    );
+    printerQueueBatches.set(status, batch);
+  }
+  return batch;
+};
+
+const foldersByArchiveBatch = batched(
+  (id) => request<LibraryFolder[]>(`/library/folders/by-archive/${id}`),
+  async (ids) => byId(await request<Record<string, LibraryFolder[]>>(`/bulk/archive-folders?${idsParam(ids)}`)),
+);
+
 export const api = {
+  // Overlay branding
+  getOverlayLogo: async (token: string | null, signal?: AbortSignal): Promise<Blob | null> => {
+    const endpoint = token ? `/overlay-branding/logo?token=${encodeURIComponent(token)}` : '/settings/overlay-logo';
+    const response = await fetch(`${API_BASE}${endpoint}`, {
+      signal, cache: 'no-store',
+      headers: !token && authToken ? { Authorization: `Bearer ${authToken}` } : {},
+    });
+    if (response.status === 404) return null;
+    if (!response.ok) throw new Error(`HTTP ${response.status}`);
+    return response.blob();
+  },
+  uploadOverlayLogo: async (file: File): Promise<void> => {
+    const body = new FormData();
+    body.append('file', file);
+    const response = await fetch(`${API_BASE}/settings/overlay-logo`, {
+      method: 'POST', body,
+      headers: authToken ? { Authorization: `Bearer ${authToken}` } : {},
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      const detail = error?.detail;
+      const message = typeof detail === 'string' ? detail : detail?.message;
+      throw new Error(typeof message === 'string' && message ? message : `HTTP ${response.status}`);
+    }
+  },
+  deleteOverlayLogo: () => request<{ status: string }>('/settings/overlay-logo', { method: 'DELETE' }),
+
   // Authentication
   getAuthStatus: () => request<AuthStatus>('/auth/status'),
   setupAuth: (data: SetupRequest) =>
@@ -3761,9 +5276,12 @@ export const api = {
   // LDAP Authentication
   getLDAPStatus: () => request<LDAPStatus>('/auth/ldap/status'),
   getEncryptionStatus: () => request<EncryptionStatus>('/auth/encryption-status'),
-  testLDAP: () =>
+  // form: the settings being edited, tested before they are saved. An empty
+  // bind password keeps the saved one.
+  testLDAP: (form?: LDAPTestRequest) =>
     request<LDAPTestResponse>('/auth/ldap/test', {
       method: 'POST',
+      ...(form ? { body: JSON.stringify(form) } : {}),
     }),
   searchLDAPDirectory: (q: string) =>
     request<LDAPSearchResult[]>(`/auth/ldap/search?q=${encodeURIComponent(q)}`),
@@ -3840,11 +5358,16 @@ export const api = {
     }),
 
   // 2FA - admin
-  admin2FADisable: (userId: number) =>
-    request<{ message: string }>(`/auth/2fa/admin/${userId}`, { method: 'DELETE' }),
+  // adminPassword: the calling admin's own password; null for an admin
+  // without one (LDAP / OIDC accounts usually), whom the route does not ask.
+  admin2FADisable: (userId: number, adminPassword: string | null) =>
+    request<{ message: string; had_2fa: boolean }>(`/auth/2fa/admin/${userId}`, {
+      method: 'DELETE',
+      body: JSON.stringify({ admin_password: adminPassword }),
+    }),
 
   // OIDC providers (public list)
-  getOIDCProviders: () => request<OIDCProvider[]>('/auth/oidc/providers'),
+  getOIDCProviders: () => request<OIDCProviderPublic[]>('/auth/oidc/providers'),
 
   // OIDC providers (admin)
   getOIDCProvidersAll: () => request<OIDCProvider[]>('/auth/oidc/providers/all'),
@@ -3890,7 +5413,7 @@ export const api = {
 
   // Users
   getUsers: () => request<UserResponse[]>('/users/'),
-  getUser: (id: number) => request<UserResponse>(`/users/${id}`),
+  getUsersSlim: () => request<UserSlim[]>('/users/slim'),
   createUser: (data: UserCreate) =>
     request<UserResponse>('/users/', {
       method: 'POST',
@@ -3940,14 +5463,6 @@ export const api = {
     request<void>(`/groups/${id}`, {
       method: 'DELETE',
     }),
-  addUserToGroup: (groupId: number, userId: number) =>
-    request<void>(`/groups/${groupId}/users/${userId}`, {
-      method: 'POST',
-    }),
-  removeUserFromGroup: (groupId: number, userId: number) =>
-    request<void>(`/groups/${groupId}/users/${userId}`, {
-      method: 'DELETE',
-    }),
 
   // Printers
   getPrinters: () => request<Printer[]>('/printers/'),
@@ -3962,6 +5477,21 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(data),
     }),
+  getWledPresets: (id: number, baseUrl: string) =>
+    request<WLEDPreset[]>(`/printers/${id}/wled/presets`, {
+      method: 'POST',
+      body: JSON.stringify({ base_url: baseUrl }),
+    }),
+  testWledConnection: (id: number, baseUrl: string) =>
+    request<WLEDConnectionInfo>(`/printers/${id}/wled/test-connection`, {
+      method: 'POST',
+      body: JSON.stringify({ base_url: baseUrl }),
+    }),
+  testWledPreset: (id: number, baseUrl: string, presetId: number) =>
+    request<{ success: boolean }>(`/printers/${id}/wled/test-preset`, {
+      method: 'POST',
+      body: JSON.stringify({ base_url: baseUrl, preset_id: presetId }),
+    }),
   deletePrinter: (id: number, deleteArchives: boolean = true) =>
     request<{ status: string; archives_deleted: boolean }>(
       `/printers/${id}?delete_archives=${deleteArchives}`,
@@ -3974,8 +5504,22 @@ export const api = {
     if (location) params.set('location', location);
     return request<Array<{ type: string; color: string; tray_info_idx: string; tray_sub_brands: string; extruder_id: number | null }>>(`/printers/available-filaments?${params}`);
   },
-  getPrinterStatus: (id: number) =>
-    request<PrinterStatus>(`/printers/${id}/status`),
+  getPrinterLocations: () => request<PrinterLocation[]>('/printer-locations/'),
+  createPrinterLocation: (data: { name: string; icon?: string | null; color?: string | null }) =>
+    request<PrinterLocation>('/printer-locations/', { method: 'POST', body: JSON.stringify(data) }),
+  updatePrinterLocation: (data: PrinterLocationUpdate) =>
+    request<PrinterLocation>('/printer-locations/', { method: 'PATCH', body: JSON.stringify(data) }),
+  deletePrinterLocations: (names: string[]) =>
+    request<{ deleted: number; printers_ungrouped: number }>('/printer-locations/delete', {
+      method: 'POST',
+      body: JSON.stringify({ names }),
+    }),
+  assignPrinterLocation: (printerIds: number[], location: string | null) =>
+    request<{ moved: number }>('/printer-locations/assign', {
+      method: 'POST',
+      body: JSON.stringify({ printer_ids: printerIds, location }),
+    }),
+  getPrinterStatus: (id: number) => printerStatusBatch(id),
   refreshPrinterStatus: (id: number) =>
     request<{ status: string }>(`/printers/${id}/refresh-status`, {
       method: 'POST',
@@ -3984,18 +5528,19 @@ export const api = {
     request<{ connected: boolean }>(`/printers/${id}/connect`, {
       method: 'POST',
     }),
-  disconnectPrinter: (id: number) =>
-    request<{ connected: boolean }>(`/printers/${id}/disconnect`, {
-      method: 'POST',
-    }),
+  getUsbCameras: () => request<{ cameras: UsbCamera[] }>('/printers/usb-cameras'),
   testExternalCamera: (printerId: number, url: string, cameraType: string) =>
     // `coalesced` is true when the frame came from a capture that was already
     // running (Obico polling, a snapshot) rather than a connection this test
     // opened — a single-reader camera is shared rather than opened twice, so
     // the result is real but says nothing about reaching the camera just now.
-    request<{ success: boolean; error?: string; resolution?: string; coalesced?: boolean }>(
-      `/printers/${printerId}/camera/external/test?url=${encodeURIComponent(url)}&camera_type=${encodeURIComponent(cameraType)}`,
-      { method: 'POST' }
+    // `live_view` is true when the tested camera is the one a viewer is
+    // watching: the answer comes from the live frame, not a test of its own.
+    // In the body: the URL may carry the camera login, and a query string
+    // ends up in the server's access log.
+    request<{ success: boolean; error?: string; resolution?: string; coalesced?: boolean; live_view?: boolean }>(
+      `/printers/${printerId}/camera/external/test`,
+      { method: 'POST', body: JSON.stringify({ url, camera_type: cameraType }) }
     ),
 
   // Print Control
@@ -4097,6 +5642,29 @@ export const api = {
       { method: 'POST' }
     ),
 
+  // Scheduled (delayed) drying runs (#2638)
+  createScheduledDrying: (data: {
+    printer_id: number;
+    ams_id: number;
+    temp: number;
+    duration_hours: number;
+    filament?: string;
+    rotate_tray?: boolean;
+    start_after: string | null;
+  }) =>
+    request<ScheduledDrying>('/scheduled-dryings', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  // Omit printerId for the whole fleet in one request; the printer cards share
+  // that single query rather than each polling for its own id.
+  listScheduledDryings: (printerId?: number) =>
+    request<ScheduledDrying[]>(
+      printerId === undefined ? '/scheduled-dryings' : `/scheduled-dryings?printer_id=${printerId}`
+    ),
+  cancelScheduledDrying: (id: number) =>
+    request<{ status: string; id: number }>(`/scheduled-dryings/${id}`, { method: 'DELETE' }),
+
   // AMS Filament Backup (auto-switch to a backup spool when one runs out)
   setAmsFilamentBackup: (printerId: number, enabled: boolean) =>
     request<{ success: boolean; ams_filament_backup: boolean }>(
@@ -4109,7 +5677,7 @@ export const api = {
   // when computing the AMS mapping; mirrors backend `_build_inventory_remain_overrides`
   // so internal and Spoolman modes both work uniformly.
   getInventoryRemain: (printerId: number) =>
-    request<{ inventory_remain_g: Record<string, number> }>(
+    request<InventoryRemainResponse>(
       `/printers/${printerId}/inventory-remain`,
     ),
 
@@ -4148,17 +5716,25 @@ export const api = {
       { method: 'POST' }
     ),
 
-  // Load filament from a tray. trayId: 0-15 for AMS (amsId*4+slotId), 254 for external spool.
-  loadAmsTray: (printerId: number, trayId: number) =>
+  // Load filament from a tray. trayId: 0-15 for AMS (amsId*4+slotId), 28-36 for the H3C AMS 3H, 128-135 for an
+  // AMS-HT (its unit id), 254 for external spool.
+  // extruderId (0 = right, 1 = left) names the hotend to feed. Pass it only on a
+  // printer with a Filament Track Switch — there the AMS is bound to a switch
+  // inlet rather than a hotend, so the firmware cannot work the target out and
+  // drops the command. Omit it everywhere else, as BambuStudio does.
+  loadAmsTray: (printerId: number, trayId: number, extruderId?: number) =>
     request<{ success: boolean; message: string }>(
-      `/printers/${printerId}/ams/load?tray_id=${trayId}`,
+      `/printers/${printerId}/ams/load?tray_id=${trayId}` +
+        (extruderId !== undefined ? `&extruder_id=${extruderId}` : ''),
       { method: 'POST' }
     ),
 
-  // Unload the currently loaded filament.
-  unloadAms: (printerId: number) =>
+  // Unload filament. trayId names the slot to unload, which is what tells a
+  // dual-nozzle printer which of its two hotends to act on; omit it to unload
+  // whatever the printer's single tray_now field names.
+  unloadAms: (printerId: number, trayId?: number) =>
     request<{ success: boolean; message: string }>(
-      `/printers/${printerId}/ams/unload`,
+      `/printers/${printerId}/ams/unload` + (trayId !== undefined ? `?tray_id=${trayId}` : ''),
       { method: 'POST' }
     ),
 
@@ -4189,6 +5765,7 @@ export const api = {
         path: string;
         mtime?: string;
       }>;
+      warnings: Array<'printer_unavailable' | 'listing_timed_out'>;
     }>(`/printers/${printerId}/files?path=${encodeURIComponent(path)}`),
   getPrinterFileDownloadUrl: (printerId: number, path: string) =>
     `${API_BASE}/printers/${printerId}/files/download?path=${encodeURIComponent(path)}`,
@@ -4218,47 +5795,82 @@ export const api = {
       is_multi_plate: boolean;
     }>(`/printers/${printerId}/files/plates?path=${encodeURIComponent(path)}`),
   getPrinterFilePlateThumbnail: (printerId: number, plateIndex: number, path: string) =>
-    withStreamToken(`${API_BASE}/printers/${printerId}/files/plate-thumbnail/${plateIndex}?path=${encodeURIComponent(path)}`),
-  downloadPrinterFile: async (printerId: number, path: string): Promise<void> => {
-    const headers: Record<string, string> = {};
-    if (authToken) {
-      headers['Authorization'] = `Bearer ${authToken}`;
+    withMediaToken(`${API_BASE}/printers/${printerId}/files/plate-thumbnail/${plateIndex}?path=${encodeURIComponent(path)}`),
+  downloadPrinterFilesAsZip: async (
+    printerId: number,
+    paths: string[],
+    sizes: Record<string, number>,
+    filename = 'printer-files.zip',
+    asZip = true,
+    signal?: AbortSignal,
+    onProgress?: (completed: number, total: number) => void,
+  ): Promise<{ requested: number; successful: number; failed: number }> => {
+    type JobStatus = {
+      job_id: string;
+      state: 'queued' | 'preparing' | 'ready' | 'failed' | 'cancelled';
+      requested: number;
+      successful: number;
+      failed: number;
+      token: string | null;
+      message: string | null;
+    };
+    let jobId: string | null = null;
+    try {
+      if (signal?.aborted) throw new DOMException('Download cancelled', 'AbortError');
+      let status = await request<JobStatus>(`/printers/${printerId}/files/download-job`, {
+        method: 'POST',
+        body: JSON.stringify({ paths, sizes, filename, as_zip: asZip }),
+        signal,
+      });
+      jobId = status.job_id;
+      let polls = 0;
+      while (status.state === 'queued' || status.state === 'preparing') {
+        onProgress?.(status.successful + status.failed, status.requested);
+        // Small selections finish in the first seconds, so poll quickly there.
+        // A large one runs for up to half an hour, where half-second polling is
+        // thousands of requests that each re-check the caller's credentials.
+        const delay = polls < 10 ? 500 : 2000;
+        polls += 1;
+        await new Promise<void>((resolve, reject) => {
+          if (signal?.aborted) {
+            reject(new DOMException('Download cancelled', 'AbortError'));
+            return;
+          }
+          const onAbort = () => {
+            window.clearTimeout(timer);
+            reject(new DOMException('Download cancelled', 'AbortError'));
+          };
+          const timer = window.setTimeout(() => {
+            signal?.removeEventListener('abort', onAbort);
+            resolve();
+          }, delay);
+          signal?.addEventListener('abort', onAbort, { once: true });
+        });
+        status = await request<JobStatus>(`/printers/${printerId}/files/download-jobs/${jobId}`, { signal });
+      }
+      onProgress?.(status.successful + status.failed, status.requested);
+      if (status.state !== 'ready' || !status.token) {
+        throw new Error(status.message || (status.state === 'cancelled'
+          ? 'Download cancelled'
+          : 'Printer download preparation failed'));
+      }
+      const link = document.createElement('a');
+      link.href = `${API_BASE}/printers/${printerId}/files/dl/${encodeURIComponent(status.token)}/${encodeURIComponent(filename)}`;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      return {
+        requested: status.requested,
+        successful: status.successful,
+        failed: status.failed,
+      };
+    } catch (error) {
+      if (jobId) {
+        await request(`/printers/${printerId}/files/download-jobs/${jobId}`, { method: 'DELETE' }).catch(() => undefined);
+      }
+      throw error;
     }
-    const response = await fetch(
-      `${API_BASE}/printers/${printerId}/files/download?path=${encodeURIComponent(path)}`,
-      { headers }
-    );
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.detail || `HTTP ${response.status}`);
-    }
-    const disposition = response.headers.get('Content-Disposition');
-    const filename = parseContentDispositionFilename(disposition) || path.split('/').pop() || 'download';
-    const blob = await response.blob();
-    const url = window.URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = filename;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    window.URL.revokeObjectURL(url);
-  },
-  downloadPrinterFilesAsZip: async (printerId: number, paths: string[]): Promise<Blob> => {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (authToken) {
-      headers['Authorization'] = `Bearer ${authToken}`;
-    }
-    const response = await fetch(`${API_BASE}/printers/${printerId}/files/download-zip`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ paths }),
-    });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.detail || `HTTP ${response.status}`);
-    }
-    return response.blob();
   },
   deletePrinterFile: (printerId: number, path: string) =>
     request<{ status: string; path: string }>(`/printers/${printerId}/files?path=${encodeURIComponent(path)}`, {
@@ -4276,18 +5888,33 @@ export const api = {
     params.set('offset', String(offset));
     if (dateFrom) params.set('date_from', dateFrom);
     if (dateTo) params.set('date_to', dateTo);
+    addDayZone(params);
     return request<Archive[]>(`/archives/?${params}`);
   },
+  // Latest archive of every printer in one request, for the printer cards.
+  getLastArchivePerPrinter: () => request<Archive[]>('/archives/last-per-printer'),
   getArchivesSlim: (dateFrom?: string, dateTo?: string, createdById?: number) => {
     const params = new URLSearchParams();
     if (dateFrom) params.set('date_from', dateFrom);
     if (dateTo) params.set('date_to', dateTo);
+    addDayZone(params);
     if (createdById !== undefined) params.set('created_by_id', String(createdById));
     const qs = params.toString();
     return request<ArchiveSlim[]>(`/archives/slim${qs ? `?${qs}` : ''}`);
   },
-  getArchive: (id: number) => request<Archive>(`/archives/${id}`),
+  getArchive: (id: number, runId?: number | null) =>
+    request<Archive>(`/archives/${id}${runId != null ? `?run_id=${runId}` : ''}`),
   getArchiveRuns: (id: number) => request<PrintLogResponse>(`/archives/${id}/runs`),
+  // The prints of the archives the caller sees that ended between two days
+  // (archive redesign P4: the calendar), in id order.
+  getArchivePrints: (params: { dateFrom: string; dateTo: string; printerId?: number; limit?: number; offset?: number }) => {
+    const search = new URLSearchParams({ date_from: params.dateFrom, date_to: params.dateTo });
+    if (params.printerId) search.set('printer_id', String(params.printerId));
+    if (params.limit) search.set('limit', String(params.limit));
+    if (params.offset) search.set('offset', String(params.offset));
+    addDayZone(search);
+    return request<PrintLogResponse>(`/archives/prints?${search}`);
+  },
   /**
    * Pre-flight for the delete-confirm modal (#1734). Returns the number of
    * related queue items that will be removed along with the archive AND how
@@ -4297,24 +5924,19 @@ export const api = {
     request<{ related_queue_items: number; currently_printing: number }>(
       `/archives/${id}/delete-impact`
     ),
-  searchArchives: (query: string, options?: {
-    printerId?: number;
-    projectId?: number;
-    status?: string;
-    limit?: number;
-    offset?: number;
-  }) => {
-    const params = new URLSearchParams();
-    params.set('q', query);
-    if (options?.printerId) params.set('printer_id', String(options.printerId));
-    if (options?.projectId) params.set('project_id', String(options.projectId));
-    if (options?.status) params.set('status', options.status);
-    if (options?.limit) params.set('limit', String(options.limit));
-    if (options?.offset) params.set('offset', String(options.offset));
-    return request<Archive[]>(`/archives/search?${params}`);
-  },
-  rebuildSearchIndex: () => request<{ message: string }>('/archives/search/rebuild-index', { method: 'POST' }),
-  getNo3MFWarning: () => request<{ has_fallback: boolean }>('/archives/no-3mf-warning'),
+  getNo3MFWarning: () =>
+    request<{
+      has_fallback: boolean;
+      reason:
+        | 'ftps_cooloff'
+        | 'ftp_transfer_failed'
+        | 'internal_storage'
+        | 'no_external_storage'
+        | 'internal_history'
+        | null;
+    }>(
+      '/archives/no-3mf-warning',
+    ),
   updateArchive: (id: number, data: {
     printer_id?: number | null;
     project_id?: number | null;
@@ -4327,6 +5949,14 @@ export const api = {
     status?: string;
     quantity?: number;
     external_url?: string | null;
+    filament_used_grams?: number | null;
+    // Post-print outcome verdict (#1898); null clears it
+    user_verdict?: 'good' | 'reject' | null;
+    // Which surface answered. The backend only accepts the sources a client
+    // can honestly claim and defaults to 'api' when none is given.
+    user_verdict_source?: 'dialog' | 'printer_card';
+    // The run the verdict / outcome is for; omitted means the latest run.
+    run_id?: number;
   }) =>
     request<Archive>(`/archives/${id}`, {
       method: 'PATCH',
@@ -4355,6 +5985,15 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ older_than_days: olderThanDays, purge_stats: purgeStats }),
     }),
+  // Archives of one file merge into the oldest (archive redesign P2).
+  previewArchiveMerge: () => request<ArchiveMergePreview>('/archives/merge-preview'),
+  /** How many duplicate groups there are; cheap, for offering the merge. */
+  getArchiveMergeCount: () => request<{ groups: number }>('/archives/merge-count'),
+  mergeArchives: (survivorIds: number[]) =>
+    request<ArchiveMergeResult>('/archives/merge', {
+      method: 'POST',
+      body: JSON.stringify({ survivor_ids: survivorIds }),
+    }),
   getArchivePurgeSettings: () =>
     request<ArchivePurgeSettings>('/archives/purge/settings'),
   updateArchivePurgeSettings: (body: ArchivePurgeSettings) =>
@@ -4367,6 +6006,7 @@ export const api = {
     const params = new URLSearchParams();
     if (options?.dateFrom) params.set('date_from', options.dateFrom);
     if (options?.dateTo) params.set('date_to', options.dateTo);
+    addDayZone(params);
     if (options?.createdById !== undefined) params.set('created_by_id', String(options.createdById));
     const qs = params.toString();
     return request<ArchiveStats>(`/archives/stats${qs ? `?${qs}` : ''}`);
@@ -4383,14 +6023,19 @@ export const api = {
       method: 'DELETE',
     }),
   recalculateCosts: () =>
-    request<{ message: string; updated: number }>('/archives/recalculate-costs', { method: 'POST' }),
-  deduplicateArchives: () =>
-    request<{ deleted: number; errors: { id: number; error: string }[] }>('/archives/deduplicate', { method: 'POST' }),
+    request<{
+      message: string;
+      updated: number;
+      preserved: number;
+      usage_repriced: number;
+      spoolman_unreachable: number;
+    }>('/archives/recalculate-costs', { method: 'POST' }),
   getFailureAnalysis: (options?: { days?: number; dateFrom?: string; dateTo?: string; printerId?: number; projectId?: number; createdById?: number }) => {
     const params = new URLSearchParams();
     if (options?.days) params.set('days', String(options.days));
     if (options?.dateFrom) params.set('date_from', options.dateFrom);
     if (options?.dateTo) params.set('date_to', options.dateTo);
+    addDayZone(params);
     if (options?.printerId) params.set('printer_id', String(options.printerId));
     if (options?.projectId) params.set('project_id', String(options.projectId));
     if (options?.createdById !== undefined) params.set('created_by_id', String(options.createdById));
@@ -4399,8 +6044,6 @@ export const api = {
   },
   compareArchives: (archiveIds: number[]) =>
     request<ArchiveComparison>(`/archives/compare?archive_ids=${archiveIds.join(',')}`),
-  findSimilarArchives: (archiveId: number, limit = 10) =>
-    request<SimilarArchive[]>(`/archives/${archiveId}/similar?limit=${limit}`),
   exportArchives: async (options?: {
     format?: 'csv' | 'xlsx';
     fields?: string[];
@@ -4419,6 +6062,7 @@ export const api = {
     if (options?.status) params.set('status', options.status);
     if (options?.dateFrom) params.set('date_from', options.dateFrom);
     if (options?.dateTo) params.set('date_to', options.dateTo);
+    addDayZone(params);
     if (options?.search) params.set('search', options.search);
 
     const headers: Record<string, string> = {};
@@ -4475,15 +6119,9 @@ export const api = {
     const blob = await response.blob();
     return { blob, filename };
   },
-  getArchiveDuplicates: (id: number) =>
-    request<{ duplicates: ArchiveDuplicate[]; count: number }>(`/archives/${id}/duplicates`),
-  backfillContentHashes: () =>
-    request<{ updated: number; errors: Array<{ id: number; error: string }> }>('/archives/backfill-hashes', {
-      method: 'POST',
-    }),
-  getArchiveThumbnail: (id: number) => withStreamToken(`${API_BASE}/archives/${id}/thumbnail?v=${Date.now()}`),
+  getArchiveThumbnail: (id: number) => withMediaToken(`${API_BASE}/archives/${id}/thumbnail?v=${Date.now()}`),
   getArchivePlateThumbnail: (id: number, plateIndex: number) =>
-    withStreamToken(`${API_BASE}/archives/${id}/plate-thumbnail/${plateIndex}`),
+    withMediaToken(`${API_BASE}/archives/${id}/plate-thumbnail/${plateIndex}`),
   getArchiveDownload: (id: number) => `${API_BASE}/archives/${id}/download`,
   downloadArchive: async (id: number, filename?: string): Promise<void> => {
     const headers: Record<string, string> = {};
@@ -4508,8 +6146,23 @@ export const api = {
     window.URL.revokeObjectURL(url);
   },
   getArchiveGcode: (id: number) => `${API_BASE}/archives/${id}/gcode`,
-  getArchivePlatePreview: (id: number) => withStreamToken(`${API_BASE}/archives/${id}/plate-preview`),
-  getArchiveTimelapse: (id: number) => withStreamToken(`${API_BASE}/archives/${id}/timelapse?v=${Date.now()}`),
+  getArchiveTimelapse: (id: number) => withMediaToken(`${API_BASE}/archives/${id}/timelapse?v=${Date.now()}`),
+  getArchiveRunTimelapse: (id: number, runId: number) =>
+    withMediaToken(`${API_BASE}/archives/${id}/runs/${runId}/timelapse?v=${Date.now()}`),
+  downloadArchiveTimelapse: async (id: number, filename: string): Promise<void> => {
+    const prepared = await request<{ token: string; filename: string }>(
+      `/archives/${id}/media-download-token`,
+      { method: 'POST' },
+    );
+    const link = document.createElement('a');
+    link.href = `${API_BASE}/archives/${id}/media/dl/${encodeURIComponent(prepared.token)}/${encodeURIComponent(filename)}`;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  },
+  getArchivePrinterMedia: (id: number) =>
+    request<ArchivePrinterMedia>(`/archives/${id}/printer-media`),
   scanArchiveTimelapse: (id: number) =>
     request<{
       status: string;
@@ -4568,17 +6221,22 @@ export const api = {
       trimStart?: number;
       trimEnd?: number;
       speed?: number;
+      /** Music volume, 0 to 1. */
+      audioVolume?: number;
       saveMode: 'replace' | 'new';
       outputFilename?: string;
     },
     audioFile?: File
-  ): Promise<{ status: string; output_path: string | null; message: string }> => {
+  ): Promise<TimelapseJob> => {
     const formData = new FormData();
     formData.append('trim_start', String(params.trimStart ?? 0));
     if (params.trimEnd !== undefined) {
       formData.append('trim_end', String(params.trimEnd));
     }
     formData.append('speed', String(params.speed ?? 1));
+    if (params.audioVolume !== undefined) {
+      formData.append('audio_volume', String(params.audioVolume));
+    }
     formData.append('save_mode', params.saveMode);
     if (params.outputFilename) {
       formData.append('output_filename', params.outputFilename);
@@ -4601,9 +6259,20 @@ export const api = {
     }
     return response.json();
   },
+  // The archive's running or last re-encode; null when there has been none.
+  getTimelapseJob: async (archiveId: number): Promise<TimelapseJob | null> => {
+    try {
+      return await request<TimelapseJob>(`/archives/${archiveId}/timelapse/job`);
+    } catch (error) {
+      if (error instanceof ApiError && error.status === 404) return null;
+      throw error;
+    }
+  },
+  cancelTimelapseJob: (archiveId: number) =>
+    request<TimelapseJob>(`/archives/${archiveId}/timelapse/job`, { method: 'DELETE' }),
   // Photos
   getArchivePhotoUrl: (archiveId: number, filename: string) =>
-    withStreamToken(`${API_BASE}/archives/${archiveId}/photos/${encodeURIComponent(filename)}`),
+    withMediaToken(`${API_BASE}/archives/${archiveId}/photos/${encodeURIComponent(filename)}`),
   uploadArchivePhoto: async (archiveId: number, file: File): Promise<{ status: string; filename: string; photos: string[] }> => {
     const formData = new FormData();
     formData.append('file', file);
@@ -4685,8 +6354,6 @@ export const api = {
       method: 'DELETE',
     }),
   // F3D (Fusion 360 design file)
-  getF3dDownloadUrl: (archiveId: number) =>
-    `${API_BASE}/archives/${archiveId}/f3d`,
   downloadF3d: async (archiveId: number): Promise<void> => {
     const headers: Record<string, string> = {};
     if (authToken) {
@@ -4734,7 +6401,7 @@ export const api = {
 
   // QR Code
   getArchiveQRCodeUrl: (archiveId: number, size = 200) =>
-    withStreamToken(`${API_BASE}/archives/${archiveId}/qrcode?size=${size}`),
+    withMediaToken(`${API_BASE}/archives/${archiveId}/qrcode?size=${size}`),
   getArchiveCapabilities: (id: number) =>
     request<{
       has_model: boolean;
@@ -4780,8 +6447,6 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(data),
     }),
-  getArchiveProjectImageUrl: (archiveId: number, imagePath: string) =>
-    withStreamToken(`${API_BASE}/archives/${archiveId}/project-image/${encodeURIComponent(imagePath)}`),
   getArchiveForSlicer: (id: number, filename: string) => {
     const safe = filename.replace(/[/\\?#]/g, '_');
     return `${API_BASE}/archives/${id}/file/${encodeURIComponent(safe.endsWith('.3mf') ? safe : safe + '.3mf')}`;
@@ -4823,27 +6488,6 @@ export const api = {
       }>;
     }>(`/archives/${archiveId}/filament-requirements${qs.toString() ? `?${qs}` : ''}`);
   },
-  uploadArchive: async (file: File, printerId?: number): Promise<Archive> => {
-    const formData = new FormData();
-    formData.append('file', file);
-    const url = printerId
-      ? `${API_BASE}/archives/upload?printer_id=${printerId}`
-      : `${API_BASE}/archives/upload`;
-    const headers: Record<string, string> = {};
-    if (authToken) {
-      headers['Authorization'] = `Bearer ${authToken}`;
-    }
-    const response = await fetch(url, {
-      method: 'POST',
-      headers,
-      body: formData,
-    });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.detail || `HTTP ${response.status}`);
-    }
-    return response.json();
-  },
   uploadArchivesBulk: async (files: File[], printerId?: number): Promise<BulkUploadResult> => {
     const formData = new FormData();
     files.forEach((file) => formData.append('files', file));
@@ -4876,6 +6520,10 @@ export const api = {
     dateTo?: string;
     limit?: number;
     offset?: number;
+    // Sorting is server-side because paging is: ordering only the rows the
+    // client holds would sort one page, not the log (#2636).
+    sortBy?: string;
+    sortDir?: 'asc' | 'desc';
   }) => {
     const searchParams = new URLSearchParams();
     if (params?.search) searchParams.set('search', params.search);
@@ -4886,9 +6534,11 @@ export const api = {
     if (params?.dateTo) searchParams.set('date_to', params.dateTo);
     if (params?.limit) searchParams.set('limit', String(params.limit));
     if (params?.offset !== undefined) searchParams.set('offset', String(params.offset));
+    if (params?.sortBy) searchParams.set('sort_by', params.sortBy);
+    if (params?.sortDir) searchParams.set('sort_dir', params.sortDir);
     return request<PrintLogResponse>(`/print-log/?${searchParams}`);
   },
-  getPrintLogThumbnail: (id: number) => withStreamToken(`${API_BASE}/print-log/${id}/thumbnail`),
+  getPrintLogThumbnail: (id: number) => withMediaToken(`${API_BASE}/print-log/${id}/thumbnail`),
   clearPrintLog: () =>
     request<{ deleted: number }>('/print-log/', { method: 'DELETE' }),
   deletePrintLogEntry: (id: number) =>
@@ -4899,7 +6549,7 @@ export const api = {
   // archive to reach through and this is the only path to classify them.
   updatePrintLogEntry: (
     id: number,
-    body: { failure_reason?: string | null; status?: string },
+    body: { failure_reason?: string | null; status?: string; notes?: string | null },
   ) =>
     request<PrintLogEntry>(`/print-log/${id}`, {
       method: 'PATCH',
@@ -4932,14 +6582,26 @@ export const api = {
       chamber_temp_presets?: string;
       fan_speed_presets?: string;
     }>('/settings/ui-preferences'),
+  // Install configuration the app shell needs, for any signed-in user. Separate
+  // from getUiPreferences: that endpoint is public because its fields are
+  // defaults shipped with the app, while these describe how this deployment is
+  // configured. Neither requires settings:read -- which is the point, since a
+  // non-admin reading GET /settings gets a 403 and every gate that consults it
+  // silently takes its fallback (#3023). Keep in sync with _UI_FLAG_FIELDS in
+  // backend/app/api/routes/settings.py.
+  getUiFlags: () => request<UiSettings>('/settings/ui-flags'),
+  // The two above together: what a page needs from the settings when its user
+  // may not read GET /settings. See useUiSettings.
+  getUiSettings: async (): Promise<UiSettings> => {
+    const [preferences, flags] = await Promise.all([api.getUiPreferences(), api.getUiFlags()]);
+    return { ...(preferences as UiSettings), ...flags };
+  },
   updateSettings: (data: AppSettingsUpdate) =>
     request<AppSettings>('/settings/', {
       method: 'PUT',
       body: JSON.stringify(data),
     }),
   getMQTTStatus: () => request<MQTTStatus>('/settings/mqtt/status'),
-  resetSettings: () =>
-    request<AppSettings>('/settings/reset', { method: 'POST' }),
   exportBackup: async (): Promise<{ blob: Blob; filename: string }> => {
     // New simplified backup - complete database + all files
     const url = `${API_BASE}/settings/backup`;
@@ -4980,10 +6642,23 @@ export const api = {
       headers,
       body: formData,
     });
-    return response.json() as Promise<{
+    const data = (await response.json().catch(() => null)) as {
+      success?: boolean;
+      message?: string;
+      detail?: string;
+    } | null;
+    // A refused restore is an HTTPException, so the body is {detail}, not
+    // {success, message}. Returning it unmapped made `success` undefined and
+    // `message` undefined too — the modal then raised an empty error toast,
+    // which is the one case where the reason matters most (e.g. a backup this
+    // version cannot import names the columns and both versions).
+    if (!response.ok) {
+      return { success: false, message: data?.detail ?? data?.message ?? '' };
+    }
+    return (data ?? { success: false, message: '' }) as {
       success: boolean;
       message: string;
-    }>;
+    };
   },
   checkFfmpeg: () =>
     request<{ installed: boolean; path: string | null }>('/settings/check-ffmpeg'),
@@ -5076,6 +6751,36 @@ export const api = {
         folder_id: folder_id ?? null,
       }),
     }),
+  // Manyfold (#1471).
+  getManyfoldConfig: () => request<ManyfoldConfig>('/manyfold/config'),
+  updateManyfoldConfig: (data: ManyfoldConfigInput) =>
+    request<ManyfoldConfig>('/manyfold/config', { method: 'PUT', body: JSON.stringify(data) }),
+  deleteManyfoldConfig: () => request<void>('/manyfold/config', { method: 'DELETE' }),
+  testManyfoldConfig: (data: ManyfoldConfigInput) =>
+    request<{ model_count: number }>('/manyfold/config/test', { method: 'POST', body: JSON.stringify(data) }),
+  getManyfoldStatus: () => request<ManyfoldStatus>('/manyfold/status'),
+  listManyfoldModels: (query: string, page: number) => {
+    const params = new URLSearchParams({ page: String(page) });
+    if (query) params.set('q', query);
+    return request<ManyfoldModelList>(`/manyfold/models?${params.toString()}`);
+  },
+  getManyfoldModel: (modelId: string) =>
+    request<ManyfoldModel>(`/manyfold/models/${encodeURIComponent(modelId)}`),
+  /** The model's preview, or null when it has none. Fetched rather than used
+   *  as an <img src>: a failing protected <img> makes the app renew its media
+   *  token, and models without a preview answer 404. */
+  getManyfoldPreview: async (modelId: string): Promise<Blob | null> => {
+    const headers: Record<string, string> = {};
+    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
+    const response = await fetch(`${API_BASE}/manyfold/models/${encodeURIComponent(modelId)}/preview`, { headers });
+    if (!response.ok) return null;
+    return response.blob();
+  },
+  importManyfoldFile: (modelId: string, fileId: string, folderId: number | null) =>
+    request<ManyfoldImportResponse>('/manyfold/import', {
+      method: 'POST',
+      body: JSON.stringify({ model_id: modelId, file_id: fileId, folder_id: folderId }),
+    }),
   getCloudSettingDetail: (settingId: string) =>
     request<SlicerSettingDetail>(`/cloud/settings/${settingId}`),
   createCloudSetting: (data: SlicerSettingCreate) =>
@@ -5092,11 +6797,8 @@ export const api = {
     request<SlicerSettingDeleteResponse>(`/cloud/settings/${settingId}`, {
       method: 'DELETE',
     }),
-  getCloudDevices: () => request<CloudDevice[]>('/cloud/devices'),
   getCloudFields: (presetType: 'filament' | 'print' | 'process' | 'printer') =>
     request<FieldDefinitionsResponse>(`/cloud/fields/${presetType}`),
-  getAllCloudFields: () =>
-    request<Record<string, FieldDefinitionsResponse>>('/cloud/fields'),
   getFilamentInfo: (settingIds: string[]) =>
     request<Record<string, { name: string; k: number | null }>>('/cloud/filament-info', {
       method: 'POST',
@@ -5105,9 +6807,8 @@ export const api = {
 
   // Smart Plugs
   getSmartPlugs: () => request<SmartPlug[]>('/smart-plugs/'),
-  getSmartPlug: (id: number) => request<SmartPlug>(`/smart-plugs/${id}`),
-  getSmartPlugByPrinter: (printerId: number) => request<SmartPlug | null>(`/smart-plugs/by-printer/${printerId}`),
-  getScriptPlugsByPrinter: (printerId: number) => request<SmartPlug[]>(`/smart-plugs/by-printer/${printerId}/scripts`),
+  getSmartPlugByPrinter: (printerId: number) => smartPlugBatch(printerId),
+  getScriptPlugsByPrinter: (printerId: number) => scriptPlugsBatch(printerId),
   createSmartPlug: (data: SmartPlugCreate) =>
     request<SmartPlug>('/smart-plugs/', {
       method: 'POST',
@@ -5127,10 +6828,11 @@ export const api = {
     }),
   getSmartPlugStatus: (id: number) =>
     request<SmartPlugStatus>(`/smart-plugs/${id}/status`),
-  testSmartPlugConnection: (ip_address: string, username?: string | null, password?: string | null) =>
+  // plug_id: the saved plug being edited, whose stored password fills in the placeholder.
+  testSmartPlugConnection: (ip_address: string, username?: string | null, password?: string | null, plug_id?: number) =>
     request<SmartPlugTestResult>('/smart-plugs/test-connection', {
       method: 'POST',
-      body: JSON.stringify({ ip_address, username, password }),
+      body: JSON.stringify({ ip_address, username, password, plug_id }),
     }),
 
   // Tasmota Discovery (auto-detects network)
@@ -5156,11 +6858,44 @@ export const api = {
   getHASensorEntities: () =>
     request<HASensorEntity[]>('/smart-plugs/ha/sensors'),
 
+  // Home Assistant sensors bound to a printer (#1148, #448)
+  getHASensors: (printerId?: number) =>
+    request<PrinterHASensor[]>(`/ha-sensors/${printerId ? `?printer_id=${printerId}` : ''}`),
+  getHASensorReadings: (printerId: number) => haSensorReadingsBatch(printerId),
+  getBindableHAEntities: (search?: string) => {
+    const params = search ? `?search=${encodeURIComponent(search)}` : '';
+    return request<HADisplayEntity[]>(`/ha-sensors/entities${params}`);
+  },
+  createHASensor: (data: PrinterHASensorCreate) =>
+    request<PrinterHASensor>('/ha-sensors/', { method: 'POST', body: JSON.stringify(data) }),
+  updateHASensor: (id: number, data: PrinterHASensorUpdate) =>
+    request<PrinterHASensor>(`/ha-sensors/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteHASensor: (id: number) =>
+    request<{ message: string }>(`/ha-sensors/${id}`, { method: 'DELETE' }),
+
+  getLocationHASensors: (locationId?: number) =>
+    request<LocationHASensor[]>(`/location-ha-sensors/${locationId ? `?location_id=${locationId}` : ''}`),
+  getLocationHASensorReadings: (locationId: number, showOnCard = true) =>
+    request<LocationHASensorReading[]>(
+      `/location-ha-sensors/by-location/${locationId}/readings?show_on_card=${showOnCard}`
+    ),
+  getBindableLocationHAEntities: (search?: string) => {
+    const params = search ? `?search=${encodeURIComponent(search)}` : '';
+    return request<HADisplayEntity[]>(`/location-ha-sensors/entities${params}`);
+  },
+  createLocationHASensor: (data: LocationHASensorCreate) =>
+    request<LocationHASensor>('/location-ha-sensors/', { method: 'POST', body: JSON.stringify(data) }),
+  updateLocationHASensor: (id: number, data: LocationHASensorUpdate) =>
+    request<LocationHASensor>(`/location-ha-sensors/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteLocationHASensor: (id: number) =>
+    request<{ message: string }>(`/location-ha-sensors/${id}`, { method: 'DELETE' }),
+
   // REST smart plug
-  testRESTConnection: (url: string, method: string = 'GET', headers?: string | null) =>
+  // plug_id: the saved plug being edited, whose stored headers fill in the placeholder.
+  testRESTConnection: (url: string, method: string = 'GET', headers?: string | null, plug_id?: number) =>
     request<{ success: boolean; error: string | null }>('/smart-plugs/rest/test-connection', {
       method: 'POST',
-      body: JSON.stringify({ url, method, headers }),
+      body: JSON.stringify({ url, method, headers, plug_id }),
     }),
 
   // Print Queue
@@ -5171,7 +6906,17 @@ export const api = {
     if (targetModel) params.set('target_model', targetModel);
     return request<PrintQueueItem[]>(`/queue/?${params}`);
   },
-  getQueueItem: (id: number) => request<PrintQueueItem>(`/queue/${id}`),
+  // History (completed / failed / skipped / cancelled), one page at a time.
+  getQueueHistory: (params: QueueHistoryParams) =>
+    request<QueueHistoryPage>(`/queue/history?${queueHistorySearch(params)}`),
+  // Removes the history matching the same filters, server-side.
+  clearQueueHistory: (params: QueueHistoryFilters) =>
+    request<{ cleared: number; kept: number }>(`/queue/history/clear?${queueHistorySearch(params)}`, {
+      method: 'POST',
+    }),
+  // One printer's queue as GET /queue/?printer_id= returns it: its own jobs
+  // plus the "Any <model>" jobs for its model. Batched across printer cards.
+  getPrinterQueue: (printerId: number, status: string) => printerQueueBatch(status)(printerId),
   addToQueue: (data: PrintQueueItemCreate) =>
     request<PrintQueueItem>('/queue/', {
       method: 'POST',
@@ -5182,8 +6927,10 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(data),
     }),
+  /** `deleted` is false when the item was kept as cancelled instead: it is the
+   *  last run a batch order could re-queue its plate from (#2960). */
   removeFromQueue: (id: number) =>
-    request<{ message: string }>(`/queue/${id}`, { method: 'DELETE' }),
+    request<{ message: string; deleted: boolean }>(`/queue/${id}`, { method: 'DELETE' }),
   reorderQueue: (items: { id: number; position: number }[]) =>
     request<{ message: string }>('/queue/reorder', {
       method: 'POST',
@@ -5209,6 +6956,13 @@ export const api = {
    * restores skipped items whose error_message matches the gate string
    * back to pending. Returns counts so the UI can render a precise toast.
    */
+  // A job for any printer of a model waits when the last print failed on every
+  // free one; this clears the gate on the model's printers.
+  resumeModelQueueAfterFailure: (model: string) =>
+    request<{ acknowledged: number; printers: number }>(
+      `/queue/model/${encodeURIComponent(model)}/resume`,
+      { method: 'POST' },
+    ),
   resumeQueueAfterFailure: (printerId: number) =>
     request<{ acknowledged: number; restored: number }>(
       `/queue/printer/${printerId}/resume`,
@@ -5224,11 +6978,15 @@ export const api = {
     const params = status ? `?status=${status}` : '';
     return request<PrintBatch[]>(`/queue/batches${params}`);
   },
-  getBatch: (id: number) => request<PrintBatch>(`/queue/batches/${id}`),
   cancelBatch: (id: number) =>
     request<{ message: string }>(`/queue/batches/${id}`, { method: 'DELETE' }),
   createBatch: (data: PrintBatchCreate) =>
     request<PrintBatch>('/queue/batches', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  dispatchBatch: (id: number, data: PrintBatchDispatchRequest = {}) =>
+    request<PrintBatch>(`/queue/batches/${id}/dispatch`, {
       method: 'POST',
       body: JSON.stringify(data),
     }),
@@ -5242,19 +7000,92 @@ export const api = {
   getKProfiles: (printerId: number, nozzleDiameter = '0.4') =>
     request<KProfilesResponse>(`/printers/${printerId}/kprofiles/?nozzle_diameter=${nozzleDiameter}`),
   setKProfile: (printerId: number, profile: KProfileCreate) =>
-    request<{ success: boolean; message: string }>(`/printers/${printerId}/kprofiles/`, {
+    request<KProfileWriteResult>(`/printers/${printerId}/kprofiles/`, {
       method: 'POST',
       body: JSON.stringify(profile),
     }),
   deleteKProfile: (printerId: number, profile: KProfileDelete) =>
-    request<{ success: boolean; message: string }>(`/printers/${printerId}/kprofiles/`, {
+    request<KProfileWriteResult>(`/printers/${printerId}/kprofiles/`, {
       method: 'DELETE',
       body: JSON.stringify(profile),
     }),
   setKProfilesBatch: (printerId: number, profiles: KProfileCreate[]) =>
-    request<{ success: boolean; message: string }>(`/printers/${printerId}/kprofiles/batch`, {
+    request<KProfileWriteResult>(`/printers/${printerId}/kprofiles/batch`, {
       method: 'POST',
       body: JSON.stringify(profiles),
+    }),
+
+  // Finance
+  getMyBalance: () => request<WalletBalance>('/finance/me/balance'),
+  getMyTransactions: (limit = 50, offset = 0) =>
+    request<WalletTransactionListResponse>(`/finance/me/transactions?limit=${limit}&offset=${offset}`),
+  getAllTransactions: (limit = 50, offset = 0, userId?: number) => {
+    const params = new URLSearchParams();
+    params.set('limit', String(limit));
+    params.set('offset', String(offset));
+    if (userId !== undefined) params.set('user_id', String(userId));
+    return request<WalletTransactionListResponse>(`/finance/transactions?${params.toString()}`);
+  },
+  deleteTransaction: (transactionId: number) =>
+    request<{ status: string }>(`/finance/transactions/${transactionId}`, {
+      method: 'DELETE',
+    }),
+  editTransaction: (transactionId: number, data: TransactionEditRequest) =>
+    request<WalletTransaction>(`/finance/transactions/${transactionId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
+  createManualPrint: (data: ManualPrintRequest) =>
+    request<WalletTransaction>('/finance/transactions/manual', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  getMyCostCenters: () => request<CostCenterSummary[]>('/finance/cost-centers/mine'),
+  listCostCenters: (includeInactive = false) =>
+    request<CostCenterSummary[]>(`/finance/cost-centers?include_inactive=${includeInactive ? 'true' : 'false'}`),
+  createCostCenter: (data: CostCenterCreateRequest) =>
+    request<CostCenterSummary>('/finance/cost-centers', {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  updateCostCenter: (costCenterId: number, data: CostCenterUpdateRequest) =>
+    request<CostCenterSummary>(`/finance/cost-centers/${costCenterId}`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
+  updateCostCenterBudgets: (costCenterId: number, data: CostCenterBudgetUpdateRequest) =>
+    request<CostCenterSummary>(`/finance/cost-centers/${costCenterId}/budgets`, {
+      method: 'PATCH',
+      body: JSON.stringify(data),
+    }),
+  deleteCostCenter: (costCenterId: number) =>
+    request<{ status: string }>(`/finance/cost-centers/${costCenterId}`, {
+      method: 'DELETE',
+    }),
+  getCostCenter: (costCenterId: number) =>
+    request<CostCenterDetail>(`/finance/cost-centers/${costCenterId}`),
+  upsertCostCenterMember: (costCenterId: number, data: CostCenterMemberRequest) =>
+    request<CostCenterMemberResponse>(`/finance/cost-centers/${costCenterId}/members`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  removeCostCenterMember: (costCenterId: number, userId: number) =>
+    request<{ status: string }>(`/finance/cost-centers/${costCenterId}/members/${userId}`, {
+      method: 'DELETE',
+    }),
+  depositUserBalance: (userId: number, data: WalletAdjustmentRequest) =>
+    request<WalletAdjustmentResponse>(`/finance/users/${userId}/deposit`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  withdrawUserBalance: (userId: number, data: WalletAdjustmentRequest) =>
+    request<WalletAdjustmentResponse>(`/finance/users/${userId}/withdraw`, {
+      method: 'POST',
+      body: JSON.stringify(data),
+    }),
+  rebuildBalanceLedger: () =>
+    request<{ status: string }>('/finance/rebuild-balance-ledger', {
+      method: 'POST',
     }),
 
   // K-Profile Notes (stored locally, not on printer)
@@ -5265,28 +7096,16 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify({ setting_id: settingId, note }),
     }),
-  deleteKProfileNote: (printerId: number, settingId: string) =>
-    request<{ success: boolean; message: string }>(`/printers/${printerId}/kprofiles/notes/${encodeURIComponent(settingId)}`, {
-      method: 'DELETE',
-    }),
 
   // Slot Preset Mappings
-  getSlotPresets: (printerId: number) =>
-    request<Record<number, SlotPresetMapping>>(`/printers/${printerId}/slot-presets`),
-  getSlotPreset: (printerId: number, amsId: number, trayId: number) =>
-    request<SlotPresetMapping | null>(`/printers/${printerId}/slot-presets/${amsId}/${trayId}`),
-  saveSlotPreset: (printerId: number, amsId: number, trayId: number, presetId: string, presetName: string, presetSource = 'cloud') =>
-    request<SlotPresetMapping>(`/printers/${printerId}/slot-presets/${amsId}/${trayId}?preset_id=${encodeURIComponent(presetId)}&preset_name=${encodeURIComponent(presetName)}&preset_source=${encodeURIComponent(presetSource)}`, {
+  getSlotPresets: (printerId: number) => slotPresetsBatch(printerId),
+  saveSlotPreset: (printerId: number, amsId: number, trayId: number, presetId: string, presetName: string, presetSource = 'cloud', trayInfoIdx?: string) =>
+    request<SlotPresetMapping>(`/printers/${printerId}/slot-presets/${amsId}/${trayId}?preset_id=${encodeURIComponent(presetId)}&preset_name=${encodeURIComponent(presetName)}&preset_source=${encodeURIComponent(presetSource)}${trayInfoIdx ? `&tray_info_idx=${encodeURIComponent(trayInfoIdx)}` : ''}`, {
       method: 'PUT',
-    }),
-  deleteSlotPreset: (printerId: number, amsId: number, trayId: number) =>
-    request<{ success: boolean }>(`/printers/${printerId}/slot-presets/${amsId}/${trayId}`, {
-      method: 'DELETE',
     }),
 
   // AMS Labels (user-defined friendly names)
-  getAmsLabels: (printerId: number) =>
-    request<Record<number, string>>(`/printers/${printerId}/ams-labels`),
+  getAmsLabels: (printerId: number) => amsLabelsBatch(printerId),
   saveAmsLabel: (printerId: number, amsId: number, label: string, amsSerial = '') =>
     request<{ ams_id: number; label: string }>(
       `/printers/${printerId}/ams-labels/${amsId}`,
@@ -5317,6 +7136,9 @@ export const api = {
       kprofile_filament_id?: string;
       kprofile_setting_id?: string;
       k_value?: number;
+      // Orca Cloud profile the slot is set to; the backend looks up its
+      // filament id when tray_info_idx is empty (#3216).
+      orca_profile_id?: string;
     }
   ) => {
     const params = new URLSearchParams({
@@ -5341,7 +7163,19 @@ export const api = {
     if (config.k_value !== undefined && config.k_value > 0) {
       params.set('k_value', config.k_value.toString());
     }
-    return request<{ success: boolean; message: string }>(
+    if (config.orca_profile_id) {
+      params.set('orca_profile_id', config.orca_profile_id);
+    }
+    return request<{
+      success: boolean;
+      message: string;
+      // The filament id the slot was actually given.
+      tray_info_idx?: string;
+      // Why an Orca profile went out as the generic for its material, or "".
+      orca_fallback_reason?: '' | 'no_filament_id' | 'lookup_failed' | 'no_permission';
+      /** A manual K value could not be sent; the filament setting was. */
+      k_value_unsent?: boolean;
+    }>(
       `/printers/${printerId}/slots/${amsId}/${trayId}/configure?${params}`,
       { method: 'POST' }
     );
@@ -5352,14 +7186,8 @@ export const api = {
       { method: 'POST' }
     ),
 
-  // Filament Catalog (material types with cost/temp data)
-  listFilaments: () => request<Filament[]>('/filament-catalog/'),
-  getFilament: (id: number) => request<Filament>(`/filament-catalog/${id}`),
-  getFilamentsByType: (type: string) => request<Filament[]>(`/filament-catalog/by-type/${type}`),
-
   // Notification Providers
   getNotificationProviders: () => request<NotificationProvider[]>('/notifications/'),
-  getNotificationProvider: (id: number) => request<NotificationProvider>(`/notifications/${id}`),
   createNotificationProvider: (data: NotificationProviderCreate) =>
     request<NotificationProvider>('/notifications/', {
       method: 'POST',
@@ -5395,7 +7223,6 @@ export const api = {
 
   // Notification Templates
   getNotificationTemplates: () => request<NotificationTemplate[]>('/notification-templates'),
-  getNotificationTemplate: (id: number) => request<NotificationTemplate>(`/notification-templates/${id}`),
   updateNotificationTemplate: (id: number, data: NotificationTemplateUpdate) =>
     request<NotificationTemplate>(`/notification-templates/${id}`, {
       method: 'PUT',
@@ -5440,12 +7267,12 @@ export const api = {
 
   // Spoolman Integration
   getSpoolmanStatus: () => request<SpoolmanStatus>('/spoolman/status'),
-  connectSpoolman: () =>
-    request<{ success: boolean; message: string }>('/spoolman/connect', {
+  migrateSpoolmanTags: (dryRun: boolean) =>
+    request<SpoolmanTagMigrationReport>(`/spoolman/inventory/tags/migrate?dry_run=${dryRun}`, {
       method: 'POST',
     }),
-  disconnectSpoolman: () =>
-    request<{ success: boolean; message: string }>('/spoolman/disconnect', {
+  connectSpoolman: () =>
+    request<{ success: boolean; message: string }>('/spoolman/connect', {
       method: 'POST',
     }),
   syncPrinterAms: (printerId: number) =>
@@ -5456,21 +7283,8 @@ export const api = {
     request<SpoolmanSyncResult>('/spoolman/sync-all', {
       method: 'POST',
     }),
-  getSpoolmanSpools: () =>
-    request<{ spools: unknown[] }>('/spoolman/spools'),
-  /** @deprecated Use getSpoolmanInventoryFilaments() — this endpoint has no SSRF guard */
-  getSpoolmanFilaments: () =>
-    request<{ filaments: unknown[] }>('/spoolman/filaments'),
   getSpoolmanInventoryFilaments: () =>
     request<SpoolmanFilamentEntry[]>('/spoolman/inventory/filaments'),
-  patchSpoolmanFilament: (
-    filamentId: number,
-    data: { name?: string; spool_weight?: number | null; keep_existing_spools?: boolean },
-  ) =>
-    request<SpoolmanFilamentEntry>(`/spoolman/inventory/filaments/${filamentId}`, {
-      method: 'PATCH',
-      body: JSON.stringify(data),
-    }),
   getUnlinkedSpools: () =>
     request<UnlinkedSpool[]>('/spoolman/spools/unlinked'),
   getLinkedSpools: () =>
@@ -5568,7 +7382,7 @@ export const api = {
   resetSpoolConsumedCounter: (id: number) =>
     request<InventorySpool>(`/inventory/spools/${id}/reset-consumed-counter`, { method: 'POST' }),
   bulkResetSpoolConsumedCounter: (spoolIds: number[]) =>
-    request<{ reset: number }>(`/inventory/spools/reset-consumed-counter-bulk`, {
+    request<{ reset: number; not_found?: number[]; errors?: Array<{ id: number; status: number; detail: string }> }>(`/inventory/spools/reset-consumed-counter-bulk`, {
       method: 'POST',
       body: JSON.stringify({ spool_ids: spoolIds }),
     }),
@@ -5599,9 +7413,50 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(profiles),
     }),
+  /**
+   * What the spool assigned to this slot is configured to use *here* -- its
+   * per-printer-model filament preset and the K profile for this slot's hotend.
+   * Nulls when the slot holds no known spool.
+   */
+  getSlotSpoolDefaults: (printerId: number, amsId: number, trayId: number) =>
+    request<SlotSpoolDefaults>(`/printers/${printerId}/slots/${amsId}/${trayId}/spool-defaults`),
+  getSpoolFilamentPresets: (spoolId: number) =>
+    request<SpoolFilamentPreset[]>(`/inventory/spools/${spoolId}/filament-presets`),
+  saveSpoolFilamentPresets: (spoolId: number, presets: SpoolFilamentPresetInput[]) =>
+    request<SpoolFilamentPreset[]>(`/inventory/spools/${spoolId}/filament-presets`, {
+      method: 'PUT',
+      body: JSON.stringify(presets),
+    }),
+  getProfileDefaults: () => request<ProfileDefault[]>('/inventory/profile-defaults'),
+  resolveProfileDefault: (key: ProfileDefaultKey) => {
+    const params = new URLSearchParams({
+      brand: key.brand,
+      material: key.material,
+      subtype: key.subtype,
+      color_name: key.color_name,
+    });
+    return request<ResolvedProfileDefault | null>(`/inventory/profile-defaults/resolve?${params}`);
+  },
+  saveProfileDefault: (data: ProfileDefaultInput) =>
+    request<ProfileDefault>('/inventory/profile-defaults', {
+      method: 'PUT',
+      body: JSON.stringify(data),
+    }),
+  deleteProfileDefault: (defaultId: number) =>
+    request<{ status: string }>(`/inventory/profile-defaults/${defaultId}`, { method: 'DELETE' }),
+  /** Fills in what active spools of the default's product lack; the inventory mode picks the route. */
+  applyProfileDefault: (defaultId: number, spoolmanMode: boolean) =>
+    request<{ updated: number }>(
+      spoolmanMode
+        ? `/spoolman/inventory/profile-defaults/${defaultId}/apply`
+        : `/inventory/profile-defaults/${defaultId}/apply`,
+      { method: 'POST' },
+    ),
   getAssignments: (printerId?: number) =>
     request<SpoolAssignment[]>(`/inventory/assignments${printerId ? `?printer_id=${printerId}` : ''}`),
-  assignSpool: (data: { spool_id: number; printer_id: number; ams_id: number; tray_id: number }) =>
+  // move: the spool also leaves any other slot it is in, in the same
+  // transaction (#1574) -- for a scanned spool, the one in the user's hand.
+  assignSpool: (data: { spool_id: number; printer_id: number; ams_id: number; tray_id: number; move?: boolean }) =>
     request<SpoolAssignment>('/inventory/assignments', {
       method: 'POST',
       body: JSON.stringify(data),
@@ -5609,36 +7464,22 @@ export const api = {
   unassignSpool: (printerId: number, amsId: number, trayId: number) =>
     request<{ status: string }>(`/inventory/assignments/${printerId}/${amsId}/${trayId}`, { method: 'DELETE' }),
   // ── Spool label printing (#809) ──────────────────────────────────────────
-  // Both endpoints return application/pdf. Frontend opens the resulting Blob
-  // in a new tab so the user can print or save from the browser's PDF viewer.
-  printSpoolLabels: async (data: { spool_ids: number[]; template: SpoolLabelTemplate; monochrome?: boolean }): Promise<Blob> => {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
-    const response = await fetch(`${API_BASE}/inventory/labels`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(data),
-    });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.detail || `HTTP ${response.status}`);
-    }
-    return response.blob();
-  },
-  printSpoolmanSpoolLabels: async (data: { spool_ids: number[]; template: SpoolLabelTemplate; monochrome?: boolean }): Promise<Blob> => {
-    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-    if (authToken) headers['Authorization'] = `Bearer ${authToken}`;
-    const response = await fetch(`${API_BASE}/spoolman/labels`, {
-      method: 'POST',
-      headers,
-      body: JSON.stringify(data),
-    });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.detail || `HTTP ${response.status}`);
-    }
-    return response.blob();
-  },
+  // The print endpoints return a PDF, a PNG, or a ZIP of PNGs (#2981); the
+  // preview endpoints one PNG. Callers get the Blob and decide what to do.
+  printSpoolLabels: (data: PrintSpoolLabelsRequest): Promise<Blob> =>
+    postForBlob('/inventory/labels', data),
+  printSpoolmanSpoolLabels: (data: PrintSpoolLabelsRequest): Promise<Blob> =>
+    postForBlob('/spoolman/labels', data),
+  previewSpoolLabel: (data: PreviewSpoolLabelRequest, signal?: AbortSignal): Promise<Blob> =>
+    postForBlob('/inventory/labels/preview', data, signal),
+  previewSpoolmanSpoolLabel: (data: PreviewSpoolLabelRequest, signal?: AbortSignal): Promise<Blob> =>
+    postForBlob('/spoolman/labels/preview', data, signal),
+  getLabelTemplates: () => request<SavedLabelTemplate[]>('/label-templates'),
+  createLabelTemplate: (data: { name: string; layout: LabelSheetLayout }) =>
+    request<SavedLabelTemplate>('/label-templates', { method: 'POST', body: JSON.stringify(data) }),
+  updateLabelTemplate: (id: number, data: { name: string; layout: LabelSheetLayout }) =>
+    request<SavedLabelTemplate>(`/label-templates/${id}`, { method: 'PUT', body: JSON.stringify(data) }),
+  deleteLabelTemplate: (id: number) => request<void>(`/label-templates/${id}`, { method: 'DELETE' }),
   getSpoolCatalog: () =>
     request<SpoolCatalogEntry[]>('/inventory/catalog'),
   addCatalogEntry: (data: { name: string; weight: number }) =>
@@ -5651,6 +7492,37 @@ export const api = {
     request<{ deleted: number }>('/inventory/catalog/bulk-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
   resetSpoolCatalog: () =>
     request<{ status: string }>('/inventory/catalog/reset', { method: 'POST' }),
+  // ── Suppliers (#2988) — inventory master data, Locations pattern ─────────
+  getSuppliers: () =>
+    request<Supplier[]>('/inventory/suppliers'),
+  createSupplier: (data: SupplierInput) =>
+    request<Supplier>('/inventory/suppliers', { method: 'POST', body: JSON.stringify(data) }),
+  updateSupplier: (id: number, data: Partial<SupplierInput>) =>
+    request<Supplier>(`/inventory/suppliers/${id}`, { method: 'PATCH', body: JSON.stringify(data) }),
+  deleteSupplier: (id: number) =>
+    request<{ status: string }>(`/inventory/suppliers/${id}`, { method: 'DELETE' }),
+  setSpoolSuppliers: (spoolId: number, links: SpoolSupplierLinkInput[]) =>
+    request<SpoolSupplierLink[]>(`/inventory/spools/${spoolId}/suppliers`, {
+      method: 'PUT',
+      body: JSON.stringify(links),
+    }),
+  // Spoolman parity: the assignment rows live Bambuddy-side, keyed by the
+  // remote spool id — same request/response shape as the built-in inventory.
+  setSpoolmanSpoolSuppliers: (spoolmanSpoolId: number, links: SpoolSupplierLinkInput[]) =>
+    request<SpoolSupplierLink[]>(`/spoolman/inventory/spools/${spoolmanSpoolId}/suppliers`, {
+      method: 'PUT',
+      body: JSON.stringify(links),
+    }),
+  // date_from/date_to scope the usage half only, so the widget can follow the
+  // dashboard timeframe; stock stays point-in-time.
+  getSupplierStats: (dateFrom?: string, dateTo?: string) => {
+    const params = new URLSearchParams();
+    if (dateFrom) params.set('date_from', dateFrom);
+    if (dateTo) params.set('date_to', dateTo);
+    addDayZone(params);
+    const qs = params.toString();
+    return request<SupplierStats[]>(`/inventory/stats/suppliers${qs ? `?${qs}` : ''}`);
+  },
   getLocations: () =>
     request<StorageLocation[]>('/inventory/locations'),
   createLocation: (data: { name: string; identifier?: string | null }) =>
@@ -5661,8 +7533,17 @@ export const api = {
     request<{ status: string }>(`/inventory/locations/${id}`, { method: 'DELETE' }),
   getColorCatalog: () =>
     request<ColorCatalogEntry[]>('/inventory/colors'),
+  /** Flat hex→name map, plus the names collapsing it loses. ``by_material`` is
+   *  keyed ``"<material>|<hex>"`` and only carries entries that differ from the
+   *  flat answer (e.g. ``"pla matte|ffffff" -> "Ivory White"`` where the flat
+   *  map says "Jade White"). #2875. */
   getColorNameMap: () =>
-    request<{ colors: Record<string, string> }>('/inventory/colors/map'),
+    request<{
+      colors: Record<string, string>;
+      by_material?: Record<string, string>;
+      bambu?: BambuCatalogColor[];
+      preset_materials?: Record<string, string>;
+    }>('/inventory/colors/map'),
   addColorEntry: (data: {
     manufacturer: string;
     color_name: string;
@@ -5689,8 +7570,6 @@ export const api = {
     request<{ deleted: number }>('/inventory/colors/bulk-delete', { method: 'POST', body: JSON.stringify({ ids }) }),
   resetColorCatalog: () =>
     request<{ status: string }>('/inventory/colors/reset', { method: 'POST' }),
-  lookupColor: (manufacturer: string, colorName: string, material?: string) =>
-    request<ColorLookupResult>(`/inventory/colors/lookup?manufacturer=${encodeURIComponent(manufacturer)}&color_name=${encodeURIComponent(colorName)}${material ? `&material=${encodeURIComponent(material)}` : ''}`),
   searchColors: (manufacturer?: string, material?: string) =>
     request<ColorCatalogEntry[]>(`/inventory/colors/search?${manufacturer ? `manufacturer=${encodeURIComponent(manufacturer)}` : ''}${manufacturer && material ? '&' : ''}${material ? `material=${encodeURIComponent(material)}` : ''}`),
   linkTagToSpool: (spoolId: number, data: { tag_uid?: string; tray_uuid?: string; tag_type?: string; data_origin?: string }) =>
@@ -5698,14 +7577,31 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify(data),
     }),
+  // Per-material-number inventory aggregate (#2870). The date range narrows
+  // the usage half only — stock is point-in-time.
+  getMaterialNumberStats: (options?: { dateFrom?: string; dateTo?: string }) => {
+    const params = new URLSearchParams();
+    if (options?.dateFrom) params.set('date_from', options.dateFrom);
+    if (options?.dateTo) params.set('date_to', options.dateTo);
+    addDayZone(params);
+    const qs = params.toString();
+    return request<MaterialNumberStats[]>(`/inventory/stats/material-numbers${qs ? `?${qs}` : ''}`);
+  },
   getSpoolUsageHistory: (spoolId: number, limit = 50) =>
     request<SpoolUsageRecord[]>(`/inventory/spools/${spoolId}/usage?limit=${limit}`),
-  getAllUsageHistory: (limit = 100, printerId?: number) =>
-    request<SpoolUsageRecord[]>(`/inventory/usage?limit=${limit}${printerId ? `&printer_id=${printerId}` : ''}`),
+  // One inventory's at a time: ``spoolman`` for the Spoolman spools' (#3407).
+  getAllUsageHistory: (limit = 100, printerId?: number, spoolman = false) =>
+    request<SpoolUsageRecord[]>(
+      `/inventory/usage?limit=${limit}${printerId ? `&printer_id=${printerId}` : ''}${spoolman ? '&spoolman=true' : ''}`,
+    ),
+  getSpoolmanSpoolUsageHistory: (spoolId: number, limit = 50) =>
+    request<SpoolUsageRecord[]>(`/spoolman/inventory/spools/${spoolId}/usage?limit=${limit}`),
+  clearSpoolmanSpoolUsageHistory: (spoolId: number) =>
+    request<{ status: string }>(`/spoolman/inventory/spools/${spoolId}/usage`, { method: 'DELETE' }),
   clearSpoolUsageHistory: (spoolId: number) =>
     request<{ status: string }>(`/inventory/spools/${spoolId}/usage`, { method: 'DELETE' }),
   syncWeightsFromAms: () =>
-    request<{ synced: number; skipped: number }>('/inventory/sync-ams-weights', { method: 'POST' }),
+    request<{ synced: number; skipped: number; printing?: number }>('/inventory/sync-ams-weights', { method: 'POST' }),
   getSkuSettings: () =>
     request<FilamentSkuSettings[]>('/inventory/sku-settings'),
   upsertSkuSettings: (data: Omit<FilamentSkuSettings, 'id'>) =>
@@ -5767,7 +7663,7 @@ export const api = {
   resetSpoolmanInventorySpoolConsumedCounter: (id: number) =>
     request<InventorySpool>(`/spoolman/inventory/spools/${id}/reset-consumed-counter`, { method: 'POST' }),
   bulkResetSpoolmanInventorySpoolConsumedCounter: (spoolIds: number[]) =>
-    request<{ reset: number }>(`/spoolman/inventory/spools/reset-consumed-counter-bulk`, {
+    request<{ reset: number; not_found?: number[]; errors?: Array<{ id: number; status: number; detail: string }> }>(`/spoolman/inventory/spools/reset-consumed-counter-bulk`, {
       method: 'POST',
       body: JSON.stringify({ spool_ids: spoolIds }),
     }),
@@ -5801,17 +7697,14 @@ export const api = {
       method: 'PATCH',
       body: JSON.stringify({ weight_grams: weightGrams }),
     }),
-  assignSpoolmanSlot: (data: { spoolman_spool_id: number; printer_id: number; ams_id: number; tray_id: number }) =>
+  // move: as assignSpool's (#1574).
+  assignSpoolmanSlot: (data: { spoolman_spool_id: number; printer_id: number; ams_id: number; tray_id: number; move?: boolean }) =>
     request<InventorySpool>('/spoolman/inventory/slot-assignments', {
       method: 'POST',
       body: JSON.stringify(data),
     }),
   unassignSpoolmanSlot: (spoolmanSpoolId: number) =>
     request<InventorySpool>(`/spoolman/inventory/slot-assignments/${spoolmanSpoolId}`, { method: 'DELETE' }),
-  getSpoolmanSlotAssignment: (printerId: number, amsId: number, trayId: number) =>
-    request<InventorySpool | null>(
-      `/spoolman/inventory/slot-assignments?printer_id=${printerId}&ams_id=${amsId}&tray_id=${trayId}`,
-    ),
   getSpoolmanSlotAssignments: (printerId?: number) =>
     request<Array<{
       printer_id: number;
@@ -5820,21 +7713,28 @@ export const api = {
       tray_id: number;
       spoolman_spool_id: number;
       ams_label: string | null;
+      printer_model?: string | null;
     }>>(
       printerId !== undefined
         ? `/spoolman/inventory/slot-assignments/all?printer_id=${printerId}`
         : '/spoolman/inventory/slot-assignments/all',
     ),
   syncSpoolmanAmsWeights: () =>
-    request<{ synced: number; skipped: number }>('/spoolman/inventory/sync-ams-weights', { method: 'POST' }),
-
-  getSpoolmanKProfiles: (spoolId: number) =>
-    request<SpoolKProfile[]>(`/spoolman/inventory/spools/${spoolId}/k-profiles`),
+    request<{ synced: number; skipped: number; printing?: number }>('/spoolman/inventory/sync-ams-weights', { method: 'POST' }),
 
   saveSpoolmanKProfiles: (spoolId: number, profiles: SpoolKProfileInput[]) =>
     request<SpoolKProfile[]>(`/spoolman/inventory/spools/${spoolId}/k-profiles`, {
       method: 'PUT',
       body: JSON.stringify(profiles),
+    }),
+
+  getSpoolmanFilamentPresets: (spoolId: number) =>
+    request<SpoolFilamentPreset[]>(`/spoolman/inventory/spools/${spoolId}/filament-presets`),
+
+  saveSpoolmanFilamentPresets: (spoolId: number, presets: SpoolFilamentPresetInput[]) =>
+    request<SpoolFilamentPreset[]>(`/spoolman/inventory/spools/${spoolId}/filament-presets`, {
+      method: 'PUT',
+      body: JSON.stringify(presets),
     }),
 
   // Updates
@@ -5863,8 +7763,6 @@ export const api = {
   restoreDefaultMaintenanceTypes: () =>
     request<{ restored: number }>(`/maintenance/types/restore-defaults`, { method: 'POST' }),
   getMaintenanceOverview: () => request<PrinterMaintenanceOverview[]>('/maintenance/overview'),
-  getPrinterMaintenance: (printerId: number) =>
-    request<PrinterMaintenanceOverview>(`/maintenance/printers/${printerId}`),
   updateMaintenanceItem: (itemId: number, data: { custom_interval_hours?: number | null; custom_interval_type?: 'hours' | 'days' | null; enabled?: boolean }) =>
     request<MaintenanceStatus>(`/maintenance/items/${itemId}`, {
       method: 'PATCH',
@@ -5875,9 +7773,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ notes }),
     }),
-  getMaintenanceHistory: (itemId: number) =>
-    request<MaintenanceHistory[]>(`/maintenance/items/${itemId}/history`),
-  getMaintenanceSummary: () => request<MaintenanceSummary>('/maintenance/summary'),
   setPrinterHours: (printerId: number, totalHours: number) =>
     request<{ printer_id: number; total_hours: number; archive_hours: number; offset_hours: number }>(
       `/maintenance/printers/${printerId}/hours?total_hours=${totalHours}`,
@@ -5896,11 +7791,41 @@ export const api = {
   getCameraStreamToken: () =>
     request<{ token: string }>('/printers/camera/stream-token', { method: 'POST' }),
 
+  // Media token (#3025) — the credential for thumbnails, plate previews,
+  // timelapses, cover images and link icons. Minted behind plain auth rather
+  // than camera:view, and identified, so those routes gate on the resource's
+  // own permission and ownership instead of on the camera.
+  getMediaToken: () => request<{ token: string }>('/auth/media-token', { method: 'POST' }),
+
   // WebSocket auth (GHSA-r2qv follow-up) — mint a short-lived token for
   // the /ws connection. Browsers can't attach Authorization headers to a
   // WebSocket handshake, so the token rides in the ?token= query param.
   getWebSocketToken: () =>
     request<{ token: string }>('/auth/ws-token', { method: 'POST' }),
+
+  // Connected apps: sign-in to external applications with Bambuddy
+  listConnectedApps: () => request<ConnectedApp[]>('/connect/apps'),
+  createConnectedApp: (payload: { name: string; redirect_uri: string }) =>
+    request<ConnectedApp>('/connect/apps', { method: 'POST', body: JSON.stringify(payload) }),
+  updateConnectedApp: (id: number, payload: { name?: string; redirect_uri?: string; enabled?: boolean }) =>
+    request<ConnectedApp>(`/connect/apps/${id}`, { method: 'PATCH', body: JSON.stringify(payload) }),
+  rotateConnectedAppSecret: (id: number) =>
+    request<ConnectedApp>(`/connect/apps/${id}/rotate-secret`, { method: 'POST' }),
+  deleteConnectedApp: (id: number) => request<void>(`/connect/apps/${id}`, { method: 'DELETE' }),
+  getConnectAuthorizeInfo: (clientId: string, redirectUri: string) =>
+    request<ConnectAuthorizeInfo>(
+      `/connect/authorize/info?client_id=${encodeURIComponent(clientId)}&redirect_uri=${encodeURIComponent(redirectUri)}`,
+    ),
+  connectAuthorize: (payload: {
+    client_id: string;
+    redirect_uri: string;
+    code_challenge: string;
+    code_challenge_method: 'S256';
+  }) =>
+    request<{ code: string; redirect_uri: string }>('/connect/authorize', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   // Long-lived camera tokens (#1108, #2531)
   createLongLivedCameraToken: (payload: {
@@ -5916,8 +7841,6 @@ export const api = {
     request<LongLivedCameraToken[]>('/auth/tokens'),
   listAllLongLivedCameraTokens: () =>
     request<LongLivedCameraToken[]>('/auth/tokens/all'),
-  listLongLivedCameraTokensForUser: (userId: number) =>
-    request<LongLivedCameraToken[]>(`/auth/tokens?user_id=${userId}`),
   revokeLongLivedCameraToken: (tokenId: number) =>
     request<void>(`/auth/tokens/${tokenId}`, { method: 'DELETE' }),
   // Token-authenticated Cam Wall feed (#2531). `token` is omitted only when
@@ -5935,12 +7858,10 @@ export const api = {
         ? `/printers/${printerId}/overlay-status?token=${encodeURIComponent(token)}`
         : `/printers/${printerId}/overlay-status`,
     ),
+  // Airtho fork: live MJPEG for the Sentry timeline's live view (upstream dropped
+  // this wrapper as unused in 460c11ca3).
   getCameraStreamUrl: (printerId: number, fps = 10) =>
     withStreamToken(`${API_BASE}/printers/${printerId}/camera/stream?fps=${fps}`),
-  getCameraSnapshotUrl: (printerId: number) =>
-    withStreamToken(`${API_BASE}/printers/${printerId}/camera/snapshot`),
-  testCameraConnection: (printerId: number) =>
-    request<{ success: boolean; message?: string; error?: string }>(`/printers/${printerId}/camera/test`),
   getCameraStatus: (printerId: number) =>
     request<{ active: boolean; stalled: boolean }>(`/printers/${printerId}/camera/status`),
   diagnoseCamera: (printerId: number) =>
@@ -6055,11 +7976,6 @@ export const api = {
       `/printers/${printerId}/camera/check-plate?${params.toString()}`
     );
   },
-  getPlateDetectionStatus: (printerId: number) => {
-    return request<PlateDetectionStatus & { chamber_light?: boolean }>(
-      `/printers/${printerId}/camera/plate-detection/status`
-    );
-  },
   calibratePlateDetection: (printerId: number, options?: { label?: string; useExternal?: boolean }) => {
     const params = new URLSearchParams();
     if (options?.label) params.set('label', options.label);
@@ -6069,12 +7985,6 @@ export const api = {
     return request<CalibrationResult & { index: number }>(
       `/printers/${printerId}/camera/plate-detection/calibrate?${params.toString()}`,
       { method: 'POST' }
-    );
-  },
-  deletePlateCalibration: (printerId: number) => {
-    return request<CalibrationResult>(
-      `/printers/${printerId}/camera/plate-detection/calibrate`,
-      { method: 'DELETE' }
     );
   },
   getPlateReferences: (printerId: number) => {
@@ -6115,11 +8025,6 @@ export const api = {
     }),
   deleteExternalLink: (id: number) =>
     request<{ message: string }>(`/external-links/${id}`, { method: 'DELETE' }),
-  reorderExternalLinks: (ids: number[]) =>
-    request<ExternalLink[]>('/external-links/reorder', {
-      method: 'PUT',
-      body: JSON.stringify({ ids }),
-    }),
   uploadExternalLinkIcon: async (id: number, file: File): Promise<ExternalLink> => {
     const formData = new FormData();
     formData.append('file', file);
@@ -6140,7 +8045,7 @@ export const api = {
   },
   deleteExternalLinkIcon: (id: number) =>
     request<ExternalLink>(`/external-links/${id}/icon`, { method: 'DELETE' }),
-  getExternalLinkIconUrl: (id: number) => withStreamToken(`${API_BASE}/external-links/${id}/icon`),
+  getExternalLinkIconUrl: (id: number) => withMediaToken(`${API_BASE}/external-links/${id}/icon`),
 
   // Projects
   getProjects: (status?: string) => {
@@ -6167,58 +8072,24 @@ export const api = {
   getProjectFileProgress: (id: number) =>
     request<ProjectFileProgress[]>(`/projects/${id}/file-progress`),
   addArchivesToProject: (projectId: number, archiveIds: number[]) =>
-    request<{ message: string }>(`/projects/${projectId}/add-archives`, {
+    request<{ message: string; count: number }>(`/projects/${projectId}/add-archives`, {
       method: 'POST',
       body: JSON.stringify({ archive_ids: archiveIds }),
     }),
-  removeArchivesFromProject: (projectId: number, archiveIds: number[]) =>
-    request<{ message: string }>(`/projects/${projectId}/remove-archives`, {
-      method: 'POST',
-      body: JSON.stringify({ archive_ids: archiveIds }),
-    }),
-  addQueueItemsToProject: (projectId: number, queueItemIds: number[]) =>
-    request<{ message: string }>(`/projects/${projectId}/add-queue`, {
-      method: 'POST',
-      body: JSON.stringify({ queue_item_ids: queueItemIds }),
-    }),
-
-  // Project Attachments
-  uploadProjectAttachment: async (projectId: number, file: File): Promise<{
-    status: string;
-    filename: string;
-    original_name: string;
-    attachments: ProjectAttachment[];
-  }> => {
-    const formData = new FormData();
-    formData.append('file', file);
-    const headers: Record<string, string> = {};
-    if (authToken) {
-      headers['Authorization'] = `Bearer ${authToken}`;
-    }
-    const response = await fetch(`${API_BASE}/projects/${projectId}/attachments`, {
-      method: 'POST',
-      headers,
-      body: formData,
-    });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.detail || `HTTP ${response.status}`);
-    }
-    return response.json();
-  },
-  getProjectAttachmentUrl: (projectId: number, filename: string) =>
-    `${API_BASE}/projects/${projectId}/attachments/${encodeURIComponent(filename)}`,
-  deleteProjectAttachment: (projectId: number, filename: string) =>
-    request<{ status: string; message: string; attachments: ProjectAttachment[] | null }>(
-      `/projects/${projectId}/attachments/${encodeURIComponent(filename)}`,
-      { method: 'DELETE' }
-    ),
 
   // #1155: Cover image
   // Browsers can't attach `Authorization: Bearer ...` to `<img src>`, so we
   // append the stream-token query string the same way archive thumbnails do.
-  getProjectCoverImageUrl: (projectId: number) =>
-    withStreamToken(`${API_BASE}/projects/${projectId}/cover-image`),
+  // `version` cache-busts the browser copy after a re-upload. It has to go on
+  // before the token does: callers used to append their own `?v=` to the
+  // returned URL, which already ended in `?token=…`, so the second `?` landed
+  // inside the token value and the image 401'd whenever auth was enabled.
+  getProjectCoverImageUrl: (projectId: number, version?: string | number) =>
+    withMediaToken(
+      `${API_BASE}/projects/${projectId}/cover-image${
+        version === undefined ? '' : `?v=${encodeURIComponent(String(version))}`
+      }`
+    ),
   uploadProjectCoverImage: async (
     projectId: number,
     file: File
@@ -6325,11 +8196,6 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(data),
     }),
-  updateAPIKey: (id: number, data: APIKeyUpdate) =>
-    request<APIKey>(`/api-keys/${id}`, {
-      method: 'PATCH',
-      body: JSON.stringify(data),
-    }),
   deleteAPIKey: (id: number) =>
     request<{ message: string }>(`/api-keys/${id}`, { method: 'DELETE' }),
 
@@ -6381,8 +8247,7 @@ export const api = {
     }),
   getLibraryFoldersByProject: (projectId: number) =>
     request<LibraryFolder[]>(`/library/folders/by-project/${projectId}`),
-  getLibraryFoldersByArchive: (archiveId: number) =>
-    request<LibraryFolder[]>(`/library/folders/by-archive/${archiveId}`),
+  getLibraryFoldersByArchive: (archiveId: number) => foldersByArchiveBatch(archiveId),
 
   getLibraryFiles: (
     folderId?: number | null,
@@ -6444,6 +8309,21 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ file_ids: fileIds, tag_ids: tagIds, action }),
     }),
+  // ============ Variant groups (#671 / #2570) ============
+  // "These files are the same job sliced for different printers." Consumed from
+  // both ends: the queue picks a printer and needs the matching file, the File
+  // Manager's print action has the printer and needs the same match.
+  createVariantGroup: (
+    members: { library_file_id: number; target_model?: string }[],
+    name?: string,
+  ) =>
+    request<VariantGroup>('/library/variant-groups', {
+      method: 'POST',
+      body: JSON.stringify({ members, ...(name ? { name } : {}) }),
+    }),
+  getVariantGroup: (groupId: number) =>
+    request<VariantGroup>(`/library/variant-groups/${groupId}`),
+
   getLibraryFile: (id: number) => request<LibraryFile>(`/library/files/${id}`),
   uploadLibraryFile: async (
     file: File,
@@ -6558,9 +8438,55 @@ export const api = {
     document.body.removeChild(a);
     window.URL.revokeObjectURL(url);
   },
-  getLibraryFileThumbnailUrl: (id: number) => withStreamToken(`${API_BASE}/library/files/${id}/thumbnail`),
+  getLibraryFileThumbnailUrl: (id: number) => withMediaToken(`${API_BASE}/library/files/${id}/thumbnail`),
+  // Client-rendered preview thumbnail upload (#2976). STEP/PDF/spreadsheet
+  // previews render in the browser; the first render is posted back so the
+  // grid gets a thumbnail without a server-side renderer for those formats.
+  uploadLibraryPreviewThumbnail: async (fileId: number, thumbnail: Blob): Promise<{ updated: boolean }> => {
+    const formData = new FormData();
+    formData.append('thumbnail', thumbnail, 'preview.png');
+    const headers: Record<string, string> = {};
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`;
+    }
+    const response = await fetch(`${API_BASE}/library/files/${fileId}/preview-thumbnail`, {
+      method: 'POST',
+      headers,
+      body: formData,
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.detail || `HTTP ${response.status}`);
+    }
+    return response.json();
+  },
   getLibraryFilePlateThumbnail: (id: number, plateIndex: number) =>
-    withStreamToken(`${API_BASE}/library/files/${id}/plate-thumbnail/${plateIndex}`),
+    withMediaToken(`${API_BASE}/library/files/${id}/plate-thumbnail/${plateIndex}`),
+  // Photos of the printed result (#3077) — same shape as the archive photo API.
+  getLibraryFilePhotoUrl: (fileId: number, filename: string) =>
+    withMediaToken(`${API_BASE}/library/files/${fileId}/photos/${encodeURIComponent(filename)}`),
+  uploadLibraryFilePhoto: async (fileId: number, file: File): Promise<{ status: string; filename: string; photos: string[] }> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    const headers: Record<string, string> = {};
+    if (authToken) {
+      headers['Authorization'] = `Bearer ${authToken}`;
+    }
+    const response = await fetch(`${API_BASE}/library/files/${fileId}/photos`, {
+      method: 'POST',
+      headers,
+      body: formData,
+    });
+    if (!response.ok) {
+      const error = await response.json().catch(() => ({}));
+      throw new Error(error.detail || `HTTP ${response.status}`);
+    }
+    return response.json();
+  },
+  deleteLibraryFilePhoto: (fileId: number, filename: string) =>
+    request<{ status: string; photos: string[] }>(`/library/files/${fileId}/photos/${encodeURIComponent(filename)}`, {
+      method: 'DELETE',
+    }),
   getLibraryFileGcodeUrl: (id: number) => `${API_BASE}/library/files/${id}/gcode`,
   moveLibraryFiles: (fileIds: number[], folderId: number | null) =>
     request<{ status: string; moved: number }>('/library/files/move', {
@@ -6582,10 +8508,10 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(options),
     }),
-  addLibraryFilesToQueue: (fileIds: number[]) =>
-    request<AddToQueueResponse>('/library/files/add-to-queue', {
+  combineLibraryFiles: (items: { file_id: number; copies: number }[], filename: string, folderId: number | null) =>
+    request<LibraryFileUploadResponse>('/library/files/combine', {
       method: 'POST',
-      body: JSON.stringify({ file_ids: fileIds }),
+      body: JSON.stringify({ items, filename, folder_id: folderId }),
     }),
   getLibraryFilePlates: (fileId: number) =>
     request<LibraryFilePlatesResponse>(`/library/files/${fileId}/plates`),
@@ -6651,14 +8577,11 @@ export const api = {
       body: JSON.stringify(config),
     }),
 
-  deleteGitHubBackupConfig: () =>
-    request<{ message: string }>('/github-backup/config', { method: 'DELETE' }),
-
   testGitHubConnection: (repoUrl: string, token: string, provider: GitProviderType = 'github') =>
-    request<GitHubTestConnectionResponse>(
-      `/github-backup/test?repo_url=${encodeURIComponent(repoUrl)}&token=${encodeURIComponent(token)}&provider=${encodeURIComponent(provider)}`,
-      { method: 'POST' }
-    ),
+    request<GitHubTestConnectionResponse>('/github-backup/test', {
+      method: 'POST',
+      body: JSON.stringify({ repo_url: repoUrl, token, provider }),
+    }),
 
   testGitHubStoredConnection: () =>
     request<GitHubTestConnectionResponse>('/github-backup/test-stored', { method: 'POST' }),
@@ -6674,6 +8597,19 @@ export const api = {
 
   clearGitHubBackupLogs: (keepLast: number = 10) =>
     request<{ deleted: number; message: string }>(`/github-backup/logs?keep_last=${keepLast}`, { method: 'DELETE' }),
+
+  // Restore from a Git backup (#2656)
+  getGitHubBackupCommits: (limit: number = 20) =>
+    request<GitHubCommitListResponse>(`/github-backup/commits?limit=${limit}`),
+
+  getGitHubRestorePreview: (ref: string = 'HEAD') =>
+    request<GitHubRestorePreview>(`/github-backup/restore/preview?ref=${encodeURIComponent(ref)}`),
+
+  restoreFromGitHub: (payload: GitHubRestoreRequest) =>
+    request<GitHubRestoreResponse>('/github-backup/restore', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 
   // Scheduled local backups
   getLocalBackupStatus: () =>
@@ -6718,6 +8654,20 @@ export const api = {
       body: JSON.stringify(token === undefined ? { url } : { url, token }),
     }),
 
+  // OctoEverywhere AI failure detection
+  getOctoEverywhereStatus: () =>
+    request<OctoEverywhereStatus>('/octoeverywhere/status'),
+
+  getOctoEverywherePrinterStatus: () =>
+    request<OctoEverywherePrinterStatus>('/octoeverywhere/printer-status'),
+
+  // An omitted key uses the saved key; an explicit empty key is rejected.
+  testOctoEverywhereConnection: (apiKey?: string, confidence?: OctoEverywhereConfidence) =>
+    request<OctoEverywhereTestConnection>('/octoeverywhere/test-connection', {
+      method: 'POST',
+      body: JSON.stringify({ api_key: apiKey, confidence }),
+    }),
+
   // Slicer API — slice in the background. Both endpoints return 202 + a
   // job_id; poll /slice-jobs/{id} until status is `completed` or `failed`.
   sliceLibraryFile: (fileId: number, body: SliceRequest) =>
@@ -6748,8 +8698,6 @@ export const api = {
   // one click. CRUD is gated on PIPELINES_READ / PIPELINES_WRITE.
   listSlicerPipelines: () =>
     request<SlicerPipelinesListResponse>('/slicer-pipelines/'),
-  getSlicerPipeline: (id: number) =>
-    request<SlicerPipeline>(`/slicer-pipelines/${id}`),
   createSlicerPipeline: (data: SlicerPipelineCreateRequest) =>
     request<SlicerPipeline>('/slicer-pipelines/', {
       method: 'POST',
@@ -6820,8 +8768,6 @@ export const api = {
   // runs are preserved.
   clearTerminalPipelineRuns: () =>
     request<{ deleted: number }>('/pipeline-runs/clear', { method: 'POST' }),
-  getPipelineRun: (runId: number) =>
-    request<PipelineRun>(`/pipeline-runs/${runId}`),
   cancelPipelineRun: (runId: number) =>
     request<PipelineRun>(`/pipeline-runs/${runId}/cancel`, { method: 'POST' }),
   retryFailedPipelineRun: (runId: number) =>
@@ -6833,12 +8779,27 @@ export const api = {
   // `@BBL <code>` suffix against the selected printer-preset name (#1325).
   getSlicerPrinterModels: () =>
     request<Record<string, string>>('/slicer/printer-models'),
+  getSlicerLoadedSpools: () =>
+    request<LoadedSpoolsResponse>('/slicer/loaded-spools'),
+
+  /**
+   * Effective values of a process preset, with its `inherits:` chain flattened
+   * by the slicer sidecar. Powers the slice modal's settings panel, which would
+   * otherwise show the option schema's compiled-in defaults (a preset setting a
+   * 0.42mm line width appears as the C++ default of 0).
+   *
+   * `resolved: false` means the values could not be obtained -- sidecar offline,
+   * too old for the endpoint, or slicing not configured -- and the caller should
+   * fall back to schema defaults rather than treat it as a failure.
+   */
+  getSlicerPresetValues: (ref: PresetRef) =>
+    request<SlicerPresetValues>(
+      `/slicer/preset-values?source=${encodeURIComponent(ref.source)}&id=${encodeURIComponent(ref.id)}`,
+    ),
 
   // Local Presets (OrcaSlicer imports)
   getLocalPresets: () =>
     request<LocalPresetsResponse>('/local-presets/'),
-  getLocalPresetDetail: (id: number) =>
-    request<LocalPresetDetail>(`/local-presets/${id}`),
   importLocalPresets: (formData: FormData) =>
     fetch(`${API_BASE}/local-presets/import`, {
       method: 'POST',
@@ -6851,20 +8812,8 @@ export const api = {
       }
       return res.json() as Promise<ImportResponse>;
     }),
-  createLocalPreset: (data: { name: string; preset_type: string; setting: Record<string, unknown> }) =>
-    request<LocalPreset>('/local-presets/', {
-      method: 'POST',
-      body: JSON.stringify(data),
-    }),
-  updateLocalPreset: (id: number, data: { name?: string; setting?: Record<string, unknown> }) =>
-    request<LocalPreset>(`/local-presets/${id}`, {
-      method: 'PUT',
-      body: JSON.stringify(data),
-    }),
   deleteLocalPreset: (id: number) =>
     request<{ success: boolean }>(`/local-presets/${id}`, { method: 'DELETE' }),
-  refreshBaseProfileCache: () =>
-    request<{ refreshed: number; failed: number; total: number }>('/local-presets/base-cache/refresh', { method: 'POST' }),
 };
 
 // AMS History types
@@ -7030,6 +8979,13 @@ export interface LibraryFolderTree {
   // max(folder.updated_at, max(immediate-child file.updated_at)). Used by
   // the File Manager folder tree's "sort by recent activity" mode (#1770).
   latest_activity_at: string | null;
+  // Ownership (#3201). can_* are for the current user: what the File
+  // Manager may offer on this folder. The backend enforces the same rules.
+  created_by_id: number | null;
+  shared: boolean;
+  can_write: boolean;
+  can_rename: boolean;
+  can_delete: boolean;
   children: LibraryFolderTree[];
 }
 
@@ -7047,6 +9003,13 @@ export interface LibraryFolder {
   external_show_hidden: boolean;
   file_count: number;
   latest_activity_at: string | null;
+  // Ownership (#3201). can_* are for the current user: what the File
+  // Manager may offer on this folder. The backend enforces the same rules.
+  created_by_id: number | null;
+  shared: boolean;
+  can_write: boolean;
+  can_rename: boolean;
+  can_delete: boolean;
   created_at: string;
   updated_at: string;
 }
@@ -7071,6 +9034,7 @@ export interface LibraryFolderUpdate {
   parent_id?: number | null;
   project_id?: number | null;  // 0 to unlink
   archive_id?: number | null;  // 0 to unlink
+  shared?: boolean;  // library:update_all only (#3201)
 }
 
 export interface LibraryFileDuplicate {
@@ -7098,6 +9062,11 @@ export interface LibraryFile {
   print_count: number;
   last_printed_at: string | null;
   notes: string | null;
+  // User link + photos of the printed result (#3077); source_url is the
+  // read-only import provenance (MakerWorld).
+  external_url: string | null;
+  photos: string[];
+  source_url: string | null;
   duplicates: LibraryFileDuplicate[] | null;
   duplicate_count: number;
   // User tracking (Issue #206)
@@ -7143,6 +9112,31 @@ export interface LibraryFileListItem {
   // legacy code path (or mock) that constructs a LibraryFileListItem without
   // it doesn't crash the renderer. Read sites use `file.tags ?? []`.
   tags?: LibraryTagSummary[];
+  // Variant grouping (#671 / #2570). `variant_count` is the size of the whole
+  // group, which may include files in other folders — never the number of
+  // matching rows on screen. 0 when the file is not grouped.
+  variant_group_id?: number | null;
+  variant_count?: number;
+  // Metadata indicators (#3077). Optional for the same reason as `tags`: older
+  // mocks construct list items without them. Read sites default to falsy.
+  external_url?: string | null;
+  has_notes?: boolean;
+  photo_count?: number;
+}
+
+// Variant groups (#671 / #2570): the same job sliced for different printers.
+export interface VariantGroupMember {
+  library_file_id: number;
+  filename: string;
+  target_model: string;
+  position: number;
+}
+
+export interface VariantGroup {
+  id: number;
+  name: string;
+  /** In priority order — index 0 wins when several printers are free at once. */
+  members: VariantGroupMember[];
 }
 
 // Library tag catalog (#1268)
@@ -7165,6 +9159,7 @@ export interface LibraryFileUpdate {
   folder_id?: number | null;
   project_id?: number | null;
   notes?: string | null;
+  external_url?: string | null;
 }
 
 // Library trash (#1008)
@@ -7207,6 +9202,32 @@ export interface ArchivePurgePreview {
   total_bytes: number;
   sample_filenames: string[];
   older_than_days: number;
+}
+
+export interface ArchiveMergeMember {
+  id: number;
+  print_name: string | null;
+  filename: string;
+  created_at: string | null;
+  run_count: number;
+}
+
+/** Why a group is left out: at work now, or holding files only one can keep. */
+export type ArchiveMergeSkip = 'busy' | 'conflicting_files' | 'failed' | 'not_a_group';
+
+export interface ArchiveMergeGroup {
+  survivor: ArchiveMergeMember;
+  merged: ArchiveMergeMember[];
+  skipped: ArchiveMergeSkip | null;
+}
+
+export interface ArchiveMergePreview {
+  groups: ArchiveMergeGroup[];
+}
+
+export interface ArchiveMergeResult {
+  merged: { survivor_id: number; merged_ids: number[] }[];
+  skipped: { survivor_id: number; reason: ArchiveMergeSkip }[];
 }
 
 export interface ArchivePurgeSettings {
@@ -7272,25 +9293,6 @@ export interface BatchThumbnailResponse {
   results: BatchThumbnailResult[];
 }
 
-// Library Queue types
-export interface AddToQueueResult {
-  file_id: number;
-  filename: string;
-  queue_item_id: number;
-  archive_id: number;
-}
-
-export interface AddToQueueError {
-  file_id: number;
-  filename: string;
-  error: string;
-}
-
-export interface AddToQueueResponse {
-  added: AddToQueueResult[];
-  errors: AddToQueueError[];
-}
-
 // Discovery types
 export interface DiscoveredPrinter {
   serial: string;
@@ -7320,8 +9322,6 @@ export interface SubnetScanStatus {
 // Discovery API
 export const discoveryApi = {
   getInfo: () => request<DiscoveryInfo>('/discovery/info'),
-
-  getStatus: () => request<DiscoveryStatus>('/discovery/status'),
 
   startDiscovery: (duration: number = 10) =>
     request<DiscoveryStatus>(`/discovery/start?duration=${duration}`, { method: 'POST' }),
@@ -7375,12 +9375,6 @@ export interface VirtualPrinterStatus {
 }
 
 export interface VirtualPrinterSettings {
-  enabled: boolean;
-  access_code_set: boolean;
-  mode: VirtualPrinterMode;
-  model: string;
-  target_printer_id: number | null;  // For proxy mode
-  remote_interface_ip: string | null;  // For SSDP proxy across networks
   tailscale_disabled: boolean;
   archive_name_source: 'metadata' | 'filename';  // Source for archive's display name
   status: VirtualPrinterStatus;
@@ -7393,11 +9387,6 @@ export interface NetworkInterface {
   subnet: string;
   is_alias?: boolean;
   label?: string;
-}
-
-export interface VirtualPrinterModels {
-  models: Record<string, string>;  // SSDP code -> display name
-  default: string;
 }
 
 export interface PendingUpload {
@@ -7421,25 +9410,11 @@ export interface PendingUpload {
 export const virtualPrinterApi = {
   getSettings: () => request<VirtualPrinterSettings>('/settings/virtual-printer'),
 
-  getModels: () => request<VirtualPrinterModels>('/settings/virtual-printer/models'),
-
   updateSettings: (data: {
-    enabled?: boolean;
-    access_code?: string;
-    mode?: 'archive' | 'review' | 'queue' | 'proxy';
-    model?: string;
-    target_printer_id?: number;
-    remote_interface_ip?: string;
     tailscale_disabled?: boolean;
     archive_name_source?: 'metadata' | 'filename';
   }) => {
     const params = new URLSearchParams();
-    if (data.enabled !== undefined) params.set('enabled', String(data.enabled));
-    if (data.access_code !== undefined) params.set('access_code', data.access_code);
-    if (data.mode !== undefined) params.set('mode', data.mode);
-    if (data.model !== undefined) params.set('model', data.model);
-    if (data.target_printer_id !== undefined) params.set('target_printer_id', String(data.target_printer_id));
-    if (data.remote_interface_ip !== undefined) params.set('remote_interface_ip', data.remote_interface_ip);
     if (data.tailscale_disabled !== undefined) params.set('tailscale_disabled', String(data.tailscale_disabled));
     if (data.archive_name_source !== undefined) params.set('archive_name_source', data.archive_name_source);
 
@@ -7650,8 +9625,7 @@ export const firmwareApi = {
   checkUpdates: () =>
     request<{ updates: FirmwareUpdateInfo[]; updates_available: number }>('/firmware/updates'),
 
-  checkPrinterUpdate: (printerId: number) =>
-    request<FirmwareUpdateInfo>(`/firmware/updates/${printerId}`),
+  checkPrinterUpdate: (printerId: number) => firmwareUpdateBatch(printerId),
 
   prepareUpload: (printerId: number, version?: string) =>
     request<FirmwareUploadPrepare>(
@@ -7797,9 +9771,6 @@ export const spoolbuddyApi = {
       body: '{}',
     }),
 
-  getCalibration: (deviceId: string) =>
-    request<{ tare_offset: number; calibration_factor: number }>(`/spoolbuddy/devices/${deviceId}/calibration`),
-
   setCalibrationFactor: (deviceId: string, knownWeightGrams: number, rawAdc: number, tareRawAdc?: number) =>
     request<{ tare_offset: number; calibration_factor: number }>(`/spoolbuddy/devices/${deviceId}/calibration/set-factor`, {
       method: 'POST',
@@ -7896,6 +9867,42 @@ export const bugReportApi = {
     request<{ logs: string }>(`/bug-report/stop-logging?was_debug=${wasDebug}`, {
       method: 'POST',
     }),
+};
+
+export type AnnouncementLevel = 'info' | 'important' | 'critical';
+
+export interface AnnouncementText {
+  title: string;
+  body: string;
+  link_label?: string;
+}
+
+// One message from the Bambuddy maintainers. `texts` holds every language the
+// message was written in; English is always there.
+export interface Announcement {
+  id: string;
+  level: AnnouncementLevel;
+  texts: Record<string, AnnouncementText>;
+  link_url: string | null;
+  published_at: string | null;
+  expires_at: string | null;
+  // Past its expiry: kept as history, listed under "Earlier", never unread.
+  archived: boolean;
+  read: boolean;
+}
+
+// `visible` says whether this user may see announcements at all (switched on,
+// and admin or "show to all users"); it keeps the sidebar entry while nothing
+// is published.
+export interface AnnouncementList {
+  visible: boolean;
+  announcements: Announcement[];
+}
+
+export const announcementsApi = {
+  list: () => request<AnnouncementList>('/announcements'),
+  markRead: (id: string) =>
+    request<void>(`/announcements/${encodeURIComponent(id)}/read`, { method: 'POST' }),
 };
 
 export interface SponsorPromptCheckResponse {

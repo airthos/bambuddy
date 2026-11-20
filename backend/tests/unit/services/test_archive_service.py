@@ -318,6 +318,80 @@ class TestThreeMFMetadataHTMLUnescape:
         assert parsed.get("print_name") == "Benchy"
 
 
+class TestModelMetadataSkipsMeshes:
+    """The metadata scans stream past ``<mesh>`` bodies instead of reading the
+    whole model entry: a combined plate keeps hundreds of MB of geometry inline
+    in 3D/3dmodel.model (#3162). Metadata after ``</build>``, where
+    BambuStudio writes its MakerWorld fields, must still be found."""
+
+    MESH = (
+        '<mesh><vertices><vertex x="0" y="0" z="0"/><vertex x="1" y="0" z="0"/>'
+        '<vertex x="0" y="1" z="0"/></vertices><triangles><triangle v1="0" v2="1" v3="2"/>'
+        "</triangles></mesh>"
+    )
+
+    def _model(self) -> str:
+        return (
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<model><metadata name="Title">Before &amp; mesh</metadata><resources>'
+            f'<object id="1" type="model">{self.MESH}</object>'
+            f'<object id="2" type="model">{self.MESH}</object>'
+            '</resources><build><item objectid="1"/></build>'
+            '<metadata name="Designer">After build</metadata>'
+            '<metadata name="CopyRight">https://makerworld.com/en/models/130726</metadata>'
+            "</model>"
+        )
+
+    def _write(self, tmp_path, model: str):
+        import zipfile
+
+        path = tmp_path / "plate.3mf"
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("3D/3dmodel.model", model)
+        return path
+
+    def test_meshes_are_dropped_and_everything_else_kept(self, tmp_path):
+        import zipfile
+
+        from backend.app.services.archive import read_3dmodel_without_meshes
+
+        model = self._model()
+        with zipfile.ZipFile(self._write(tmp_path, model)) as zf:
+            text = read_3dmodel_without_meshes(zf)
+
+        assert "<vertex" not in text and "<triangle" not in text
+        assert text == model.replace(self.MESH, "")
+
+    def test_tags_split_across_chunks(self, tmp_path, monkeypatch):
+        """Every chunk size from 1 byte up puts ``<mesh`` and ``</mesh>``
+        across a boundary somewhere; the result must not change."""
+        import zipfile
+
+        from backend.app.services import archive
+
+        model = self._model()
+        path = self._write(tmp_path, model)
+        expected = model.replace(self.MESH, "")
+        for chunk in range(1, 40):
+            monkeypatch.setattr(archive, "_MODEL_READ_CHUNK", chunk)
+            with zipfile.ZipFile(path) as zf:
+                assert archive.read_3dmodel_without_meshes(zf) == expected, chunk
+
+    def test_parsers_still_find_metadata_after_the_build(self, tmp_path):
+        from backend.app.services.archive import ProjectPageParser, ThreeMFParser
+
+        path = self._write(tmp_path, self._model())
+
+        parsed = ThreeMFParser(str(path)).parse()
+        assert parsed.get("print_name") == "Before & mesh"
+        assert parsed.get("designer") == "After build"
+        assert parsed.get("makerworld_model_id") == "130726"
+
+        page = ProjectPageParser(str(path)).parse(archive_id=1)
+        assert page["title"] == "Before & mesh"
+        assert page["designer"] == "After build"
+
+
 class TestPrintableObjectsExtraction:
     """Tests for extracting printable objects count from 3MF files."""
 
@@ -1011,3 +1085,100 @@ class TestThreeMFParserSupportMaterial:
         meta = ThreeMFParser(path).parse()
         assert meta["filament_type"] == "PLA"
         assert meta["filament_color"] == "#FFFFFF,#000000"
+
+
+class TestThreeMFLayerHeightFromPlateGcode:
+    """The plate's G-code outranks project_settings.config on layer height.
+
+    Reported against a print sliced at 0.08 that archived as 0.2: the card
+    reads ``project_settings.config``, which is the *project's* record and can
+    still describe another plate or an earlier process, while the plate G-code
+    is the file the printer actually runs. The value sits in the CONFIG_BLOCK
+    14-25KB into the G-code, past the 4KB header window this parser used to
+    read, so the disagreement had no way to surface.
+    """
+
+    @staticmethod
+    def _plate_gcode(layer_height: str, total_layers: int) -> str:
+        # Mirrors a real Bambu plate: header block first, then the alphabetical
+        # config block, which is what pushes layer_height past 4KB.
+        filler = "".join(f"; config_filler_{i} = {i}\n" for i in range(1200))
+        return (
+            "; HEADER_BLOCK_START\n"
+            f"; total layer number: {total_layers}\n"
+            "; HEADER_BLOCK_END\n"
+            "; CONFIG_BLOCK_START\n"
+            f"{filler}"
+            "; independent_support_layer_height = 0\n"
+            f"; layer_height = {layer_height}\n"
+            "; CONFIG_BLOCK_END\n"
+            "G1 X0 Y0\n"
+        )
+
+    def _write(self, path, *, config_layer_height, plates):
+        import json
+        import zipfile
+
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("3D/3dmodel.model", "<model/>")
+            zf.writestr(
+                "Metadata/project_settings.config",
+                json.dumps({"layer_height": config_layer_height}),
+            )
+            for index, (layer_height, total_layers) in plates.items():
+                zf.writestr(
+                    f"Metadata/plate_{index}.gcode",
+                    self._plate_gcode(layer_height, total_layers),
+                )
+        return path
+
+    def test_gcode_wins_over_project_settings(self, tmp_path):
+        from backend.app.services.archive import ThreeMFParser
+
+        path = self._write(tmp_path / "sliced.3mf", config_layer_height="0.2", plates={1: ("0.08", 59)})
+
+        parsed = ThreeMFParser(path).parse()
+
+        assert parsed["layer_height"] == 0.08
+        assert parsed["total_layers"] == 59
+
+    def test_reads_the_plate_that_was_printed(self, tmp_path):
+        from backend.app.services.archive import ThreeMFParser
+
+        path = self._write(
+            tmp_path / "multi.3mf",
+            config_layer_height="0.2",
+            plates={1: ("0.2", 30), 2: ("0.08", 148)},
+        )
+
+        parsed = ThreeMFParser(path, plate_number=2).parse()
+
+        assert parsed["layer_height"] == 0.08
+        assert parsed["total_layers"] == 148
+
+    def test_falls_back_to_the_lowest_plate_when_none_was_named(self, tmp_path):
+        from backend.app.services.archive import ThreeMFParser
+
+        path = self._write(
+            tmp_path / "unnamed.3mf",
+            config_layer_height="0.2",
+            plates={2: ("0.08", 148), 1: ("0.2", 30)},
+        )
+
+        parsed = ThreeMFParser(path).parse()
+
+        assert parsed["layer_height"] == 0.2
+        assert parsed["total_layers"] == 30
+
+    def test_source_3mf_without_gcode_keeps_the_project_value(self, tmp_path):
+        import json
+        import zipfile
+
+        from backend.app.services.archive import ThreeMFParser
+
+        path = tmp_path / "source.3mf"
+        with zipfile.ZipFile(path, "w") as zf:
+            zf.writestr("3D/3dmodel.model", "<model/>")
+            zf.writestr("Metadata/project_settings.config", json.dumps({"layer_height": "0.28"}))
+
+        assert ThreeMFParser(path).parse()["layer_height"] == 0.28

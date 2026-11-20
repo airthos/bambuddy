@@ -452,15 +452,6 @@ class TestOIDCExchangeReplay:
     async def test_exchange_token_is_single_use(self, async_client: AsyncClient, db_session: AsyncSession):
         """The second call to /oidc/exchange with the same token returns 401."""
         exchange_token = secrets.token_urlsafe(32)
-        db_session.add(
-            AuthEphemeralToken(
-                token=exchange_token,
-                token_type="oidc_exchange",
-                username="oidc_replay_user",
-                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
-            )
-        )
-        await db_session.commit()
 
         # Seed the user so the exchange can resolve it
         from backend.app.core.auth import get_password_hash
@@ -477,6 +468,18 @@ class TestOIDCExchangeReplay:
                     )
                 )
                 await db.commit()
+
+        # Minted after the user exists, as the OIDC callback does (a token from
+        # before the user's session began is refused).
+        db_session.add(
+            AuthEphemeralToken(
+                token=exchange_token,
+                token_type="oidc_exchange",
+                username="oidc_replay_user",
+                expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+            )
+        )
+        await db_session.commit()
 
         first = await async_client.post("/api/v1/auth/oidc/exchange", json={"oidc_token": exchange_token})
         assert first.status_code == 200
@@ -1912,6 +1915,27 @@ class TestEncryptionRoundtrip:
 # ============================================================================
 
 
+def _minimal_sqlite_backup() -> bytes:
+    """A real, if empty, SQLite database to stand in for a backup's bambuddy.db.
+
+    Restore now refuses a bambuddy.db it cannot open, and refuses it before it
+    stops services or overwrites the MFA key file -- a corrupt or truncated
+    backup used to be found only by the Postgres import, which by then had
+    dropped every table in the live database. These tests are about the key
+    handling around the swap, so they need a file that opens; what is in it does
+    not matter.
+    """
+    import sqlite3
+
+    conn = sqlite3.connect(":memory:")
+    try:
+        conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)")
+        conn.commit()
+        return conn.serialize()
+    finally:
+        conn.close()
+
+
 class TestBackupKeyFiles:
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -1980,7 +2004,7 @@ class TestBackupKeyFiles:
         # Build a minimal ZIP with a stub DB and the key file.
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
-            zf.writestr("bambuddy.db", b"SQLite format 3")
+            zf.writestr("bambuddy.db", _minimal_sqlite_backup())
             zf.writestr(".mfa_encryption_key", "test-restored-key")
         buf.seek(0)
 
@@ -1993,6 +2017,7 @@ class TestBackupKeyFiles:
             patch("backend.app.core.database.close_all_connections", new_callable=AsyncMock),
             patch("backend.app.core.database.reinitialize_database", new_callable=AsyncMock),
             patch("backend.app.core.database.init_db", new_callable=AsyncMock),
+            patch("backend.app.core.database.invalidate_all_sessions", new_callable=AsyncMock),
         ):
             resp = await async_client.post(
                 "/api/v1/settings/restore",
@@ -2020,7 +2045,7 @@ class TestBackupKeyFiles:
 
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
-            zf.writestr("bambuddy.db", b"SQLite format 3")
+            zf.writestr("bambuddy.db", _minimal_sqlite_backup())
             # Intentionally no .mfa_encryption_key entry.
         buf.seek(0)
 
@@ -2033,6 +2058,7 @@ class TestBackupKeyFiles:
             patch("backend.app.core.database.close_all_connections", new_callable=AsyncMock),
             patch("backend.app.core.database.reinitialize_database", new_callable=AsyncMock),
             patch("backend.app.core.database.init_db", new_callable=AsyncMock),
+            patch("backend.app.core.database.invalidate_all_sessions", new_callable=AsyncMock),
         ):
             resp = await async_client.post(
                 "/api/v1/settings/restore",
@@ -2061,7 +2087,7 @@ class TestBackupKeyFiles:
         # Build ZIP with a key file that we will fail to write to DATA_DIR.
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
-            zf.writestr("bambuddy.db", b"SQLite format 3 backup data")
+            zf.writestr("bambuddy.db", _minimal_sqlite_backup())
             zf.writestr(".mfa_encryption_key", "backup-key-content")
         buf.seek(0)
 
@@ -2141,7 +2167,7 @@ class TestBackupKeyFiles:
         assert new_key != old_key
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w") as zf:
-            zf.writestr("bambuddy.db", b"SQLite format 3 backup data")
+            zf.writestr("bambuddy.db", _minimal_sqlite_backup())
             zf.writestr(".mfa_encryption_key", new_key)
         buf.seek(0)
 
@@ -2154,6 +2180,7 @@ class TestBackupKeyFiles:
             patch("backend.app.core.database.close_all_connections", new_callable=AsyncMock),
             patch("backend.app.core.database.reinitialize_database", new_callable=AsyncMock),
             patch("backend.app.core.database.init_db", new_callable=AsyncMock),
+            patch("backend.app.core.database.invalidate_all_sessions", new_callable=AsyncMock),
         ):
             resp = await async_client.post(
                 "/api/v1/settings/restore",
@@ -2367,6 +2394,7 @@ class TestBackupKeyFiles:
                 patch("backend.app.core.database.close_all_connections", new_callable=AsyncMock),
                 patch("backend.app.core.database.reinitialize_database", new_callable=AsyncMock),
                 patch("backend.app.core.database.init_db", new_callable=AsyncMock),
+                patch("backend.app.core.database.invalidate_all_sessions", new_callable=AsyncMock),
                 open(zip_path, "rb") as f,
             ):
                 resp = await async_client.post(

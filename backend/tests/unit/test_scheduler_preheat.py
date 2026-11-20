@@ -36,7 +36,7 @@ def item():
 
 @pytest.fixture
 def archive():
-    return SimpleNamespace(bed_temperature=60)
+    return SimpleNamespace(file_path=None, bed_temperature=60)
 
 
 def _make_printer(model: str, printer_id: int = 7):
@@ -200,11 +200,78 @@ async def test_filament_map_picks_max_across_loaded_slots(scheduler, item, archi
 
 
 @pytest.mark.asyncio
-async def test_pla_only_derives_zero_chamber_skips(scheduler, item, archive):
-    """PLA-only print: filament-map lookup returns 0 → chamber phase skips
-    automatically without the user touching anything."""
+async def test_pla_only_derives_zero_chamber_skips_the_whole_stage(scheduler, item, archive):
+    """PLA-only print: the filament map returns 0, and the stage skips entirely.
+
+    Not just the chamber phase (#3041). A derived 0 says the materials this
+    print loads want no chamber conditioning, so there is nothing to soak for
+    -- and the bed phase that used to run anyway put the bed warm-up plus the
+    full soak ahead of the FTP upload, delaying every PLA dispatch by minutes
+    for no gain. The print's own G-code sets the bed when it starts.
+
+    The soak is left at its production default here on purpose: the old
+    behaviour held for those 300s, and a test that zeroes the soak cannot see
+    the difference.
+    """
     db = AsyncMock()
     client = _make_client()
+    sleeper = AsyncMock()
+
+    with (
+        patch.object(scheduler, "_get_bool_setting", AsyncMock(return_value=True)),
+        patch.object(scheduler, "_get_int_setting", _ints()),
+        patch.object(scheduler, "_get_setting", AsyncMock(return_value=None)),
+        patch("backend.app.services.print_scheduler.printer_manager") as pm,
+        patch("backend.app.services.print_scheduler.asyncio.sleep", sleeper),
+    ):
+        pm.get_client.return_value = client
+        pm.get_status.return_value = _make_state(60.0, 0.0, trays=["PLA", "PLA"])
+        assert await scheduler._preheat_and_soak(db, item, _make_printer("H2D"), archive) is True
+
+    client.set_bed_temperature.assert_not_called()
+    client.set_chamber_temperature.assert_not_called()
+    sleeper.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_a_zero_target_still_puts_the_flap_back_to_cooling(scheduler, item, archive):
+    """Skipping the stage must not skip the flap.
+
+    The airduct decision is the one thing a no-chamber print still needs: an
+    H2D left in heating mode by the ABS job before it would cook the PLA that
+    follows. It costs one MQTT command and no waiting, so it survives the
+    early return that everything else takes.
+    """
+    db = AsyncMock()
+    client = _make_client()
+
+    with (
+        patch.object(scheduler, "_get_bool_setting", AsyncMock(return_value=True)),
+        patch.object(scheduler, "_get_int_setting", _ints()),
+        patch.object(scheduler, "_get_setting", AsyncMock(return_value=None)),
+        patch("backend.app.services.print_scheduler.printer_manager") as pm,
+        patch("backend.app.services.print_scheduler.asyncio.sleep", AsyncMock()),
+    ):
+        pm.get_client.return_value = client
+        pm.get_status.return_value = _make_state(60.0, 0.0, trays=["PLA"], airduct_mode=1)
+        await scheduler._preheat_and_soak(db, item, _make_printer("H2D"), archive)
+
+    client.set_airduct_mode.assert_called_once_with("cooling")
+    client.set_bed_temperature.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_an_explicit_item_zero_still_heats_the_bed_and_soaks(scheduler, item, archive):
+    """A 0 typed into the per-item chamber override is not the same as a 0
+    derived from the filament map.
+
+    The map's 0 is a default nobody chose; the field's 0 is the user saying
+    "warm the bed for this print, skip the chamber", which is what the queue
+    documentation promises it does. Only the automatic path short-circuits.
+    """
+    db = AsyncMock()
+    client = _make_client()
+    item.preheat_chamber_target_override = 0
 
     with (
         patch.object(scheduler, "_get_bool_setting", AsyncMock(return_value=True)),
@@ -214,7 +281,35 @@ async def test_pla_only_derives_zero_chamber_skips(scheduler, item, archive):
         patch("backend.app.services.print_scheduler.asyncio.sleep", AsyncMock()),
     ):
         pm.get_client.return_value = client
-        pm.get_status.return_value = _make_state(60.0, 0.0, trays=["PLA", "PLA"])
+        pm.get_status.return_value = _make_state(60.0, 0.0, trays=["PLA"])
+        await scheduler._preheat_and_soak(db, item, _make_printer("H2D"), archive)
+
+    client.set_bed_temperature.assert_called_once_with(60)
+    client.set_chamber_temperature.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_forcing_the_item_override_on_still_heats_the_bed(scheduler, item, archive):
+    """`preheat_override='on'` for a PLA print is also an explicit act.
+
+    The user reached past the global toggle for this one print; the only thing
+    left to give them on a print with no chamber requirement is the warm bed,
+    so the stage runs rather than silently doing nothing.
+    """
+    db = AsyncMock()
+    client = _make_client()
+    item.preheat_override = "on"
+
+    with (
+        # Global off -- 'on' is carrying the whole decision.
+        patch.object(scheduler, "_get_bool_setting", AsyncMock(return_value=False)),
+        patch.object(scheduler, "_get_int_setting", _ints(preheat_soak_seconds=0)),
+        patch.object(scheduler, "_get_setting", AsyncMock(return_value=None)),
+        patch("backend.app.services.print_scheduler.printer_manager") as pm,
+        patch("backend.app.services.print_scheduler.asyncio.sleep", AsyncMock()),
+    ):
+        pm.get_client.return_value = client
+        pm.get_status.return_value = _make_state(60.0, 0.0, trays=["PLA"])
         await scheduler._preheat_and_soak(db, item, _make_printer("H2D"), archive)
 
     client.set_bed_temperature.assert_called_once_with(60)
@@ -224,24 +319,29 @@ async def test_pla_only_derives_zero_chamber_skips(scheduler, item, archive):
 @pytest.mark.asyncio
 async def test_unknown_filament_type_falls_to_default(scheduler, item, archive):
     """A loaded tray with a type not in the map uses the `default` entry —
-    keeps users with custom filament names safe (they get 0 by default,
-    can be tuned via the per-filament editor)."""
+    keeps users with custom filament names safe.
+
+    Asserted against a tuned map rather than the bundled one: `default` ships
+    at 0, and since #3041 a derived 0 skips the stage before any command goes
+    out, so the bundled map cannot tell "fell through to default" apart from
+    "found nothing at all". Raising `default` makes the fallback visible.
+    """
     db = AsyncMock()
     client = _make_client()
 
     with (
         patch.object(scheduler, "_get_bool_setting", AsyncMock(return_value=True)),
         patch.object(scheduler, "_get_int_setting", _ints(preheat_soak_seconds=0)),
-        patch.object(scheduler, "_get_setting", AsyncMock(return_value=None)),
+        patch.object(scheduler, "_get_setting", AsyncMock(return_value='{"PLA": 0, "default": 35}')),
         patch("backend.app.services.print_scheduler.printer_manager") as pm,
         patch("backend.app.services.print_scheduler.asyncio.sleep", AsyncMock()),
     ):
         pm.get_client.return_value = client
-        pm.get_status.return_value = _make_state(60.0, 0.0, trays=["MyCustomFilament"])
+        pm.get_status.return_value = _make_state(60.0, 36.0, trays=["MyCustomFilament"])
         await scheduler._preheat_and_soak(db, item, _make_printer("H2D"), archive)
 
     client.set_bed_temperature.assert_called_once_with(60)
-    client.set_chamber_temperature.assert_not_called()  # default = 0
+    client.set_chamber_temperature.assert_called_once_with(35)
 
 
 @pytest.mark.asyncio
@@ -295,21 +395,70 @@ async def test_malformed_filament_targets_falls_back_to_defaults(scheduler, item
 
 
 @pytest.mark.asyncio
-async def test_no_bed_temperature_in_archive_skips(scheduler, item):
-    """Archive without bed_temperature metadata skips entirely rather than
-    guessing a default that might wreck a non-PLA print."""
+async def test_no_bed_temperature_but_chamber_needed_heats_bed_to_configured_temp(scheduler, item):
+    """Archive without bed_temperature still preheats when the chamber needs heat.
+
+    This branch used to return early, on the reasoning that guessing a bed
+    temperature could wreck a print. Two things make the fallback safe, and
+    skipping actively harmful:
+
+    * Preheat's bed target is transient. The print's own gcode issues its
+      M140/M190 the moment it starts, so preheat can never set the temperature
+      the print actually runs at — it only decides how warm things are while
+      the file uploads.
+    * The fallback is gated on a non-zero chamber target, so it only applies to
+      materials the filament map says want a hot chamber (ABS/ASA/PC …). The
+      original concern — inventing a bed temperature for a PLA print — is still
+      guarded, and covered by the sibling test below.
+
+    Skipping meant a chamber-heated print whose slicer metadata carries no bed
+    temperature started with a cold chamber, which is what preheat exists to
+    prevent.
+    """
     db = AsyncMock()
     client = _make_client()
-    bare_archive = SimpleNamespace(bed_temperature=None)
+    bare_archive = SimpleNamespace(file_path=None, bed_temperature=None)
 
     with (
         patch.object(scheduler, "_get_bool_setting", AsyncMock(return_value=True)),
-        patch.object(scheduler, "_get_int_setting", _ints()),
+        patch.object(
+            scheduler,
+            "_get_int_setting",
+            _ints(queue_keep_warm_bed_temp=90, preheat_soak_seconds=0, preheat_max_wait_seconds=0),
+        ),
+        patch.object(scheduler, "_get_setting", AsyncMock(return_value=None)),
+        patch("backend.app.services.print_scheduler.printer_manager") as pm,
+        patch("backend.app.services.print_scheduler.asyncio.sleep", AsyncMock()),
+    ):
+        pm.get_client.return_value = client
+        # Bed/chamber already at temperature so the convergence loop exits on its
+        # first pass — its deadline is wall-clock, so a mocked `asyncio.sleep`
+        # would otherwise spin for the full max_wait in real time.
+        pm.get_status.return_value = _make_state(90.0, 46.0, trays=["ABS"])
+        await scheduler._preheat_and_soak(db, item, _make_printer("H2D"), bare_archive)
+
+    client.set_bed_temperature.assert_called_once_with(90)
+
+
+@pytest.mark.asyncio
+async def test_no_bed_temperature_and_no_chamber_target_still_skips(scheduler, item):
+    """PLA (chamber target 0) with no bed metadata → skip, as before.
+
+    Preserves the original guard: with nothing to preheat *for*, no bed
+    temperature is invented for the print.
+    """
+    db = AsyncMock()
+    client = _make_client()
+    bare_archive = SimpleNamespace(file_path=None, bed_temperature=None)
+
+    with (
+        patch.object(scheduler, "_get_bool_setting", AsyncMock(return_value=True)),
+        patch.object(scheduler, "_get_int_setting", _ints(queue_keep_warm_bed_temp=90)),
         patch.object(scheduler, "_get_setting", AsyncMock(return_value=None)),
         patch("backend.app.services.print_scheduler.printer_manager") as pm,
     ):
         pm.get_client.return_value = client
-        pm.get_status.return_value = _make_state(trays=["ABS"])
+        pm.get_status.return_value = _make_state(trays=["PLA"])
         await scheduler._preheat_and_soak(db, item, _make_printer("H2D"), bare_archive)
 
     client.set_bed_temperature.assert_not_called()
@@ -359,7 +508,10 @@ async def test_p1s_no_chamber_sensor_uses_soak_timer_only(scheduler, item, archi
 
     client.set_bed_temperature.assert_called_once_with(60)
     client.set_chamber_temperature.assert_not_called()
-    assert 600 in [call.args[0] for call in sleep_mock.call_args_list]
+    # The soak is slept in slices so a cancellation landing mid-hold is noticed
+    # (a single 600s sleep could not see one), so assert the total rather than a
+    # single call of the full duration.
+    assert sum(call.args[0] for call in sleep_mock.call_args_list) == 600
 
 
 @pytest.mark.asyncio
@@ -379,7 +531,8 @@ async def test_lost_client_skips_silently(scheduler, item, archive):
 
 
 @pytest.mark.asyncio
-async def test_h2d_flips_airduct_to_heating_before_m141(scheduler, item, archive):
+@pytest.mark.parametrize("model", ["H2D", "H2D Pro"])  # an H2D Pro is stored as "H2D Pro" (#3335)
+async def test_h2d_flips_airduct_to_heating_before_m141(scheduler, item, archive, model):
     """H-series + X2D have a cooling/heating airduct flap that DEFAULTS to
     cooling. If we energise M141 without first flipping to heating, the
     chamber fan actively extracts the heat we're trying to put in and the
@@ -400,13 +553,36 @@ async def test_h2d_flips_airduct_to_heating_before_m141(scheduler, item, archive
     ):
         pm.get_client.return_value = client
         pm.get_status.return_value = _make_state(60.0, 46.0, trays=["ABS"])
-        await scheduler._preheat_and_soak(db, item, _make_printer("H2D"), archive)
+        await scheduler._preheat_and_soak(db, item, _make_printer(model), archive)
 
     client.set_airduct_mode.assert_called_once_with("heating")
     client.set_chamber_temperature.assert_called_once_with(45)
     # Airduct heating must precede M141 — the heater enabling first while the
     # flap is still in cooling mode wastes minutes of fan-vs-heater tug-of-war.
     assert call_order == [("airduct", "heating"), ("chamber", 45)]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("model", ["X1E", "C13"])
+async def test_x1e_heats_the_chamber_without_an_airduct(scheduler, item, archive, model):
+    """The X1E has a chamber heater (to 60 °C) but no airduct flap: M141 fires,
+    set_airduct does not."""
+    db = AsyncMock()
+    client = _make_client()
+
+    with (
+        patch.object(scheduler, "_get_bool_setting", AsyncMock(return_value=True)),
+        patch.object(scheduler, "_get_int_setting", _ints(preheat_soak_seconds=0)),
+        patch.object(scheduler, "_get_setting", AsyncMock(return_value=None)),
+        patch("backend.app.services.print_scheduler.printer_manager") as pm,
+        patch("backend.app.services.print_scheduler.asyncio.sleep", AsyncMock()),
+    ):
+        pm.get_client.return_value = client
+        pm.get_status.return_value = _make_state(60.0, 46.0, trays=["ABS"])
+        await scheduler._preheat_and_soak(db, item, _make_printer(model), archive)
+
+    client.set_chamber_temperature.assert_called_once_with(45)
+    client.set_airduct_mode.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -448,20 +624,41 @@ async def test_normalize_filament_type_strips_at_space():
 
 
 @pytest.mark.asyncio
-async def test_get_preheat_filament_targets_defaults_when_missing(scheduler):
-    """Empty / null setting → bundled defaults are used. _get_preheat_filament_targets
-    upper-cases the keys, so the bundled `default` becomes `DEFAULT` on the
-    returned dict — keep both spellings synced."""
+@pytest.mark.parametrize("stored", [None, "", "not json at all", "[1, 2, 3]"])
+async def test_get_preheat_filament_targets_defaults_when_missing(scheduler, stored):
+    """Empty / null / malformed setting → bundled defaults are used.
+
+    Every path out of this function must honour the one contract its docstring
+    states: keys upper-cased, and DEFAULT present so the resolution loop can
+    index it unconditionally. The fallback paths used to hand the bundled
+    constant back as declared, with its lowercase `default`, so an install that
+    had never opened the setting returned a dict the loop could not read its
+    fallback out of. It happened to produce the right number only because that
+    default is 0 -- this test is what stops the constant changing and taking
+    every unconfigured install's chamber preheat down with it.
+    """
     db = AsyncMock()
-    with patch.object(scheduler, "_get_setting", AsyncMock(return_value=None)):
+    with patch.object(scheduler, "_get_setting", AsyncMock(return_value=stored)):
         targets = await scheduler._get_preheat_filament_targets(db)
-    # The bundled defaults dict is kept as-is on the "no setting" path, so
-    # `default` (lowercase) is what callers see for that fallback.
     assert targets["PLA"] == 0
     assert targets["ABS"] == 45
     assert targets["PA-CF"] == 55
-    # Either casing must resolve to the fallback 0.
-    assert targets.get("default", targets.get("DEFAULT")) == 0
+    assert "DEFAULT" in targets, "the resolution loop looks the fallback up by this exact key"
+    assert targets["DEFAULT"] == PrintScheduler.DEFAULT_PREHEAT_FILAMENT_TARGETS["default"]
+    assert all(key == key.upper() for key in targets), targets
+
+
+@pytest.mark.asyncio
+async def test_a_configured_map_reaches_the_loop_under_the_same_contract(scheduler):
+    """The editor writes the keys it displays, lowercase `default` included, so
+    the parsed path has always upper-cased. Both paths agree now."""
+    db = AsyncMock()
+    stored = '{"PLA": 0, "abs": 60, "default": 15}'
+    with patch.object(scheduler, "_get_setting", AsyncMock(return_value=stored)):
+        targets = await scheduler._get_preheat_filament_targets(db)
+    assert targets["ABS"] == 60
+    assert targets["DEFAULT"] == 15
+    assert all(key == key.upper() for key in targets), targets
 
 
 # ----------------------------------------------------------------------------
@@ -495,7 +692,8 @@ async def test_h2d_chamber_heat_switches_airduct_to_heating(scheduler, item, arc
 
 
 @pytest.mark.asyncio
-async def test_h2d_chamber_zero_switches_airduct_to_cooling(scheduler, item, archive):
+@pytest.mark.parametrize("model", ["H2D", "H2D Pro"])
+async def test_h2d_chamber_zero_switches_airduct_to_cooling(scheduler, item, archive, model):
     """H2D running a PLA print (chamber_target derives 0) on an airduct
     previously left in heating mode (from a prior ABS run) must switch
     back to cooling. Otherwise PLA prints inherit ABS's closed-flap recirc
@@ -513,7 +711,7 @@ async def test_h2d_chamber_zero_switches_airduct_to_cooling(scheduler, item, arc
         pm.get_client.return_value = client
         # Currently in heating (mode 1). PLA loaded → derived target 0.
         pm.get_status.return_value = _make_state(60.0, 30.0, trays=["PLA"], airduct_mode=1)
-        await scheduler._preheat_and_soak(db, item, _make_printer("H2D"), archive)
+        await scheduler._preheat_and_soak(db, item, _make_printer(model), archive)
 
     client.set_airduct_mode.assert_called_once_with("cooling")
     client.set_chamber_temperature.assert_not_called()
@@ -566,3 +764,45 @@ async def test_x1c_no_airduct_flap_never_fires_set_airduct(scheduler, item, arch
         await scheduler._preheat_and_soak(db, item, _make_printer("X1C"), archive)
 
     client.set_airduct_mode.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_a_filled_variant_preheats_like_its_base_material(monkeypatch):
+    """#2902 widened the type an AMS slot carries, so a slot that used to say
+    "ASA" can now say "ASA-GF". The chamber map has no ASA-GF row, and an
+    unknown type preheats to nothing -- so an ASA-GF print would have gone out
+    with a cold chamber. The specific type is still tried first, so the rows
+    that do exist for a variant (PETG-CF, PA-CF) are not traded down."""
+    from backend.app.services.print_scheduler import PrintScheduler
+
+    s = PrintScheduler()
+    # The map as every read of it sees it: upper-cased, so "DEFAULT" is the
+    # catch-all key rather than the lowercase one the Settings editor writes.
+    targets = PrintScheduler._bundled_preheat_targets()
+
+    # Deliberately the production method rather than a copy of its rule. This
+    # test used to reimplement the lookup inline, which meant it went on passing
+    # whatever _target_for_tray_type did (#3067).
+    def target_for(tray_type: str) -> int:
+        return s._target_for_tray_type(tray_type, targets)
+
+    assert target_for("ASA-GF") == targets["ASA"]
+    assert target_for("ASA-AERO") == targets["ASA"]
+    assert target_for("ABS-GF") == targets["ABS"]
+    # Variants listed in their own right keep their own row.
+    assert target_for("PETG-CF") == 40
+    assert target_for("PA-CF") == 55
+    # And a plain type is untouched.
+    assert target_for("PLA") == 0
+    # The polyamide spellings reach PA's row too, now that this shares the
+    # drying lookup's alias map (#3067). Stripping the suffix alone left PA6
+    # and PAHT on the catch-all, so those prints preheated to nothing.
+    assert target_for("PA6-CF") == targets["PA"]
+    assert target_for("PA12-CF") == targets["PA"]
+    assert target_for("PAHT-CF") == targets["PA"]
+    assert target_for("Nylon") == targets["PA"]
+    # An empty tray is not an unknown material: it reports no type at all and
+    # contributes no chamber target, where an unrecognised one takes the
+    # catch-all.
+    assert target_for("") == 0
+    assert target_for("   ") == 0

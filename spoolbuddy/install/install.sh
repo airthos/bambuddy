@@ -697,7 +697,10 @@ setup_bambuddy_venv() {
 
     run_with_progress "Creating Bambuddy venv" $PYTHON_CMD -m venv venv
     run_with_progress "Upgrading pip" "$INSTALL_PATH/venv/bin/pip" install --upgrade pip
-    run_with_progress "Installing Bambuddy dependencies" "$INSTALL_PATH/venv/bin/pip" install -r requirements.txt
+    # The tested pins; requirements.txt only for a checkout from before the lock.
+    local requirements=requirements.lock
+    [ -f "$requirements" ] || requirements=requirements.txt
+    run_with_progress "Installing Bambuddy dependencies" "$INSTALL_PATH/venv/bin/pip" install -r "$requirements"
 
     chown -R "$BAMBUDDY_SERVICE_USER:$BAMBUDDY_SERVICE_USER" "$INSTALL_PATH/venv"
 }
@@ -756,6 +759,15 @@ create_bambuddy_directories() {
 create_bambuddy_service() {
     info "Creating Bambuddy systemd service..."
 
+    # ProtectHome=true hides /home/* from the service, which breaks ExecStart
+    # when INSTALL_PATH lives under /home (issue #1685, as in install/install.sh).
+    # Read-only there keeps the venv binary resolvable; ReadWritePaths below
+    # re-grants writes for the install's data and log dirs.
+    local protect_home="true"
+    if [[ "$INSTALL_PATH" == /home/* ]]; then
+        protect_home="read-only"
+    fi
+
     # Overwriting the unit used to silently drop any ReadWritePaths the operator
     # had added — a NAS share for Scheduled Backups, typically — after which the
     # backups failed with EROFS, which looks like a permission problem and is not
@@ -808,10 +820,17 @@ TimeoutStopSec=30
 StandardOutput=journal
 StandardError=journal
 
+# Allow binding to privileged ports (322 RTSP, 990 FTPS) for Virtual Printer
+# mode. The Bambuddy-only installer has had this since #757; this unit did not,
+# so a full-mode install produced a virtual printer whose sockets never opened
+# (#2549). Compatible with NoNewPrivileges below — systemd raises the ambient
+# set at exec, which is not the escalation that setting forbids.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict
-ProtectHome=true
+ProtectHome=$protect_home
 # ProtectSystem=strict makes every path outside the ones below read-only for this
 # service. To back up to a NAS share, add it here or in a drop-in that survives a
 # reinstall: sudo systemctl edit bambuddy → [Service] → ReadWritePaths=/mnt/share

@@ -27,7 +27,6 @@ interface TrackedJob {
 
 interface SliceJobTrackerContextValue {
   trackJob: (id: number, kind: 'libraryFile' | 'archive', sourceName: string) => void;
-  activeJobs: TrackedJob[];
 }
 
 const SliceJobTrackerContext = createContext<SliceJobTrackerContextValue | null>(null);
@@ -197,6 +196,23 @@ export function SliceJobTrackerProvider({ children }: { children: ReactNode }) {
           t('slice.completedToast', 'Sliced {{name}}', { name: prettifyFilename(job.sourceName) }),
           'success',
         );
+        // The result normally lands next to its source, including on an
+        // external mount. When the mount can't take it the file is still
+        // kept — in managed storage — but the user has to be told, or they
+        // go looking on the share and find nothing (#2810).
+        const fallback =
+          state.result && 'external_write_fallback' in state.result
+            ? state.result.external_write_fallback
+            : null;
+        if (fallback) {
+          showToast(
+            t(
+              'slice.externalWriteFallbackToast',
+              'Saved to the internal library: the external folder could not be written to',
+            ),
+            'warning',
+          );
+        }
       } else if (state.status === 'failed') {
         setSliceError({
           name: prettifyFilename(job.sourceName),
@@ -273,7 +289,7 @@ export function SliceJobTrackerProvider({ children }: { children: ReactNode }) {
   }, [activeJobs.length, renderProgressToast]);
 
   return (
-    <SliceJobTrackerContext.Provider value={{ trackJob, activeJobs }}>
+    <SliceJobTrackerContext.Provider value={{ trackJob }}>
       {children}
       {sliceError && (
         <AlertModal

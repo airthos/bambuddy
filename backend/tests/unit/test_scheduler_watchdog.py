@@ -13,6 +13,7 @@ belt-and-braces for slow transitions that also don't emit an early subtask_id
 tick.
 """
 
+import itertools
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -585,6 +586,23 @@ class TestWatchdogRetryBudget:
         notify.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_a_send_that_never_started_drops_its_colour_note(self, db_session):
+        """#3279: the note says a slot printed in another colour; a print that
+        never started printed in none, on the pending row or the failed one."""
+        note = '[{"slot_id": 1, "type": "PLA", "wanted": "#A4AAAC", "got": "#000000", "tray": 1}]'
+        async with db_session() as db:
+            item = await db.get(PrintQueueItem, 1)
+            item.color_substitutions = note
+            await db.commit()
+
+        await self._wedge(db_session)
+
+        async with db_session() as db:
+            item = await db.get(PrintQueueItem, 1)
+            assert item.status == "pending"
+            assert item.color_substitutions is None
+
+    @pytest.mark.asyncio
     async def test_a_successful_start_never_touches_the_counter(self, db_session):
         """Only the revert path increments. A printer that picks the job up
         must not accumulate attempts towards a future give-up."""
@@ -722,3 +740,217 @@ class TestWatchdogCommandRejected:
             item = await db.get(PrintQueueItem, 1)
             assert item.status == "printing"
             assert item.dispatch_attempts == 0
+
+
+def _drying_status(state: str, subtask_id: str | None = None, *, drying: dict[int, int] | None = None, **kw):
+    """``_status`` plus the ``raw_data['ams']`` shape the drying probe reads.
+
+    ``drying`` maps AMS unit id -> dry_time in minutes (0 = idle unit).
+    """
+    st = _status(state, subtask_id, **kw)
+    st.raw_data = {"ams": [{"id": i, "dry_time": t} for i, t in (drying or {}).items()]}
+    return st
+
+
+class TestDryingAmsIds:
+    """``_drying_ams_ids`` is a diagnostic read of firmware telemetry (#2758)."""
+
+    def test_reports_units_with_time_remaining(self):
+        from backend.app.services.print_scheduler import _drying_ams_ids
+
+        assert _drying_ams_ids(_drying_status("IDLE", drying={0: 45, 1: 0, 128: 12})) == [0, 128]
+
+    def test_no_raw_data_is_not_an_error(self):
+        """Every watchdog poll calls this, including against the bare status
+        objects other tests build, so a missing field must read as 'not drying'
+        rather than raise inside the dispatch loop."""
+        from backend.app.services.print_scheduler import _drying_ams_ids
+
+        assert _drying_ams_ids(_status("IDLE")) == []
+        assert _drying_ams_ids(SimpleNamespace(raw_data={})) == []
+
+    def test_unparseable_entries_are_skipped_not_fatal(self):
+        from backend.app.services.print_scheduler import _drying_ams_ids
+
+        status = SimpleNamespace(raw_data={"ams": ["nonsense", {"id": 2, "dry_time": "20"}, {"dry_time": None}]})
+        assert _drying_ams_ids(status) == [2]
+
+
+class TestWatchdogNamesDryingAsTheObstacle:
+    """#2758: an X2D with two AMS units drying accepted the file and never
+    started. The watchdog waited out both phases three times, re-uploading the
+    whole 3MF each lap, and closed with a message about the SD card — while the
+    actual obstacle was on the printer's own screen the whole time.
+
+    Detection only. Bambuddy does not stop the cycle: this hardware supports
+    drying concurrently with an active print, so drying is not incompatible with
+    printing, and it is not yet established whether the blocker is the drying or
+    the power budget of an AMS drying without its external PSU.
+    """
+
+    @staticmethod
+    async def _wedge_while_drying(db_session, *, drying: dict[int, int], item_id: int = 1):
+        get_status = MagicMock(return_value=_drying_status("IDLE", "NEW_SUBTASK", gcode_file="/new.3mf", drying=drying))
+        with (
+            patch("backend.app.services.print_scheduler.printer_manager.get_status", get_status),
+            patch("backend.app.services.print_scheduler.printer_manager.get_client", MagicMock()),
+            patch("backend.app.services.print_scheduler.async_session", db_session),
+            patch("backend.app.core.database.async_session", db_session),
+            patch(
+                "backend.app.services.notification_service.notification_service.on_queue_job_failed",
+                AsyncMock(),
+            ),
+        ):
+            await PrintScheduler._watchdog_print_start(
+                queue_item_id=item_id,
+                printer_id=42,
+                pre_state="IDLE",
+                pre_subtask_id="OLD_SUBTASK",
+                pre_gcode_file="/old.3mf",
+                timeout=0.2,
+                phase_b_timeout=0.2,
+                poll_interval=0.05,
+            )
+
+    @pytest.mark.asyncio
+    async def test_give_up_message_names_the_drying_units(self, db_session):
+        for _ in range(DISPATCH_MAX_ATTEMPTS):
+            async with db_session() as db:
+                item = await db.get(PrintQueueItem, 1)
+                item.status = "printing"
+                await db.commit()
+            await self._wedge_while_drying(db_session, drying={0: 45, 128: 12})
+
+        async with db_session() as db:
+            item = await db.get(PrintQueueItem, 1)
+        assert item.status == "failed"
+        assert "AMS 0, AMS 128" in item.error_message
+        assert "were drying" in item.error_message
+        # The old text sent the reporter to check the SD card. It must not be
+        # what a drying-blocked dispatch says.
+        assert "SD card" not in item.error_message
+
+    @pytest.mark.asyncio
+    async def test_single_unit_reads_naturally(self, db_session):
+        for _ in range(DISPATCH_MAX_ATTEMPTS):
+            async with db_session() as db:
+                item = await db.get(PrintQueueItem, 1)
+                item.status = "printing"
+                await db.commit()
+            await self._wedge_while_drying(db_session, drying={128: 30})
+
+        async with db_session() as db:
+            item = await db.get(PrintQueueItem, 1)
+        assert "AMS 128 was drying" in item.error_message
+
+    @pytest.mark.asyncio
+    async def test_no_drying_keeps_the_original_message(self, db_session):
+        """The generic advice is still right when drying had nothing to do with
+        it — this must not become the answer to every stalled dispatch."""
+        for _ in range(DISPATCH_MAX_ATTEMPTS):
+            async with db_session() as db:
+                item = await db.get(PrintQueueItem, 1)
+                item.status = "printing"
+                await db.commit()
+            await self._wedge_while_drying(db_session, drying={0: 0})
+
+        async with db_session() as db:
+            item = await db.get(PrintQueueItem, 1)
+        assert item.status == "failed"
+        assert "SD card" in item.error_message
+        assert "drying" not in item.error_message
+
+    @pytest.mark.asyncio
+    async def test_a_cycle_that_ends_mid_window_is_still_reported(self, db_session):
+        """Latched, not level-tested. Drying finishing (or the user stopping it)
+        part-way through the dispatch window must not erase the fact that it was
+        what the printer was doing when it declined to start."""
+        drying = _drying_status("IDLE", "NEW_SUBTASK", gcode_file="/new.3mf", drying={1: 5})
+        finished = _drying_status("IDLE", "NEW_SUBTASK", gcode_file="/new.3mf", drying={1: 0})
+
+        for _ in range(DISPATCH_MAX_ATTEMPTS):
+            async with db_session() as db:
+                item = await db.get(PrintQueueItem, 1)
+                item.status = "printing"
+                await db.commit()
+            # Fresh per run: the first poll of each dispatch window sees the
+            # cycle, every later poll sees it finished.
+            get_status = MagicMock(side_effect=itertools.chain([drying], itertools.repeat(finished)))
+            with (
+                patch("backend.app.services.print_scheduler.printer_manager.get_status", get_status),
+                patch("backend.app.services.print_scheduler.printer_manager.get_client", MagicMock()),
+                patch("backend.app.services.print_scheduler.async_session", db_session),
+                patch("backend.app.core.database.async_session", db_session),
+                patch(
+                    "backend.app.services.notification_service.notification_service.on_queue_job_failed",
+                    AsyncMock(),
+                ),
+            ):
+                await PrintScheduler._watchdog_print_start(
+                    queue_item_id=1,
+                    printer_id=42,
+                    pre_state="IDLE",
+                    pre_subtask_id="OLD_SUBTASK",
+                    pre_gcode_file="/old.3mf",
+                    timeout=0.2,
+                    phase_b_timeout=0.2,
+                    poll_interval=0.05,
+                )
+
+        async with db_session() as db:
+            item = await db.get(PrintQueueItem, 1)
+        assert "AMS 1 was drying" in item.error_message
+
+    @pytest.mark.asyncio
+    async def test_drying_does_not_make_a_successful_start_fail(self, db_session):
+        """Drying is not an error condition. A printer that starts the job while
+        an AMS dries — which this hardware supports — must be left alone."""
+        get_status = MagicMock(return_value=_drying_status("RUNNING", "NEW_SUBTASK", drying={0: 45}))
+        with (
+            patch("backend.app.services.print_scheduler.printer_manager.get_status", get_status),
+            patch("backend.app.services.print_scheduler.async_session", db_session),
+            patch("backend.app.core.database.async_session", db_session),
+        ):
+            await PrintScheduler._watchdog_print_start(
+                queue_item_id=1,
+                printer_id=42,
+                pre_state="IDLE",
+                pre_subtask_id="OLD_SUBTASK",
+                timeout=0.3,
+                poll_interval=0.05,
+            )
+
+        async with db_session() as db:
+            item = await db.get(PrintQueueItem, 1)
+        assert item.status == "printing"
+        assert (item.dispatch_attempts or 0) == 0
+
+
+class TestARefusedStart:
+    """FW-C1: the printer answered the start with a refusal. Nothing will
+    start, and the command was not lost: no full wait, no reconnect."""
+
+    @pytest.mark.asyncio
+    async def test_reverts_at_once_without_a_reconnect(self, db_session):
+        get_status = MagicMock(return_value=_status("FINISH", "OLD_SUBTASK", gcode_file="/old.3mf"))
+        client = MagicMock(last_start_refusal=("FAIL", "file not found"))
+
+        with (
+            patch("backend.app.services.print_scheduler.printer_manager.get_status", get_status),
+            patch("backend.app.services.print_scheduler.printer_manager.get_client", MagicMock(return_value=client)),
+            patch("backend.app.services.print_scheduler.async_session", db_session),
+            patch("backend.app.core.database.async_session", db_session),
+        ):
+            await PrintScheduler._watchdog_print_start(
+                queue_item_id=1,
+                printer_id=42,
+                pre_state="FINISH",
+                pre_subtask_id="OLD_SUBTASK",
+                pre_gcode_file="/old.3mf",
+                timeout=30,
+                poll_interval=0.05,
+            )
+
+        client.force_reconnect_stale_session.assert_not_called()
+        async with db_session() as db:
+            assert (await db.get(PrintQueueItem, 1)).status == "pending"

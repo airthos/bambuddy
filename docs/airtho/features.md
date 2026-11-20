@@ -88,6 +88,13 @@ Commit `7a953506`, deployed 2026-06-12.
 
 Added 2026-06-29, committed 2026-07-02 as `1afe3156`.
 
+> **Moved 2026-11-19 (v1.3.1 sync)** into `_auto_clear_sdcard_faults()` in `main.py`,
+> called before upstream's notified-fault bookkeeping. Upstream #3226/#3486 report a fault
+> only once per 10 minutes and remember it across restarts, so clearing only "new" faults
+> (the original placement below) would leave a repeat uncleared and the HMS dispatch gate
+> closed. Throttled to one clear per printer per 30 s; now has tests
+> (`test_sdcard_hms_auto_clear.py`). The rest of this entry is the original design record.
+
 - **Why:** transient SD/MicroSD read/write HMS errors (especially `0500_C010`) spam a
   notification on every MQTT push and, worse, block the dispatch gate (any HMS at
   severity ≤2 counts as "not idle" in `_is_printer_idle`) until a human clicks "Clear
@@ -293,9 +300,9 @@ intervals — since it's sparse sampling, not continuous capture.
 
 ### Frontend
 - Sidebar nav: "Sentry" (Radar icon; started life as a standalone "Cameras" page,
-  `9e60f7ee`, renamed when recording landed). Grid/Detail toggle lives on that page:
-  Grid shows every printer's live camera at once (`pages/CamerasPage.tsx` +
-  `components/CameraGridTile.tsx`); Detail is the per-printer timeline
+  `9e60f7ee`, renamed when recording landed). The page (`pages/CamerasPage.tsx`) is
+  the per-printer timeline only; the live Grid view (`CameraGridTile.tsx`) was removed at
+  the v1.3.1 sync in favour of upstream's Cam Wall, which the page links to. The timeline is
   (`components/camera-timeline/CameraTimelineView.tsx` — 24h rail with mini-previews,
   scrubbable job and standby clips, mini timeline, plate overlay, speeds up to 100x,
   per-frame snapshot download, timelapse download).

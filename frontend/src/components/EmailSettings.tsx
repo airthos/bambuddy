@@ -9,6 +9,7 @@ import { Button } from './Button';
 import { useToast } from '../contexts/ToastContext';
 import { useEffect } from 'react';
 import { useAuth } from '../contexts/AuthContext';
+import { NumberInput } from './NumberInput';
 
 const SECURITY_PORT_MAP: Record<string, number> = {
   starttls: 587,
@@ -62,6 +63,15 @@ export function EmailSettings() {
       });
     }
   }, [existingSettings]);
+
+  // The saved password only goes to the server it was entered for.
+  const smtpPasswordNeedsReentry =
+    !!existingSettings &&
+    smtpSettings.smtp_auth_enabled &&
+    !smtpSettings.smtp_password &&
+    (smtpSettings.smtp_host !== existingSettings.smtp_host ||
+      smtpSettings.smtp_port !== existingSettings.smtp_port ||
+      smtpSettings.smtp_security !== existingSettings.smtp_security);
 
   const handleSecurityChange = (security: 'starttls' | 'ssl' | 'none') => {
     setSMTPSettings({
@@ -144,8 +154,10 @@ export function EmailSettings() {
       showToast(t('settings.email.errors.enterTestEmail'), 'error');
       return;
     }
+    // What the form holds, saved or not.
     testMutation.mutate({
       test_recipient: testEmail,
+      smtp: smtpSettings,
     });
   };
 
@@ -295,6 +307,9 @@ export function EmailSettings() {
                     disabled={!smtpSettings.smtp_auth_enabled}
                     className={smtpSettings.smtp_auth_enabled ? inputClasses : disabledInputClasses}
                   />
+                  {smtpPasswordNeedsReentry && (
+                    <p className="text-xs mt-1 text-yellow-400">{t('common.secretReenter')}</p>
+                  )}
                 </div>
               </div>
 
@@ -316,10 +331,12 @@ export function EmailSettings() {
                   <label className="block text-sm font-medium text-white mb-1">
                     {t('settings.email.smtpPort') || 'SMTP Port'}
                   </label>
-                  <input
-                    type="number"
+                  <NumberInput
                     value={smtpSettings.smtp_port}
-                    onChange={(e) => handlePortChange(parseInt(e.target.value) || 587)}
+                    onChange={handlePortChange}
+                    min={1}
+                    max={65535}
+                    fallback={587}
                     placeholder="587"
                     className={inputClasses}
                   />

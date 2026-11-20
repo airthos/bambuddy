@@ -2,18 +2,22 @@ import { useState, useMemo } from 'react';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { useOutletContext } from 'react-router-dom';
-import { Search, X, Package } from 'lucide-react';
+import { Search, X, Package, QrCode } from 'lucide-react';
 import { api } from '../../api/client';
 import type { InventorySpool } from '../../api/client';
 import { resolveSpoolColorName, getSwatchStyle, spoolColorString } from '../../utils/colors';
-import { formatSlotLabel } from '../../utils/amsHelpers';
+import { SpoolPaint, SpoolShade } from '../../components/spoolbuddy/SpoolIcon';
+import { hasFilamentPaint, spoolSwatchStyle } from '../../components/spoolbuddy/spoolPaint';
+import { formatAssignmentSlotLabel } from '../../utils/amsHelpers';
 import { filterSpoolsByQuery } from '../../utils/inventorySearch';
+import { useColorCatalogVersion } from '../../hooks/useColorCatalogVersion';
 import { InventorySpoolInfoCard } from '../../components/spoolbuddy/InventorySpoolInfoCard';
 import { AssignToAmsModal } from '../../components/spoolbuddy/AssignToAmsModal';
+import { QrAssignTargetModal } from '../../components/QrAssignTargetModal';
 import type { SpoolBuddyOutletContext } from '../../components/spoolbuddy/SpoolBuddyLayout';
 import { useToast } from '../../contexts/ToastContext';
 
-type SlotInfo = { ams_id: number; tray_id: number; printer_name?: string | null };
+type SlotInfo = { ams_id: number; tray_id: number; printer_name?: string | null; printer_model?: string | null };
 
 type FilterMode = 'all' | 'in_ams' | string; // string = material name
 
@@ -37,13 +41,26 @@ function spoolDisplayName(spool: InventorySpool): string {
 }
 
 function assignmentLabel(a: SlotInfo): string {
-  const isExternal = a.ams_id === 254 || a.ams_id === 255;
-  const isHt = !isExternal && a.ams_id >= 128;
-  return formatSlotLabel(a.ams_id, a.tray_id, isHt, isExternal);
+  return formatAssignmentSlotLabel(a);
 }
 
 /* Spool circle — same style as AMS page tray slots */
-function SpoolCircle({ color, size = 56 }: { color: string; size?: number }) {
+function SpoolCircle({ color, spool, size = 56 }: { color: string; spool?: InventorySpool; size?: number }) {
+  if (hasFilamentPaint(spool)) {
+    // Extra colours or an effect: paint the two rings with the Filament page's
+    // background and keep the shine and hub from the SVG on top (#3033).
+    return (
+      <div className="relative shrink-0" style={{ width: size, height: size }}>
+        <SpoolPaint spool={spool} size={size} inset={2 / 56} />
+        <SpoolShade inset={8 / 56} />
+        <svg className="absolute inset-0" width={size} height={size} viewBox="0 0 56 56">
+          <ellipse cx="20" cy="20" rx="6" ry="4" fill="white" opacity="0.3" />
+          <circle cx="28" cy="28" r="8" fill="#2d2d2d" />
+          <circle cx="28" cy="28" r="5" fill="#1a1a1a" />
+        </svg>
+      </div>
+    );
+  }
   return (
     <svg width={size} height={size} viewBox="0 0 56 56">
       <circle cx="28" cy="28" r="26" fill={color} />
@@ -65,12 +82,16 @@ function SpoolCircle({ color, size = 56 }: { color: string; size?: number }) {
 export function SpoolBuddyInventoryPage() {
   const { sbState, selectedPrinterId } = useOutletContext<SpoolBuddyOutletContext>();
   const { t } = useTranslation();
+  // The spool filter below resolves colour names through the catalog; its
+  // memo has to recompute when the catalog finishes loading (#3090).
+  const colorCatalogVersion = useColorCatalogVersion();
   const { showToast } = useToast();
   const queryClient = useQueryClient();
   const [searchQuery, setSearchQuery] = useState('');
   const [filterMode, setFilterMode] = useState<FilterMode>('all');
   const [selectedSpoolId, setSelectedSpoolId] = useState<number | null>(null);
   const [showAssignAmsModal, setShowAssignAmsModal] = useState(false);
+  const [qrTargetModalOpen, setQrTargetModalOpen] = useState(false);
 
   const { data: spoolmanSettings } = useQuery({
     queryKey: ['spoolman-settings'],
@@ -114,11 +135,11 @@ export function SpoolBuddyInventoryPage() {
   const assignmentMap = useMemo((): Record<number, SlotInfo> => {
     if (spoolmanMode) {
       const map: Record<number, SlotInfo> = {};
-      spoolmanAssignments.forEach(a => { map[a.spoolman_spool_id] = { ams_id: a.ams_id, tray_id: a.tray_id }; });
+      spoolmanAssignments.forEach(a => { map[a.spoolman_spool_id] = { ams_id: a.ams_id, tray_id: a.tray_id, printer_model: a.printer_model }; });
       return map;
     }
     const map: Record<number, SlotInfo> = {};
-    assignments.forEach(a => { map[a.spool_id] = { ams_id: a.ams_id, tray_id: a.tray_id, printer_name: a.printer_name }; });
+    assignments.forEach(a => { map[a.spool_id] = { ams_id: a.ams_id, tray_id: a.tray_id, printer_name: a.printer_name, printer_model: a.printer_model }; });
     return map;
   }, [spoolmanMode, assignments, spoolmanAssignments]);
 
@@ -137,6 +158,11 @@ export function SpoolBuddyInventoryPage() {
 
   // Filter and sort
   const filteredSpools = useMemo(() => {
+    // Named so this memo depends on it: the search below resolves colour
+    // names through the catalog, which `resolveSpoolColorName` reads from
+    // module state the linter cannot follow. Without it a query typed
+    // before the catalog loads keeps its empty result (#3090).
+    void colorCatalogVersion;
     let list = activeSpools;
 
     if (filterMode === 'in_ams') {
@@ -154,12 +180,21 @@ export function SpoolBuddyInventoryPage() {
       if (aAssigned !== bAssigned) return aAssigned - bAssigned;
       return new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
     });
-  }, [activeSpools, filterMode, searchQuery, assignedSpoolIds]);
+  }, [activeSpools, filterMode, searchQuery, assignedSpoolIds, colorCatalogVersion]);
 
   return (
     <div className="h-full flex flex-col">
       {/* Search + filter pills */}
       <div className="px-3 pt-3 pb-2 space-y-2.5">
+        {/* Scan-to-location (#1574) */}
+        <button
+          onClick={() => setQrTargetModalOpen(true)}
+          className="w-full flex items-center justify-center gap-2 py-2 bg-bambu-green/20 border border-bambu-green text-bambu-green rounded-lg text-sm font-medium hover:bg-bambu-green/30 transition-colors"
+        >
+          <QrCode className="w-4 h-4" />
+          {t('inventory.qrAssign.button')}
+        </button>
+
         {/* Search */}
         <div className="relative">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-white/40" />
@@ -265,11 +300,20 @@ export function SpoolBuddyInventoryPage() {
               onClose={() => setShowAssignAmsModal(false)}
               spool={liveSpool}
               printerId={selectedPrinterId}
+              variant="kiosk"
               spoolmanMode={spoolmanMode}
             />
           </>
         );
       })()}
+
+      {qrTargetModalOpen && (
+        <QrAssignTargetModal
+          isOpen={qrTargetModalOpen}
+          onClose={() => setQrTargetModalOpen(false)}
+          spoolmanMode={spoolmanMode}
+        />
+      )}
     </div>
   );
 }
@@ -306,7 +350,7 @@ function CatalogCard({ spool, assignment, onClick }: {
   const color = spoolColor(spool);
   const pct = spoolPct(spool);
   const remaining = spoolRemaining(spool);
-  const colorName = resolveSpoolColorName(spool.color_name, spool.rgba);
+  const colorName = resolveSpoolColorName(spool.color_name, spool.rgba, spool.color_name_is_synthesized);
 
   return (
     <button
@@ -314,7 +358,7 @@ function CatalogCard({ spool, assignment, onClick }: {
       className="bg-bambu-dark-secondary rounded-xl p-3 flex flex-col items-center text-center gap-1.5 border border-transparent hover:border-bambu-green/50 transition-colors"
     >
       {/* Spool icon */}
-      <SpoolCircle color={color} size={56} />
+      <SpoolCircle color={color} spool={spool} size={56} />
 
       {/* Material + Subtype */}
       <p className="text-xs font-semibold text-white leading-tight truncate w-full">
@@ -325,7 +369,7 @@ function CatalogCard({ spool, assignment, onClick }: {
       <div className="flex items-center gap-1 min-w-0 max-w-full">
         <span
           className="w-2.5 h-2.5 rounded-full shrink-0 border border-white/10"
-          style={getSwatchStyle(spool.rgba)}
+          style={spoolSwatchStyle(spool) ?? getSwatchStyle(spool.rgba)}
         />
         <span className="text-[11px] text-white/50 truncate">
           {colorName || '-'}

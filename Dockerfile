@@ -52,10 +52,11 @@ RUN setcap cap_net_bind_service=+ep "$(readlink -f /usr/local/bin/python3)"
 # pip is upgraded to >=26.1 first to close CVE-2026-6357 — the python:3.13-slim
 # base image ships pip 26.0.1, which runs its self-update check after installing
 # wheels (so a hostile wheel could hijack stdlib imports during install).
-COPY requirements.txt ./
+# requirements.lock pins the exact versions that were tested (see CONTRIBUTING.md).
+COPY requirements.txt requirements.lock ./
 RUN --mount=type=cache,target=/root/.cache/pip \
     pip install --root-user-action=ignore --upgrade 'pip>=26.1.2' \
- && pip install --root-user-action=ignore -r requirements.txt
+ && pip install --root-user-action=ignore -r requirements.lock
 
 # Copy backend
 COPY backend/ ./backend/
@@ -71,15 +72,6 @@ COPY .git/HEAD ./.git/HEAD
 
 # Copy built frontend from builder stage
 COPY --from=frontend-builder /app/static ./static
-
-# Copy embedded GCode viewer static assets (PrettyGCode + Bambuddy adapter).
-# Served by the explicit @app.get("/gcode-viewer/{...}") routes in main.py,
-# which resolve files under (static_dir.parent / "gcode_viewer") = /app/gcode_viewer/.
-# Without this COPY the routes return a bare 404 at request time and the 3D
-# Preview iframe shows {"detail":"Not Found"} (see #1218). The directory is
-# vendored third-party JS — the Vite build does NOT stage it into static/,
-# the dev server serves it via a configureServer middleware that's dev-only.
-COPY gcode_viewer/ ./gcode_viewer/
 
 # Create data directories. Ownership is normalised at startup by the
 # entrypoint (chowns to PUID:PGID and drops privileges via gosu before

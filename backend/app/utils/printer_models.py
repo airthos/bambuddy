@@ -24,19 +24,26 @@ PRINTER_MODEL_MAP = {
     "Bambu Lab H2S": "H2S",
     "Bambu Lab X2D": "X2D",
     "Bambu Lab A2L": "A2L",
+    "Bambu Lab H3C": "H3C",
 }
 
 # Map from printer_model_id (internal codes in slice_info.config) to short names
-# These are the codes Bambu Studio uses internally
+# These are the codes Bambu Studio uses internally, and the same codes the
+# printers announce over SSDP (DevModel), so Printer.model can hold them too.
+# A real P1P 3MF carries printer_model_id "C11" next to "Bambu Lab P1P"; the
+# X1 Carbon's code is "BL-P001", not a C-code.
 PRINTER_MODEL_ID_MAP = {
     # X1 series
-    "C11": "X1C",
-    "C12": "X1",
+    "BL-P001": "X1C",
+    "BL-P002": "X1",
     "C13": "X1E",
     # P1 series
+    "C11": "P1P",
+    "C12": "P1S",
     "P1P": "P1P",
     "P1S": "P1S",
     # P2 series
+    "N7": "P2S",
     "P2S": "P2S",
     # X2 series
     "N6": "X2D",
@@ -55,6 +62,10 @@ PRINTER_MODEL_ID_MAP = {
     "O1C": "H2C",
     "O1C2": "H2C",
     "O1S": "H2S",
+    # H3 series ("Bambu Lab H3C.json" model_id). One extruder with nine
+    # nozzles in Studio's profile, so not in DUAL_NOZZLE_MODELS or
+    # NOZZLE_RACK_MODELS: the H2C's rack ids and left/right split don't fit it.
+    "N10": "H3C",
 }
 
 
@@ -71,10 +82,12 @@ CARBON_ROD_MODELS = frozenset(
         "X1E",
         "P1P",
         "P1S",
-        # Internal codes
-        "C11",  # X1C
-        "C12",  # X1
+        # Internal codes (dashes stripped, as the lookup strips them)
+        "BLP001",  # X1C (BL-P001)
+        "BLP002",  # X1 (BL-P002)
         "C13",  # X1E
+        "C11",  # P1P
+        "C12",  # P1S
     ]
 )
 
@@ -99,6 +112,7 @@ LINEAR_RAIL_MODELS = frozenset(
         "H2DPRO",
         "H2C",
         "H2S",
+        "H3C",
         # Internal codes
         "N1",  # A1 Mini
         "N2S",  # A1
@@ -112,6 +126,7 @@ LINEAR_RAIL_MODELS = frozenset(
         "O1C",  # H2C
         "O1C2",  # H2C (dual nozzle variant)
         "O1S",  # H2S
+        "N10",  # H3C
     ]
 )
 
@@ -176,6 +191,13 @@ NO_REMOTE_STORAGE_TOGGLE_MODELS = frozenset(
         # Display names (uppercase, no spaces)
         "P1S",
         "P1P",
+        # A2L (#3499): neither the printer (firmware 01.01.05.00) nor Bambu
+        # Studio or OrcaSlicer offers the option, per the reporter.
+        "A2L",
+        # Internal codes
+        "C11",  # P1P
+        "C12",  # P1S
+        "N9",  # A2L
     ]
 )
 
@@ -194,11 +216,12 @@ ETHERNET_MODELS = frozenset(
         "H2DPRO",
         "H2C",
         "H2S",
-        # Internal codes
-        "C11",  # X1C
+        # Internal codes (dashes stripped, as the lookup strips them)
+        "BLP001",  # X1C (BL-P001)
         "C13",  # X1E
         "N6",  # X2D
-        "P1S",  # P1S
+        "C12",  # P1S
+        "N7",  # P2S
         "O1D",  # H2D
         "O1E",  # H2D Pro
         "O2D",  # H2D Pro (alternate)
@@ -234,6 +257,31 @@ DUAL_NOZZLE_MODELS = frozenset(
 )
 
 
+# Printers with a swappable nozzle rack ("Vortek"): the H2C carries six
+# hotends in a rack and mounts one of them on its right extruder at a time.
+#
+# Why this needs its own set rather than reusing DUAL_NOZZLE_MODELS: on every
+# other dual-nozzle printer the dispatch `nozzle_mapping` values ARE the MQTT
+# extruder indices (0 = right, 1 = left). On a rack model the wire wants the
+# *physical* nozzle position for both carriages: the rack positions the
+# firmware reports as IDs 16-21 — see `device.nozzle.info` handling in
+# bambu_mqtt — and 1 for the fixed hotend, which is not its extruder index.
+# Note the H2C does not follow the 0 = right convention either: extruder
+# index 1 is the rack side, confirmed on hardware in #2800.
+# Sending an extruder index where a physical position is expected makes the
+# printer clean and level with one nozzle and then print with another, at the
+# wrong Z (#2800).
+NOZZLE_RACK_MODELS = frozenset(
+    [
+        # Display names (uppercase, no spaces)
+        "H2C",
+        # Internal codes
+        "O1C",  # H2C
+        "O1C2",  # H2C (dual nozzle variant)
+    ]
+)
+
+
 # Models where Bambu's own firmware/UI names the enclosure fan (big_fan2 /
 # airduct part id 3) "Exhaust" rather than "Chamber". On these the printer's
 # touchscreen and Bambu Studio both call it the exhaust fan, and on the P2S it
@@ -262,6 +310,31 @@ def uses_exhaust_fan_label(model: str | None) -> bool:
         return False
     normalized = model.strip().upper().replace(" ", "").replace("-", "")
     return normalized in EXHAUST_FAN_LABEL_MODELS
+
+
+# Models whose airduct part 10 is the RIGHT auxiliary fan and part 2 the left
+# one (#3373). Bambu Studio names the fans per model (resources/printers/*.json):
+# on the X2D (N6) "2" is Left(Aux) and "10" Right(Aux); on the P2S (N7) it is
+# the other way round.
+AUX_FANS_LEFT_FIRST_MODELS = frozenset(["X2D", "N6"])
+
+
+def aux_fan_sides(model: str | None) -> tuple[str, str]:
+    """Which side the ``aux`` (part 2) and ``aux2`` (part 10) fans are on: ("left"|"right", ...)."""
+    normalized = (model or "").strip().upper().replace(" ", "").replace("-", "")
+    if normalized in AUX_FANS_LEFT_FIRST_MODELS:
+        return "left", "right"
+    return "right", "left"
+
+
+# Ceiling for every chamber-temperature target the UI and API accept (manual
+# M141, the preheat filament map, the per-item preheat override, the chamber
+# quick-select presets). The H2 series (H2C / H2D / H2D Pro / H2S) and X2D
+# heat the chamber to 65 °C; X1E tops out at 60. We validate against the
+# highest of those and let the firmware clamp on the lower-ceiling models —
+# the preheat filament map is global rather than per printer, so a per-model
+# maximum could not be expressed there anyway.
+MAX_CHAMBER_TEMP_C = 65
 
 
 def has_ethernet(model: str | None) -> bool:
@@ -293,7 +366,8 @@ def has_remote_storage_toggle(model: str | None) -> bool:
 
     False for P1-series (has an SD slot, but no on-printer screen and no
     published `support_save_remote_print_file_to_storage` capability, so the
-    Bambu Studio toggle never renders). The external_storage diagnostic uses
+    Bambu Studio toggle never renders), and for the A2L, which offers the
+    option nowhere (#3499). The external_storage diagnostic uses
     this to skip rather than report an unresolvable fail (#2524). Defaults to
     True for unknown models so the check keeps working on anything not
     explicitly listed.
@@ -310,6 +384,67 @@ def is_dual_nozzle_model(model: str | None) -> bool:
         return False
     normalized = model.strip().upper().replace(" ", "").replace("-", "")
     return normalized in DUAL_NOZZLE_MODELS
+
+
+# Chamber heater runs only in the airduct's heating mode (in cooling mode the
+# H3C acks M141 and stays off; the H2 series heats in either).
+CHAMBER_HEATER_NEEDS_HEATING_MODE_MODELS = frozenset(["H3C", "N10"])
+
+# `mc_percent` counts the start sequence (an H3C is at ~20% on layer 0), so a
+# stopped print is charged by layers instead (usage_progress).
+PROGRESS_INCLUDES_START_SEQUENCE_MODELS = frozenset(["H3C", "N10"])
+
+AMS3H_MODELS = frozenset(["H3C", "N10"])
+
+
+def _model_key(model: str | None) -> str:
+    return model.strip().upper().replace(" ", "").replace("-", "") if isinstance(model, str) else ""
+
+
+def progress_includes_start_sequence(model: str | None) -> bool:
+    """True when the printer's progress percent counts its start sequence (H3C)."""
+    return _model_key(model) in PROGRESS_INCLUDES_START_SEQUENCE_MODELS
+
+
+def has_ams3h(model: str | None) -> bool:
+    """True for a model that comes with an AMS 3H (H3C)."""
+    return _model_key(model) in AMS3H_MODELS
+
+
+def usage_progress(
+    model: str | None,
+    progress: float | int | None,
+    layer_num: int | None,
+    total_layers: int | None,
+) -> float | int:
+    """How much of a stopped print was printed, in percent, for charging its filament.
+
+    The printer's own progress, except on a model whose progress counts the
+    start sequence: there the share of layers printed (0 before layer 1).
+    """
+    if not progress_includes_start_sequence(model):
+        return progress if progress is not None else 0.0
+    if layer_num and layer_num > 0 and total_layers and total_layers > 0:
+        return min(100.0, 100.0 * layer_num / total_layers)
+    return 0.0
+
+
+def chamber_heater_needs_heating_mode(model: str | None) -> bool:
+    """True when a chamber target only takes effect with the airduct in heating mode (H3C)."""
+    return _model_key(model) in CHAMBER_HEATER_NEEDS_HEATING_MODE_MODELS
+
+
+def is_nozzle_rack_model(model: str | None) -> bool:
+    """Return True if the model mounts its nozzles from a swappable rack (H2C).
+
+    Accepts both the display name and the internal SSDP code, because
+    ``BambuMQTTClient.model`` carries whichever the printer row happens to
+    hold — the same reason the P2S dispatch tweak checks ``("P2S", "N7")``.
+    """
+    if not model:
+        return False
+    normalized = model.strip().upper().replace(" ", "").replace("-", "")
+    return normalized in NOZZLE_RACK_MODELS
 
 
 def supports_nozzle_flow_type(model: str | None) -> bool:
@@ -337,6 +472,20 @@ def supports_nozzle_flow_type(model: str | None) -> bool:
         return True
     normalized = model.strip().upper().replace(" ", "").replace("-", "")
     return normalized not in SINGLE_NOZZLE_FLOW_MODELS
+
+
+# Models whose firmware predates Bambu's newer MQTT protocol, so Bambu Studio
+# re-reads an AMS tag on them with the M620 R gcode rather than ams_get_rfid
+# (#3206). Short display names (uppercase, no spaces).
+LEGACY_RFID_REFRESH_MODELS = frozenset(["X1", "X1C", "X1E", "P1P", "P1S", "A1", "A1MINI"])
+
+
+def uses_legacy_rfid_refresh(model: str | None) -> bool:
+    """True for models that may need M620 R instead of ams_get_rfid (#3206)."""
+    if not model:
+        return False
+    short = PRINTER_MODEL_ID_MAP.get(model.strip(), model)
+    return short.strip().upper().replace(" ", "") in LEGACY_RFID_REFRESH_MODELS
 
 
 def get_rod_type(model: str | None) -> str | None:

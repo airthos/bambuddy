@@ -14,10 +14,17 @@ import ssl
 import struct
 import subprocess
 import uuid
+import weakref
 from datetime import datetime
 from pathlib import Path
 
-from backend.app.core.logging_filters import redact_url_credentials
+from backend.app.utils.ffmpeg_output import (
+    FFMPEG_RTSP_LOGLEVEL,
+    NO_FFMPEG_OUTPUT,
+    read_ffmpeg_log_until_open,
+    reap_ffmpeg,
+    summarize_ffmpeg_stderr,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -54,6 +61,28 @@ _active_capture_pids: set[int] = set()
 # and they all do, from 10s to 30s — would never coalesce, which is exactly
 # the Obico-vs-snapshot pair from the report.
 _inflight_captures: dict[str, asyncio.Task[bytes | None]] = {}
+
+# In-flight connection handlers for each live TLS proxy server (#3001).
+#
+# This belongs on the server object, and for one release it lived there as an
+# instance attribute. That works on asyncio's own Server and raises
+# AttributeError on uvloop's, which is a Cython cdef class with no __dict__.
+# Every launch path this repo ships pins --loop asyncio (added for #1896), so
+# none of them could hit it -- but requirements.txt pins uvicorn[standard],
+# which installs uvloop, so anything launched without that flag gets uvloop
+# from --loop auto and loses every RTSP camera. That is real deployments: the
+# Proxmox VE Helper-Scripts LXC writes its own unit, and native installs
+# predating the #1896 pin never get it either, since update.sh does not rewrite
+# unit files. So the loop is not ours to assume, and this must not depend on it.
+# The test suite could not see it either: conftest builds the loop from the
+# default policy, so it only ever exercised the loop where the assignment is
+# legal.
+#
+# Keyed weakly so a server that is dropped without close_tls_proxy() -- an
+# exception between create and close -- takes its entry with it. Keying on
+# id(server) instead would leak those entries forever and, worse, hand a later
+# server a dead one's handler set once CPython recycles the address.
+_proxy_handlers: "weakref.WeakKeyDictionary[asyncio.Server, set[asyncio.Task]]" = weakref.WeakKeyDictionary()
 
 
 def get_ffmpeg_path() -> str | None:
@@ -159,7 +188,7 @@ def rtsp_socket_timeout_flag() -> str:
 def supports_rtsp(model: str | None) -> bool:
     """Check if printer model supports RTSP camera streaming.
 
-    RTSP supported: X1, X1C, X1E, X2D, H2C, H2D, H2DPRO, H2S, P2S
+    RTSP supported: X1, X1C, X1E, X2D, H2C, H2D, H2DPRO, H2S, H3C, P2S
     Chamber image only: A1, A1MINI, P1P, P1S
 
     Note: Model can be either display name (e.g., "P2S") or internal code (e.g., "N7").
@@ -172,14 +201,15 @@ def supports_rtsp(model: str | None) -> bool:
       - O1S: H2S
       - O1E, O2D: H2D Pro
       - N7: P2S
+      - N10: H3C
     """
     if model:
         model_upper = model.upper()
-        # Display names: X1, X1C, X1E, X2D, H2C, H2D, H2DPRO, H2S, P2S
-        if model_upper.startswith(("X1", "X2", "H2", "P2")):
+        # Display names: X1, X1C, X1E, X2D, H2C, H2D, H2DPRO, H2S, H3C, P2S
+        if model_upper.startswith(("X1", "X2", "H2", "H3", "P2")):
             return True
         # Internal codes for RTSP models
-        if model_upper in ("BL-P001", "C13", "N6", "O1D", "O1C", "O1C2", "O1S", "O1E", "O2D", "N7"):
+        if model_upper in ("BL-P001", "C13", "N6", "O1D", "O1C", "O1C2", "O1S", "O1E", "O2D", "N7", "N10"):
             return True
     # A1/P1 and unknown models use chamber image protocol
     return False
@@ -188,7 +218,7 @@ def supports_rtsp(model: str | None) -> bool:
 def get_camera_port(model: str | None) -> int:
     """Get the camera port based on printer model.
 
-    X1/X2/H2/P2 series use RTSP on port 322.
+    X1/X2/H2/H3/P2 series use RTSP on port 322.
     A1/P1 series use chamber image protocol on port 6000.
     """
     if supports_rtsp(model):
@@ -231,7 +261,8 @@ async def create_tls_proxy(target_host: str, target_port: int) -> tuple[int, "as
     rewrites ``127.0.0.1:<proxy_port>`` → ``<target_host>:<target_port>`` in
     client→server data so the printer recognises the stream path.
 
-    Returns ``(local_port, server)``.  Caller must close the server when done.
+    Returns ``(local_port, server)``.  Caller must close it with
+    :func:`close_tls_proxy` when done.
     """
     ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ssl_ctx.check_hostname = False
@@ -240,7 +271,22 @@ async def create_tls_proxy(target_host: str, target_port: int) -> tuple[int, "as
     # Filled in after the server socket is created (handler only runs after).
     _local_port: list[int] = [0]
 
+    # Strong references to the in-flight connection handlers (#2968).
+    # ``asyncio.start_server`` wraps the callback in a task and keeps only a
+    # weak reference to it, so a handler still awaiting its two forwarders can
+    # be garbage-collected out from under itself — which is asyncio's
+    # "Task was destroyed but it is pending!", logged at ERROR with a traceback
+    # pointing here and no indication that it is a teardown race rather than a
+    # camera fault. Holding the set also gives close_tls_proxy something to
+    # cancel, so shutdown stops depending on ffmpeg having dropped its end.
+    # The set is published in _proxy_handlers once the server exists; see the
+    # note there for why it is not an attribute on the server itself.
+    handlers: set[asyncio.Task] = set()
+
     async def _handle(client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter):
+        current = asyncio.current_task()
+        if current is not None:
+            handlers.add(current)
         tls_writer = None
         try:
             tls_reader, tls_writer = await asyncio.wait_for(
@@ -305,7 +351,19 @@ async def create_tls_proxy(target_host: str, target_port: int) -> tuple[int, "as
             )
         except (ConnectionError, OSError, TimeoutError) as e:
             logger.debug("TLS proxy connection to %s:%s failed: %s", target_host, target_port, e)
+        except asyncio.CancelledError:
+            # close_tls_proxy cancelling us at shutdown, which is the only thing
+            # that cancels this task. Swallowing a cancellation is normally
+            # wrong because it hides the request from whoever made it; here we
+            # *are* whoever made it, the cleanup it exists to trigger is in the
+            # finally below, and nothing awaits this task's result. Asyncio's
+            # own done-callback for a connection handler treats a cancelled task
+            # differently from a completed one, so ending in the ordinary way
+            # keeps the teardown on one path across Python versions.
+            pass
         finally:
+            if current is not None:
+                handlers.discard(current)
             for w in (client_writer, tls_writer):
                 if w and not w.is_closing():
                     try:
@@ -315,8 +373,36 @@ async def create_tls_proxy(target_host: str, target_port: int) -> tuple[int, "as
 
     server = await asyncio.start_server(_handle, "127.0.0.1", 0)
     _local_port[0] = server.sockets[0].getsockname()[1]
+    _proxy_handlers[server] = handlers
     logger.debug("TLS proxy for %s:%s listening on 127.0.0.1:%s", target_host, target_port, _local_port[0])
     return _local_port[0], server
+
+
+async def close_tls_proxy(server: "asyncio.Server") -> None:
+    """Shut a :func:`create_tls_proxy` server down without leaving tasks behind.
+
+    ``server.close()`` stops the listener but leaves established connections
+    running, and ``wait_closed()`` is only as deterministic as the peer: it
+    waits for the handlers, and a handler waits for ffmpeg to drop its end of
+    the socket. By the time this is called ffmpeg has already been reaped, so
+    the connection is dead weight — cancelling it is both correct and the only
+    way to guarantee no handler outlives the server that owns it.
+
+    ``Server.close_clients()`` would do this natively, but it landed in Python
+    3.13 and Bambuddy supports 3.11, so the handler set is tracked by hand in
+    ``_proxy_handlers``.
+
+    Safe to call on any ``asyncio.Server`` from anywhere else: a server that
+    was not created here is simply absent from the registry, and this degrades
+    to the close/wait it replaces.
+    """
+    handlers: set[asyncio.Task] = _proxy_handlers.pop(server, set())
+    server.close()
+    for task in list(handlers):
+        task.cancel()
+    if handlers:
+        await asyncio.gather(*list(handlers), return_exceptions=True)
+    await server.wait_closed()
 
 
 def is_chamber_image_model(model: str | None) -> bool:
@@ -325,12 +411,6 @@ def is_chamber_image_model(model: str | None) -> bool:
     A1, A1MINI, P1P, P1S use the chamber image protocol on port 6000.
     """
     return not supports_rtsp(model)
-
-
-def build_camera_url(ip_address: str, access_code: str, model: str | None) -> str:
-    """Build the RTSPS URL for the printer camera (RTSP models only)."""
-    port = get_camera_port(model)
-    return f"rtsps://bblp:{access_code}@{ip_address}:{port}/streaming/live/1"
 
 
 def _create_chamber_auth_payload(access_code: str) -> bytes:
@@ -692,14 +772,14 @@ async def _capture_camera_frame_bytes_uncoalesced(
 
     ffmpeg = get_ffmpeg_path()
     if not ffmpeg:
-        proxy_server.close()
-        await proxy_server.wait_closed()
+        await close_tls_proxy(proxy_server)
         logger.error("ffmpeg not found for camera frame capture")
         return None
 
     cmd = [
         ffmpeg,
         "-y",
+        *FFMPEG_RTSP_LOGLEVEL,
         "-rtsp_transport",
         "tcp",
         "-rtsp_flags",
@@ -729,20 +809,27 @@ async def _capture_camera_frame_bytes_uncoalesced(
 
         _active_capture_pids.add(process.pid)
         try:
-            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=timeout)
+            # The printer's answers reach ffmpeg through the proxy unchanged,
+            # so a redirect is refused here as for an external camera.
+            async with asyncio.timeout(timeout):
+                state, log = await read_ffmpeg_log_until_open(process)
+                stdout, stderr = await process.communicate()
         except TimeoutError:
-            process.kill()
-            await process.wait()
             logger.error("Camera frame bytes capture timed out after %ss", timeout)
             return None
+        stderr = log + stderr
 
-        if process.returncode == 0 and stdout and len(stdout) >= 100:
+        if state == "redirected":
+            return None
+        if state == "open" and process.returncode == 0 and stdout and len(stdout) >= 100:
             logger.info("Successfully captured camera frame bytes: %s bytes", len(stdout))
             return stdout
         else:
-            # ffmpeg echoes the RTSP input URL, which carries the access code.
-            stderr_text = redact_url_credentials(stderr.decode()) if stderr else "Unknown error"
-            logger.error("ffmpeg frame bytes capture failed (code %s): %s", process.returncode, stderr_text[:200])
+            # The summariser drops ffmpeg's banner and masks the access code
+            # the RTSP input URL carries; without it this line was 200
+            # characters of build configuration (#2968).
+            stderr_text = summarize_ffmpeg_stderr(stderr) or NO_FFMPEG_OUTPUT
+            logger.error("ffmpeg frame bytes capture failed (code %s): %s", process.returncode, stderr_text)
             return None
 
     except FileNotFoundError:
@@ -752,10 +839,11 @@ async def _capture_camera_frame_bytes_uncoalesced(
         logger.exception("Camera frame bytes capture failed: %s", e)
         return None
     finally:
+        # Killed however the capture ends, not only on its deadline (#3292).
+        await reap_ffmpeg(process)
         if process is not None:
             _active_capture_pids.discard(process.pid)
-        proxy_server.close()
-        await proxy_server.wait_closed()
+        await close_tls_proxy(proxy_server)
 
 
 async def extract_video_last_frame(video_path: Path, output_path: Path) -> bool:
@@ -815,25 +903,22 @@ async def extract_video_last_frame(video_path: Path, output_path: Path) -> bool:
             logger.warning(
                 "ffmpeg failed extracting last frame from %s: %s",
                 video_path,
-                stderr.decode(errors="replace")[:500],
+                summarize_ffmpeg_stderr(stderr) or NO_FFMPEG_OUTPUT,
             )
             return False
         if not output_path.exists() or output_path.stat().st_size == 0:
             logger.warning("ffmpeg produced no output for %s", video_path)
             return False
         return True
-    except asyncio.TimeoutError:
+    except TimeoutError:
         logger.warning("ffmpeg timed out extracting last frame from %s", video_path)
-        if process is not None:
-            try:
-                process.kill()
-                await process.wait()
-            except ProcessLookupError:
-                pass  # Already exited
         return False
     except OSError as e:
         logger.warning("ffmpeg subprocess error for %s: %s", video_path, e)
         return False
+    finally:
+        # Killed however this ends, not only on its deadline (#3292).
+        await reap_ffmpeg(process)
 
 
 def apply_camera_rotation(image_data: bytes, rotation: int, logger: logging.Logger) -> bytes:

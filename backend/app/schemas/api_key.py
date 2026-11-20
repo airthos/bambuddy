@@ -2,6 +2,8 @@ from datetime import datetime
 
 from pydantic import BaseModel
 
+from backend.app.schemas.not_null import IgnoresNullForRequiredColumns
+
 
 class APIKeyCreate(BaseModel):
     """Schema for creating a new API key."""
@@ -19,12 +21,15 @@ class APIKeyCreate(BaseModel):
     can_manage_projects: bool = True  # Create/update/delete projects + membership (add archives) (#1893)
     can_access_cloud: bool = False  # Read /cloud/* on the creator's behalf — default off (#1182)
     can_update_energy_cost: bool = False  # POST /settings/electricity-price only (#1356)
+    can_send_notifications: bool = False  # POST /notifications/app-message, PUT /external-links/badge only
     printer_ids: list[int] | None = None  # null = all printers
     expires_at: datetime | None = None
 
 
-class APIKeyUpdate(BaseModel):
+class APIKeyUpdate(IgnoresNullForRequiredColumns):
     """Schema for updating an API key."""
+
+    __orm_table__ = "api_keys"
 
     name: str | None = None
     can_queue: bool | None = None
@@ -37,6 +42,7 @@ class APIKeyUpdate(BaseModel):
     can_manage_projects: bool | None = None
     can_access_cloud: bool | None = None
     can_update_energy_cost: bool | None = None
+    can_send_notifications: bool | None = None
     printer_ids: list[int] | None = None
     enabled: bool | None = None
     expires_at: datetime | None = None
@@ -59,6 +65,7 @@ class APIKeyResponse(BaseModel):
     can_manage_projects: bool
     can_access_cloud: bool
     can_update_energy_cost: bool
+    can_send_notifications: bool
     printer_ids: list[int] | None
     enabled: bool
     last_used: datetime | None

@@ -1,6 +1,7 @@
 import { useState, useMemo, useEffect, useCallback } from 'react';
+import { bulkUpdateToast } from '../utils/queueBulkUpdate';
 import { useTranslation } from 'react-i18next';
-import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
+import { keepPreviousData, useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
 import { Link } from 'react-router-dom';
 import {
   DndContext,
@@ -19,6 +20,8 @@ import {
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
+import { queueItemDisplayName } from '../utils/queueItemName';
+import { queueItemThumbnailUrl } from '../utils/queueItemThumbnail';
 import {
   Clock,
   Trash2,
@@ -61,13 +64,20 @@ import {
   Ban,
   PlayCircle,
   Workflow,
+  ThumbsUp,
 } from 'lucide-react';
 import { api, ApiError } from '../api/client';
 import { PipelineRunsView } from './PipelineRunsPage';
 import { type TimeFormat, formatETA, formatDuration, formatRelativeTime, parseUTCDate } from '../utils/date';
 import { getBedTypeInfo } from '../utils/bedType';
-import type { PrintQueueItem, PrintQueueBulkUpdate, Permission, CalibrationMode } from '../api/client';
+import { getColorName } from '../utils/colors';
+import { productLineOf, useFilamentNameByIdx } from '../components/PrintModal/useFilamentLabels';
+import type { PrintQueueItem, PrintQueueBulkUpdate, Permission, CalibrationMode, PrinterStatus, SlotSpoolIdentity } from '../api/client';
+import { formatSlotLabel, getEmptySlotKind, isAmsHtUnit } from '../utils/amsHelpers';
+import { locateTray, trayLayoutOf } from '../utils/trayIds';
+import type { PlateMetadata } from '../types/plates';
 import { Card } from '../components/Card';
+import { FilamentSwatch } from '../components/FilamentSwatch';
 import { Button } from '../components/Button';
 import { ConfirmModal } from '../components/ConfirmModal';
 import { PrintModal } from '../components/PrintModal';
@@ -75,7 +85,204 @@ import { useToast } from '../contexts/ToastContext';
 import { useAuth } from '../contexts/AuthContext';
 import { QueueStatsBar } from '../components/QueueStatsBar';
 import { CompactHistoryRow } from '../components/CompactHistoryRow';
+import { ColorSubstitutionNotes } from '../components/ColorSubstitutionNotes';
 import { QueueTimelineView } from '../components/QueueTimelineView';
+import { compareQueueOrder } from '../utils/queueOrder';
+import { BatchOrdersView } from '../components/BatchOrdersView';
+import { ThumbnailHoverPreview } from '../components/ThumbnailHoverPreview';
+import { buildLoadedFilaments, type LoadedFilament } from '../hooks/useFilamentMapping';
+import { hasGcodeSnippets, useUiSettings } from '../hooks/useUiSettings';
+
+// The scheduler's MODEL_GATE_WAIT_REASON (print_scheduler.py).
+const MODEL_GATE_WAIT_REASON = 'The last print failed on every free matching printer';
+
+type QueueFilamentDisplay = {
+  slotId: number;
+  type: string;
+  color: string;
+  colorName: string;
+  slotLabel?: string;
+  spoolName?: string;
+  extraColors?: string;
+  effectType?: string;
+  subtype?: string;
+  /** The stored mapping names a slot the printer reports as empty. */
+  emptySlot?: boolean;
+};
+
+/**
+ * Slot label for a mapped tray the printer positively reports as empty.
+ *
+ * The scheduler dispatches a stored mapping as-is, so a spool unloaded after
+ * queueing leaves the job pointed at an empty slot. Returns undefined when the
+ * status doesn't describe that slot (offline, still loading, unit removed) or
+ * when the slot may still hold an unconfigured spool (a non-RFID spool has no
+ * tray_type either, #2527), so the card only warns on a positive finding.
+ */
+function emptyMappedSlotLabel(status: PrinterStatus | undefined, trayId: number): string | undefined {
+  if (!status?.connected) return undefined;
+  // null for an external input: the external holder reports no presence signal
+  // (the status route sends vt_tray without state / exists), so its emptiness
+  // can't be confirmed.
+  const located = locateTray(trayLayoutOf(status.ams, status.vt_tray), trayId);
+  if (!located) return undefined;
+  const [amsId, slot] = located;
+  const isHt = isAmsHtUnit(amsId);
+  const unit = status.ams?.find((ams) => ams.id === amsId);
+  const tray = isHt ? unit?.tray[0] : unit?.tray.find((candidate) => candidate.id === slot);
+  if (getEmptySlotKind(tray) !== 'physical') return undefined;
+  return formatSlotLabel(amsId, slot, isHt, false, unit?.ams_type);
+}
+
+/**
+ * The backup tray each mapped tray handed over to during the running print.
+ *
+ * With AMS Filament Backup on, a spool that runs out is replaced by an identical
+ * one in another slot, and the job's stored mapping still names the empty slot.
+ * The printer's tray log shows the switch: a tray the mapping doesn't name, right
+ * after the tray it took over from. A backup that runs out in turn hands over
+ * again, so the chain resolves to the slot the mapping named.
+ */
+function backupTrays(mapping: number[] | null | undefined, log: [number, number][] | undefined): Map<number, number> {
+  const backups = new Map<number, number>();
+  if (!mapping?.length || !log?.length) return backups;
+  const mapped = new Set(mapping.filter((tray) => tray >= 0));
+  // Backup tray -> the mapped tray it stands in for.
+  const standsInFor = new Map<number, number>();
+  let previous: number | undefined;
+  for (const [tray] of log) {
+    if (previous !== undefined && !mapped.has(tray) && !standsInFor.has(tray)) {
+      const original = mapped.has(previous) ? previous : standsInFor.get(previous);
+      if (original !== undefined) {
+        standsInFor.set(tray, original);
+        backups.set(original, tray);
+      }
+    }
+    previous = tray;
+  }
+  return backups;
+}
+
+function queueFilamentLabel(filament: QueueFilamentDisplay): string {
+  return filament.slotLabel
+    ? [
+        filament.slotLabel,
+        filament.spoolName || filament.type,
+        filament.colorName,
+      ].filter(Boolean).join(' · ')
+    : filament.colorName;
+}
+
+/**
+ * Resolve the filament colours a queued job is actually configured to use.
+ *
+ * Plate metadata is the source of truth for which 3MF slots the selected plate
+ * consumes. A queue-level override replaces only its matching slot, so a
+ * multi-colour job can mix original 3MF colours and user-selected overrides
+ * without losing either (#3132).
+ */
+function resolveQueueFilaments(
+  item: PrintQueueItem,
+  plates: PlateMetadata[],
+  loadedFilaments: LoadedFilament[] = [],
+  status?: PrinterStatus,
+  emptyLabel = 'Empty',
+  filamentNameByIdx: Record<string, string> = {},
+): QueueFilamentDisplay[] {
+  // A stored AMS mapping names the physical tray that will actually feed a 3MF
+  // slot. Once its live tray data is available, that is more specific than
+  // either the queue override or the original slice. When the printer reports
+  // that tray as empty, keep the intended colour but say the slot is empty.
+  // While the job prints, a slot whose spool ran out shows the backup spool the
+  // printer switched to instead.
+  const backups =
+    item.status === 'printing' ? backupTrays(item.ams_mapping, status?.tray_change_log) : new Map<number, number>();
+  const resolveSlot = (planned: QueueFilamentDisplay): QueueFilamentDisplay => {
+    const slotId = planned.slotId;
+    const storedTrayId = slotId > 0 ? item.ams_mapping?.[slotId - 1] : undefined;
+    if (storedTrayId == null || storedTrayId < 0) return planned;
+    const mappedTrayId = backups.get(storedTrayId) ?? storedTrayId;
+    const loaded = loadedFilaments.find((filament) => filament.globalTrayId === mappedTrayId);
+    if (loaded) {
+      return {
+        slotId,
+        type: loaded.type,
+        color: loaded.color,
+        colorName: loaded.colorName,
+        slotLabel: loaded.label,
+        spoolName: loaded.spoolName,
+        extraColors: loaded.extraColors,
+        effectType: loaded.effectType,
+        subtype: loaded.spoolSubtype,
+      };
+    }
+    const emptySlotLabel = emptyMappedSlotLabel(status, mappedTrayId);
+    if (emptySlotLabel) {
+      return { ...planned, slotLabel: emptySlotLabel, spoolName: emptyLabel, emptySlot: true };
+    }
+    return planned;
+  };
+
+  const selectedPlate =
+    item.plate_id != null
+      ? plates.find((plate) => plate.index === item.plate_id)
+      : plates[0];
+
+  if (selectedPlate) {
+    const overrides = new Map(
+      (item.filament_overrides ?? []).map((override) => [override.slot_id, override]),
+    );
+
+    return selectedPlate.filaments
+      .filter((filament) => filament.used_in_plate !== false && filament.used_grams > 0)
+      .map((filament) => {
+        const override = overrides.get(filament.slot_id);
+        const color = override?.color ?? filament.color;
+        const type = override?.type ?? filament.type;
+        // An override is another filament: the plate's preset is not its own.
+        const productLine = override
+          ? productLineOf(override.tray_info_idx, override.type, filamentNameByIdx)
+          : productLineOf(filament.tray_info_idx, filament.type, filamentNameByIdx);
+
+        return resolveSlot({
+          slotId: filament.slot_id,
+          type,
+          color,
+          colorName: override?.color_name?.trim() || getColorName(color, productLine),
+        });
+      });
+  }
+
+  // The queue row can render before plate metadata arrives (or an old source
+  // may no longer expose it). Prefer a resolved physical tray when possible,
+  // then explicit queue overrides because they describe the user's intention.
+  if (item.filament_overrides?.length) {
+    return item.filament_overrides.map((override) =>
+      resolveSlot({
+        slotId: override.slot_id,
+        type: override.type,
+        color: override.color,
+        colorName:
+          override.color_name?.trim() ||
+          getColorName(override.color, productLineOf(override.tray_info_idx, override.type, filamentNameByIdx)),
+      }),
+    );
+  }
+
+  // Last-resort compatibility fallback for older/simpler queue responses.
+  if (item.filament_color) {
+    return [
+      resolveSlot({
+        slotId: 1,
+        type: item.filament_type ?? '',
+        color: item.filament_color,
+        colorName: getColorName(item.filament_color, item.filament_type),
+      }),
+    ];
+  }
+
+  return [];
+}
 
 function formatWeight(g: number, useKg = false): string {
   if (useKg && g >= 1000) return `${(g / 1000).toFixed(1)}kg`;
@@ -130,6 +337,7 @@ function BulkEditModal({
   onClose,
   isSaving,
   canControlPrinter,
+  hasGcodeSnippets,
   t,
 }: {
   selectedCount: number;
@@ -138,18 +346,21 @@ function BulkEditModal({
   onClose: () => void;
   isSaving: boolean;
   canControlPrinter: boolean;
+  hasGcodeSnippets: boolean;
   t: (key: string, options?: Record<string, unknown>) => string;
 }) {
   const [printerId, setPrinterId] = useState<number | null | 'unchanged'>('unchanged');
   const [manualStart, setManualStart] = useState<boolean | 'unchanged'>('unchanged');
   const [autoOffAfter, setAutoOffAfter] = useState<boolean | 'unchanged'>('unchanged');
   const [requirePreviousSuccess, setRequirePreviousSuccess] = useState<boolean | 'unchanged'>('unchanged');
+  const [gcodeInjection, setGcodeInjection] = useState<boolean | 'unchanged'>('unchanged');
   const [bedLevelling, setBedLevelling] = useState<CalibrationMode | 'unchanged'>('unchanged');
   const [flowCali, setFlowCali] = useState<CalibrationMode | 'unchanged'>('unchanged');
   const [vibrationCali, setVibrationCali] = useState<boolean | 'unchanged'>('unchanged');
   const [layerInspect, setLayerInspect] = useState<boolean | 'unchanged'>('unchanged');
   const [timelapse, setTimelapse] = useState<boolean | 'unchanged'>('unchanged');
   const [useAms, setUseAms] = useState<boolean | 'unchanged'>('unchanged');
+  const [confirmOutcome, setConfirmOutcome] = useState<boolean | 'unchanged'>('unchanged');
   const [nozzleOffsetCali, setNozzleOffsetCali] = useState<CalibrationMode | 'unchanged'>('unchanged');
 
   // Show the dual-nozzle-only toggle when the user has at least one
@@ -163,12 +374,14 @@ function BulkEditModal({
     if (manualStart !== 'unchanged') data.manual_start = manualStart;
     if (autoOffAfter !== 'unchanged') data.auto_off_after = autoOffAfter;
     if (requirePreviousSuccess !== 'unchanged') data.require_previous_success = requirePreviousSuccess;
+    if (gcodeInjection !== 'unchanged') data.gcode_injection = gcodeInjection;
     if (bedLevelling !== 'unchanged') data.bed_levelling = bedLevelling;
     if (flowCali !== 'unchanged') data.flow_cali = flowCali;
     if (vibrationCali !== 'unchanged') data.vibration_cali = vibrationCali;
     if (layerInspect !== 'unchanged') data.layer_inspect = layerInspect;
     if (timelapse !== 'unchanged') data.timelapse = timelapse;
     if (useAms !== 'unchanged') data.use_ams = useAms;
+    if (confirmOutcome !== 'unchanged') data.confirm_outcome = confirmOutcome;
     if (nozzleOffsetCali !== 'unchanged') data.nozzle_offset_cali = nozzleOffsetCali;
     onSave(data);
   };
@@ -176,7 +389,7 @@ function BulkEditModal({
   const hasChanges = printerId !== 'unchanged' || manualStart !== 'unchanged' || autoOffAfter !== 'unchanged' ||
     requirePreviousSuccess !== 'unchanged' || bedLevelling !== 'unchanged' || flowCali !== 'unchanged' ||
     vibrationCali !== 'unchanged' || layerInspect !== 'unchanged' || timelapse !== 'unchanged' || useAms !== 'unchanged' ||
-    nozzleOffsetCali !== 'unchanged';
+    confirmOutcome !== 'unchanged' || nozzleOffsetCali !== 'unchanged' || gcodeInjection !== 'unchanged';
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/50 backdrop-blur-sm">
@@ -223,6 +436,12 @@ function BulkEditModal({
               <TriStateToggle label={t('queue.bulkEdit.staged')} value={manualStart} onChange={setManualStart} t={t} />
               <TriStateToggle label={t('queue.bulkEdit.autoPowerOff')} value={autoOffAfter} onChange={setAutoOffAfter} disabled={!canControlPrinter} t={t} />
               <TriStateToggle label={t('queue.bulkEdit.requirePrevious')} value={requirePreviousSuccess} onChange={setRequirePreviousSuccess} t={t} />
+              {/* Same gate as the print modal's checkbox (#3058): hidden until an
+                  admin has saved a snippet for some printer model, so the toggle
+                  never promises an injection that has nothing to inject. */}
+              {hasGcodeSnippets && (
+                <TriStateToggle label={t('queue.bulkEdit.gcodeInjection')} value={gcodeInjection} onChange={setGcodeInjection} t={t} />
+              )}
             </div>
           </div>
 
@@ -236,6 +455,7 @@ function BulkEditModal({
               <TriStateToggle label={t('queue.bulkEdit.layerInspection')} value={layerInspect} onChange={setLayerInspect} t={t} />
               <TriStateToggle label={t('queue.bulkEdit.timelapse')} value={timelapse} onChange={setTimelapse} t={t} />
               <TriStateToggle label={t('queue.bulkEdit.useAms')} value={useAms} onChange={setUseAms} t={t} />
+              <TriStateToggle label={t('queue.bulkEdit.confirmOutcome')} value={confirmOutcome} onChange={setConfirmOutcome} t={t} />
               {hasDualNozzlePrinter && (
                 <CalibrationModeToggle label={t('queue.bulkEdit.nozzleOffsetCali')} value={nozzleOffsetCali} onChange={setNozzleOffsetCali} t={t} />
               )}
@@ -386,13 +606,48 @@ function SortableQueueItem({
   etaNow?: number;
   t: (key: string, options?: Record<string, unknown>) => string;
 }) {
-  // Fetch printer status every 30 seconds while printing to monitor progress
+  const { hasAnyPermission } = useAuth();
+  // Their waiting jobs are started by someone who manages the queue (#1620)
+  const awaitingReview = !hasAnyPermission('queue:update_all', 'queue:start_unreviewed');
+  const hasPhysicalAmsMapping =
+    item.printer_id != null && (item.ams_mapping?.some((trayId) => trayId >= 0) ?? false);
+
+  // Printing rows already need live status for progress. A queued item with a
+  // stored AMS mapping also needs it so the card can turn global tray ids into
+  // the actual slot / colour that will feed the print (#3132). React Query
+  // deduplicates rows sharing a printer.
   const { data: status } = useQuery({
     queryKey: ['printerStatus', item.printer_id],
     queryFn: () => api.getPrinterStatus(item.printer_id!),
-    refetchInterval: 30000,
-    enabled: item.printer_id != null && printerState === 'printing',
+    refetchInterval: printerState === 'printing' ? 30000 : false,
+    enabled: item.printer_id != null && (printerState === 'printing' || hasPhysicalAmsMapping),
   });
+
+  // Inventory identity is display-only: printer telemetry knows the tray colour
+  // and material but not that a third-party spool is e.g. "eSUN PLA Basic".
+  // Reuse the same payload / key as PrintModal so a mapped queue row names the
+  // physical spool consistently with the mapping picker.
+  const { data: inventoryRemain } = useQuery({
+    queryKey: ['printer-inventory-remain', item.printer_id],
+    queryFn: () => api.getInventoryRemain(item.printer_id!),
+    enabled: hasPhysicalAmsMapping,
+    staleTime: 30 * 1000,
+  });
+
+  const slotSpools = useMemo(() => {
+    const slots = inventoryRemain?.slot_materials;
+    if (!slots?.length) return undefined;
+    const map = new Map<number, SlotSpoolIdentity>();
+    slots.forEach((slot) => {
+      if (slot.spool) map.set(slot.global_tray_id, slot.spool);
+    });
+    return map.size > 0 ? map : undefined;
+  }, [inventoryRemain]);
+
+  const loadedFilaments = useMemo(
+    () => buildLoadedFilaments(status, slotSpools),
+    [status, slotSpools],
+  );
 
   // Determine if we're printing a library file
   const isLibraryFile = !!item.library_file_id && !item.archive_id;
@@ -415,6 +670,15 @@ function SortableQueueItem({
   // Combine plates data from either source
   const platesData = isLibraryFile ? libraryPlatesData : archivePlatesData;
   const plates = platesData?.plates ?? [];
+  const filamentNameByIdx = useFilamentNameByIdx();
+  const queueFilaments = resolveQueueFilaments(
+    item,
+    plates,
+    loadedFilaments,
+    status,
+    t('ams.empty'),
+    filamentNameByIdx,
+  );
 
   const canReorder = hasPermission('queue:reorder');
   const {
@@ -446,6 +710,7 @@ function SortableQueueItem({
       : null;
 
   const isMobileSelectable = isPending && onToggleSelect;
+  const thumbnailUrl = queueItemThumbnailUrl(item);
 
   return (
     <div
@@ -464,7 +729,7 @@ function SortableQueueItem({
         ${isPrinting ? 'border-blue-500/30 bg-gradient-to-r from-blue-500/5 to-transparent' : ''}
         ${isSelected && isMobileSelectable ? 'sm:border-bambu-dark-tertiary border-bambu-green/40' : ''}
         ${!isSelected && !isPrinting ? 'border-bambu-dark-tertiary hover:border-bambu-dark-tertiary/80' : ''}
-        ${isMobileSelectable ? 'sm:cursor-default' : ''}
+        ${isMobileSelectable ? 'cursor-pointer sm:cursor-default' : ''}
       `}
       onClick={isMobileSelectable ? () => {
         if (window.innerWidth < 640) onToggleSelect();
@@ -544,39 +809,24 @@ function SortableQueueItem({
         )}
 
         {/* Thumbnail - use plate-specific thumbnail if plate_id is set */}
-        <div className="w-10 h-10 sm:w-14 sm:h-14 flex-shrink-0 bg-bambu-dark rounded-lg overflow-hidden">
-          {item.archive_thumbnail ? (
-            <img
-              src={
-                item.plate_id != null
-                  ? api.getArchivePlateThumbnail(item.archive_id!, item.plate_id)
-                  : api.getArchiveThumbnail(item.archive_id!)
-              }
-              alt=""
-              className="w-full h-full object-cover"
-            />
-          ) : item.library_file_thumbnail ? (
-            <img
-              src={
-                item.plate_id != null
-                  ? api.getLibraryFilePlateThumbnail(item.library_file_id!, item.plate_id)
-                  : api.getLibraryFileThumbnailUrl(item.library_file_id!)
-              }
-              alt=""
-              className="w-full h-full object-cover"
-            />
+        <ThumbnailHoverPreview
+          src={thumbnailUrl}
+          className="w-10 h-10 sm:w-14 sm:h-14 flex-shrink-0 bg-bambu-dark rounded-lg overflow-hidden"
+        >
+          {thumbnailUrl ? (
+            <img src={thumbnailUrl} alt="" className="w-full h-full object-cover" />
           ) : (
             <div className="w-full h-full flex items-center justify-center text-bambu-gray">
               <Layers className="w-5 h-5 sm:w-6 sm:h-6" />
             </div>
           )}
-        </div>
+        </ThumbnailHoverPreview>
 
         {/* Info */}
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-1">
             <p className="text-sm sm:text-base text-white font-medium truncate">
-              {item.archive_name || item.library_file_name || `File #${item.archive_id || item.library_file_id}`}
+              {queueItemDisplayName(item, (n) => t('common.plusNMore', { count: n }))}
               {(platesData?.is_multi_plate ?? false) && item.plate_id !== undefined && item.plate_id !== null && ` • ${plates.find(plate => plate.index === item.plate_id)?.name || t('queue.plateNumber', { index: item.plate_id })}`}
             </p>
             {item.archive_id ? (
@@ -589,7 +839,7 @@ function SortableQueueItem({
               </Link>
             ) : item.library_file_id ? (
               <Link
-                to={`/library?highlight=${item.library_file_id}`}
+                to={`/files?highlight=${item.library_file_id}`}
                 className="text-bambu-gray hover:text-bambu-green transition-colors flex-shrink-0"
                 title={t('queue.viewInFileManager')}
               >
@@ -607,7 +857,12 @@ function SortableQueueItem({
             <span className={`flex items-center gap-1 sm:gap-1.5 ${item.printer_id === null && !item.target_model ? 'text-orange-700 dark:text-orange-400' : ''} ${item.target_model && !item.printer_id ? 'text-blue-700 dark:text-blue-400' : ''}`}>
               <Printer className="w-3 h-3 sm:w-3.5 sm:h-3.5" />
               <span className="truncate max-w-[120px] sm:max-w-none">
-              {item.target_model && !item.printer_id
+              {/* A cross-model item (#671) is waiting on several models at once.
+                  Showing only target_model would name whichever candidate is
+                  first and read as a lie the moment the other one runs. */}
+              {(item.variants?.length ?? 0) > 1 && !item.printer_id
+                ? `${t('queue.filter.any')} ${item.variants!.map(v => v.target_model).join(' / ')}${item.target_location ? ` @ ${item.target_location}` : ''}`
+                : item.target_model && !item.printer_id
                 ? `${t('queue.filter.any')} ${item.target_model}${item.target_location ? ` @ ${item.target_location}` : ''}${item.required_filament_types?.length ? ` (${item.required_filament_types.join(', ')})` : ''}`
                 : item.printer_id === null
                   ? t('queue.filter.unassigned')
@@ -635,6 +890,62 @@ function SortableQueueItem({
                 {formatWeight(item.filament_used_grams)}
               </span>
             )}
+            {queueFilaments.length > 2 ? (
+              <span
+                data-testid="queue-filament-compact"
+                className="flex items-center gap-0.5 flex-shrink-0"
+                title={queueFilaments.map(queueFilamentLabel).join('\n')}
+                // The tooltip needs a hover; touch screens and screen readers
+                // get the same lines through the accessible name instead.
+                role="img"
+                aria-label={queueFilaments.map(queueFilamentLabel).join(', ')}
+              >
+                {queueFilaments.map((filament) => (
+                  <FilamentSwatch
+                    key={`filament-${filament.slotId}`}
+                    rgba={filament.color}
+                    extraColors={filament.extraColors}
+                    effectType={filament.effectType}
+                    subtype={filament.subtype}
+                    className="w-2.5 h-2.5 sm:w-3 sm:h-3 pointer-events-none"
+                    effectSize="table"
+                  />
+                ))}
+                {queueFilaments.some((filament) => filament.emptySlot) && (
+                  <AlertCircle
+                    className="w-3 h-3 ml-0.5 text-yellow-700 dark:text-yellow-400"
+                    aria-hidden="true"
+                  />
+                )}
+              </span>
+            ) : (
+              queueFilaments.map((filament) => {
+                const mappedLabel = queueFilamentLabel(filament);
+                return (
+                  <span
+                    key={`filament-${filament.slotId}`}
+                    className="flex items-center gap-1 sm:gap-1.5 min-w-0"
+                    title={mappedLabel}
+                  >
+                    <FilamentSwatch
+                      rgba={filament.color}
+                      extraColors={filament.extraColors}
+                      effectType={filament.effectType}
+                      subtype={filament.subtype}
+                      className="w-3 h-3 sm:w-3.5 sm:h-3.5"
+                      effectSize="table"
+                    />
+                    <span
+                      className={`truncate max-w-[110px] sm:max-w-[260px]${
+                        filament.emptySlot ? ' text-yellow-700 dark:text-yellow-400' : ''
+                      }`}
+                    >
+                      {mappedLabel}
+                    </span>
+                  </span>
+                );
+              })
+            )}
             {(() => {
               // Build plate badge so the user knows which plate to mount before
               // walking to the printer (#1281). Hidden when the 3MF doesn't
@@ -657,11 +968,18 @@ function SortableQueueItem({
             {isPending && !item.manual_start && (
               <span className="flex items-center gap-1.5">
                 <Clock className="w-3.5 h-3.5" />
+                {/* An item with no scheduled time used to render as "ASAP", which is the
+                    name of a dispatch mode the user may well not have picked -- ASAP and
+                    Queue differ only in insert position, and neither is stored on the
+                    item, so the two are indistinguishable here. Someone who chose Queue
+                    saw their row labelled ASAP and read it as Bambuddy overriding them
+                    (#2557, #3018). This column answers "when does it run", so it now says
+                    that instead of borrowing a mode name. */}
                 {item.scheduled_time
                   ? ((parseUTCDate(item.scheduled_time)?.getTime() ?? 0) - Date.now() < -60000
                       ? t?.('queue.time.overdue') ?? 'Overdue'
                       : formatRelativeTime(item.scheduled_time, timeFormat, t))
-                  : t?.('queue.time.asap') ?? 'ASAP'}
+                  : t?.('queue.time.whenFree') ?? 'When a printer is free'}
               </span>
             )}
           </div>
@@ -671,7 +989,7 @@ function SortableQueueItem({
             {item.manual_start && (
               <span className="text-[10px] sm:text-xs px-1.5 sm:px-2 py-0.5 bg-purple-50 dark:bg-purple-500/10 text-purple-700 dark:text-purple-400 rounded-full border border-purple-200 dark:border-purple-500/20 flex items-center gap-1">
                 <Hand className="w-2.5 h-2.5 sm:w-3 sm:h-3" />
-                {t('queue.badges.staged')}
+                {awaitingReview ? t('queue.badges.awaitingReview') : t('queue.badges.staged')}
               </span>
             )}
             {item.require_previous_success && (
@@ -689,6 +1007,15 @@ function SortableQueueItem({
               <span className="text-[10px] sm:text-xs px-1.5 sm:px-2 py-0.5 bg-emerald-50 dark:bg-emerald-500/10 text-emerald-700 dark:text-emerald-400 rounded-full border border-emerald-200 dark:border-emerald-500/20 flex items-center gap-1">
                 <Code className="w-2.5 h-2.5 sm:w-3 sm:h-3" />
                 {t('queue.badges.gcodeInjection')}
+              </span>
+            )}
+            {item.confirm_outcome && (
+              <span
+                title={t('queue.badges.confirmOutcomeTitle')}
+                className="text-[10px] sm:text-xs px-1.5 sm:px-2 py-0.5 bg-green-50 dark:bg-green-500/10 text-green-700 dark:text-green-400 rounded-full border border-green-200 dark:border-green-500/20 flex items-center gap-1"
+              >
+                <ThumbsUp className="w-2.5 h-2.5 sm:w-3 sm:h-3" />
+                {t('queue.badges.confirmOutcome')}
               </span>
             )}
           </div>
@@ -757,6 +1084,13 @@ function SortableQueueItem({
             </p>
           )}
 
+          {/* Sent with a spool of another colour than the file asks for (#3279). */}
+          <ColorSubstitutionNotes
+            substitutions={item.color_substitutions}
+            t={t}
+            className="text-[10px] sm:text-xs mt-1.5 sm:mt-2"
+          />
+
           {/* Archive carries the slicer's own live-resolved AMS-slot pick
               (extra_data.slicer_ams_mapping) — reprints of this archive reuse
               the exact physical spool instead of re-deriving one. */}
@@ -803,8 +1137,14 @@ function SortableQueueItem({
                     variant="ghost"
                     size="sm"
                     onClick={onStart}
-                    disabled={!canModify('queue', 'update', item.created_by_id)}
-                    title={!canModify('queue', 'update', item.created_by_id) ? t('queue.permissions.noStartPrint') : t('queue.actions.startPrint')}
+                    disabled={awaitingReview || !canModify('queue', 'update', item.created_by_id)}
+                    title={
+                      awaitingReview
+                        ? t('queue.permissions.awaitingReview')
+                        : !canModify('queue', 'update', item.created_by_id)
+                          ? t('queue.permissions.noStartPrint')
+                          : t('queue.actions.startPrint')
+                    }
                     className="text-bambu-green hover:text-bambu-green-light hover:bg-bambu-green/10 p-1.5 sm:p-2"
                   >
                     <Play className="w-4 h-4" />
@@ -1171,8 +1511,10 @@ type HistoryRow =
   | { kind: 'batch'; batchId: number; batchName: string; items: PrintQueueItem[] };
 
 interface HistorySectionProps {
+  // The loaded page, then any other runs of its batches (see getQueueHistory)
   items: PrintQueueItem[];
-  collapsed: boolean;
+  // Matching history in all, loaded or not
+  total: number;
   visibleCount: number;
   onShowMore: () => void;
   sortBy: 'date' | 'name' | 'printer';
@@ -1193,6 +1535,7 @@ interface HistorySectionProps {
 
 function HistorySection({
   items,
+  total,
   visibleCount,
   onShowMore,
   sortBy,
@@ -1245,7 +1588,7 @@ function HistorySection({
         <h2 className="text-base sm:text-lg font-semibold text-white flex items-center gap-2">
           {t('queue.sections.history')}
           <span className="text-xs sm:text-sm font-normal text-bambu-gray">
-            ({t('queue.itemCount', { count: items.length })})
+            ({t('queue.itemCount', { count: total })})
           </span>
         </h2>
         <div className="flex items-center gap-2">
@@ -1371,15 +1714,15 @@ function HistorySection({
           );
         })}
       </div>
-      {items.length > visibleCount && (
+      {total > visibleCount && (
         <div className="mt-4 flex flex-col items-center gap-2">
           <Button variant="secondary" size="sm" onClick={onShowMore}>
             {t('queue.history.showMore')}
           </Button>
           <span className="text-xs text-bambu-gray">
             {t('queue.history.showingCount', {
-              shown: Math.min(visibleCount, items.length),
-              total: items.length,
+              shown: Math.min(visibleCount, total),
+              total,
             })}
           </span>
         </div>
@@ -1389,6 +1732,9 @@ function HistorySection({
 }
 
 const HISTORY_PAGE_SIZE = 50;
+// The statuses the Queue tab works with; the rest is history.
+const ACTIVE_STATUSES = ['pending', 'printing', 'skipped'];
+const EMPTY_QUEUE: PrintQueueItem[] = [];
 
 export function QueuePage() {
   const { t } = useTranslation();
@@ -1414,6 +1760,8 @@ export function QueuePage() {
     printerName: string;
     skippedCount: number;
   } | null>(null);
+  // Same for a model whose waiting jobs are held by failed last prints.
+  const [resumeModelConfirm, setResumeModelConfirm] = useState<string | null>(null);
   const [historySortBy, setHistorySortBy] = useState<'date' | 'name' | 'printer'>(() => {
     const saved = localStorage.getItem('queue.historySortBy');
     return (saved as 'date' | 'name' | 'printer') || 'date';
@@ -1438,16 +1786,23 @@ export function QueuePage() {
   // History tab renders unconditionally so this no longer drives the UI.
   // Tabbed page structure: Active queue stays as the main view; History
   // and Timeline split off. Persists per-user via localStorage.
-  const [activeTab, setActiveTab] = useState<'queue' | 'history' | 'timeline' | 'pipelines'>(() => {
+  // /queue?batch=<id>: a link to one batch (e.g. from Bambuddy Orders), read once.
+  const [focusBatchId] = useState<number | null>(() => {
+    const id = Number(new URLSearchParams(window.location.search).get('batch'));
+    return Number.isInteger(id) && id > 0 ? id : null;
+  });
+  const [activeTab, setActiveTab] = useState<'queue' | 'batches' | 'history' | 'timeline' | 'pipelines'>(() => {
     // URL deep-link wins so the legacy /pipelines/runs redirect lands on the
     // right tab. localStorage holds the per-user last-selected fallback.
     const search = new URLSearchParams(window.location.search);
     const url = search.get('tab');
-    if (url === 'pipelines' || url === 'history' || url === 'timeline' || url === 'queue') {
+    // A link to one batch (/queue?batch=<id>) opens the tab that shows it.
+    if (search.get('batch')) return 'batches';
+    if (url === 'pipelines' || url === 'history' || url === 'timeline' || url === 'queue' || url === 'batches') {
       return url;
     }
     const saved = localStorage.getItem('queue.activeTab');
-    if (saved === 'history' || saved === 'timeline' || saved === 'pipelines') return saved;
+    if (saved === 'history' || saved === 'timeline' || saved === 'pipelines' || saved === 'batches') return saved;
     return 'queue';
   });
   // Active-tab layout toggle. "position" = today's flat list; "printer"
@@ -1515,18 +1870,61 @@ export function QueuePage() {
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   );
 
-  const { data: settings } = useQuery({
-    queryKey: ['settings'],
-    queryFn: api.getSettings,
-  });
+  const { data: settings } = useUiSettings();
 
   const timeFormat: TimeFormat = settings?.time_format || 'system';
 
-  const { data: queue, isLoading } = useQuery({
-    queryKey: ['queue', filterPrinter, filterStatus],
-    queryFn: () => api.getQueue(filterPrinter || undefined, filterStatus || undefined),
-    refetchInterval: 5000,
+  // Badge count for the Batches tab (#342). Deliberately its own query rather
+  // than derived from the queue: an order whose runs have all finished has no
+  // queue rows left, and those are precisely the orders the tab exists to
+  // surface. Shares the ['batches'] key with the tab itself, so dispatching or
+  // cancelling refreshes both.
+  const { data: activeBatches } = useQuery({
+    queryKey: ['batches', 'active'],
+    queryFn: () => api.getBatches('active'),
   });
+  const activeBatchCount = activeBatches?.length ?? 0;
+
+  // Only what is still in play: pending and printing, plus skipped for the
+  // Resume-after-failure banner. History has its own paged query below. This
+  // used to be the whole queue, history included, every five seconds; on a
+  // farm that was thousands of rows and stalled the server.
+  const activeStatuses = filterStatus
+    ? (ACTIVE_STATUSES.includes(filterStatus) ? filterStatus : null)
+    : ACTIVE_STATUSES.join(',');
+  const { data: activeQueue, isLoading } = useQuery({
+    queryKey: ['queue', filterPrinter, activeStatuses],
+    queryFn: () => api.getQueue(filterPrinter || undefined, activeStatuses ?? undefined),
+    refetchInterval: 5000,
+    // A finished status selected in the filter leaves nothing active to show
+    enabled: activeStatuses !== null,
+  });
+  const queue = activeStatuses === null ? EMPTY_QUEUE : activeQueue;
+
+  // One page of history at a time, filtered and sorted on the server.
+  // "Show more" asks for a longer first page rather than appending, so a
+  // batch row always sees the rest of its runs.
+  const historyFilters = {
+    printerId: filterPrinter,
+    status: filterStatus || undefined,
+    location: filterLocation || undefined,
+  };
+  const { data: historyPage, isLoading: historyLoading } = useQuery({
+    queryKey: ['queue', 'history', historyFilters, historySortBy, historySortAsc, historyVisibleCount],
+    queryFn: () =>
+      api.getQueueHistory({
+        ...historyFilters,
+        sortBy: historySortBy,
+        reverse: historySortAsc,
+        limit: historyVisibleCount,
+      }),
+    // Nothing pushes history changes, so it is polled: briskly while the tab
+    // shows one page, slowly once it is expanded (a long page is what used to
+    // stall the server) or when only the badge and stats need the total.
+    refetchInterval: activeTab === 'history' && historyVisibleCount <= HISTORY_PAGE_SIZE ? 5000 : 30000,
+    placeholderData: keepPreviousData,
+  });
+  const historyTotal = historyPage?.total ?? 0;
 
   const { data: printers } = useQuery({
     queryKey: ['printers'],
@@ -1537,6 +1935,7 @@ export function QueuePage() {
     mutationFn: (enabled: boolean) => api.updateSettings({ queue_shortest_first: enabled }),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['settings'] });
+      queryClient.invalidateQueries({ queryKey: ['ui-settings'] });
     },
   });
 
@@ -1551,9 +1950,13 @@ export function QueuePage() {
 
   const removeMutation = useMutation({
     mutationFn: (id: number) => api.removeFromQueue(id),
-    onSuccess: () => {
+    onSuccess: (result) => {
       queryClient.invalidateQueries({ queryKey: ['queue'] });
-      showToast(t('queue.toast.removed'));
+      queryClient.invalidateQueries({ queryKey: ['batches'] });
+      // The backend keeps an order's last run for a plate, cancelled rather
+      // than deleted, so the order can still re-queue it (#2960). Say so:
+      // the row stays on screen and silence would read as a failed delete.
+      showToast(result.deleted === false ? t('queue.toast.keptForOrder') : t('queue.toast.removed'));
     },
     onError: () => showToast(t('queue.toast.removeFailed'), 'error'),
   });
@@ -1581,6 +1984,14 @@ export function QueuePage() {
     }>;
   } | null>(null);
 
+  // A filament the printer has no tray for at all (#2799): 409 with
+  // `code=unmatched_filament` and the missing filaments. Same "Print Anyway"
+  // path as the deficit above.
+  const [filamentMissingConfirm, setFilamentMissingConfirm] = useState<{
+    itemId: number;
+    missing: string[];
+  } | null>(null);
+
   const startMutation = useMutation({
     mutationFn: ({ id, skipFilamentCheck }: { id: number; skipFilamentCheck?: boolean }) =>
       api.startQueueItem(id, { skipFilamentCheck }),
@@ -1588,6 +1999,7 @@ export function QueuePage() {
       queryClient.invalidateQueries({ queryKey: ['queue'] });
       showToast(t('queue.toast.released'));
       setFilamentShortConfirm(null);
+      setFilamentMissingConfirm(null);
     },
     onError: (error: unknown, variables) => {
       if (error instanceof ApiError && error.status === 409 && error.code === 'insufficient_filament') {
@@ -1598,6 +2010,11 @@ export function QueuePage() {
           filament_type?: string | null;
         }>;
         setFilamentShortConfirm({ itemId: variables.id, deficit: deficitRaw });
+        return;
+      }
+      if (error instanceof ApiError && error.status === 409 && error.code === 'unmatched_filament') {
+        const missing = (error.detail?.missing ?? []) as string[];
+        setFilamentMissingConfirm({ itemId: variables.id, missing });
         return;
       }
       showToast(t('queue.toast.startFailed'), 'error');
@@ -1613,18 +2030,18 @@ export function QueuePage() {
   });
 
   const clearHistoryMutation = useMutation({
-    mutationFn: async () => {
-      const historyItems = queue?.filter(i =>
-        ['completed', 'failed', 'skipped', 'cancelled'].includes(i.status)
-      ) || [];
-      for (const item of historyItems) {
-        await api.removeFromQueue(item.id);
-      }
-      return historyItems.length;
-    },
-    onSuccess: (count) => {
+    // One request for the history under the current filters. A row a batch
+    // order still needs is kept rather than deleted, so the counts come from
+    // what the backend actually did (#2960).
+    mutationFn: () => api.clearQueueHistory(historyFilters),
+    onSuccess: ({ cleared, kept }) => {
       queryClient.invalidateQueries({ queryKey: ['queue'] });
-      showToast(t('queue.toast.historyCleared', { count }));
+      queryClient.invalidateQueries({ queryKey: ['batches'] });
+      showToast(
+        kept > 0
+          ? `${t('queue.toast.historyCleared', { count: cleared })} ${t('queue.toast.historyKeptForOrders', { kept })}`
+          : t('queue.toast.historyCleared', { count: cleared })
+      );
     },
     onError: () => showToast(t('queue.toast.clearHistoryFailed'), 'error'),
   });
@@ -1635,7 +2052,8 @@ export function QueuePage() {
       queryClient.invalidateQueries({ queryKey: ['queue'] });
       setSelectedItems([]);
       setShowBulkEditModal(false);
-      showToast(result.message);
+      const toast = bulkUpdateToast(result);
+      showToast(t(toast.key, toast.params), toast.type);
     },
     onError: () => showToast(t('queue.toast.updateFailed'), 'error'),
   });
@@ -1666,6 +2084,16 @@ export function QueuePage() {
           acknowledged: result.acknowledged,
         }),
       );
+    },
+    onError: () => showToast(t('queue.toast.resumeAfterFailureFailed'), 'error'),
+  });
+
+  const resumeModelMutation = useMutation({
+    mutationFn: (model: string) => api.resumeModelQueueAfterFailure(model),
+    onSuccess: (result) => {
+      queryClient.invalidateQueries({ queryKey: ['queue'] });
+      setResumeModelConfirm(null);
+      showToast(t('queue.toast.resumedModelAfterFailure', { count: result.acknowledged }));
     },
     onError: () => showToast(t('queue.toast.resumeAfterFailureFailed'), 'error'),
   });
@@ -1709,8 +2137,9 @@ export function QueuePage() {
     queue?.forEach(item => {
       if (item.target_location) locations.add(item.target_location);
     });
+    historyPage?.locations.forEach(location => locations.add(location));
     return Array.from(locations).sort();
-  }, [printers, queue]);
+  }, [printers, queue, historyPage?.locations]);
 
   // Helper to check if a queue item matches the location filter
   const matchesLocationFilter = useCallback((item: PrintQueueItem): boolean => {
@@ -1744,22 +2173,7 @@ export function QueuePage() {
 
     // When SJF is enabled, override sort to match scheduler order
     if (settings?.queue_shortest_first) {
-      return [...items].sort((a, b) => {
-        // Group by printer first (nulls = model-based, grouped by target_model)
-        const aPrinter = a.printer_id ?? -(a.target_model?.charCodeAt(0) ?? 0);
-        const bPrinter = b.printer_id ?? -(b.target_model?.charCodeAt(0) ?? 0);
-        if (aPrinter !== bPrinter) return aPrinter - bPrinter;
-        // Within same printer/model: jumped items first (starvation guard)
-        const aJumped = a.been_jumped ? 1 : 0;
-        const bJumped = b.been_jumped ? 1 : 0;
-        if (aJumped !== bJumped) return bJumped - aJumped;
-        // Shortest print time next (nulls last)
-        const aTime = a.print_time_seconds ?? Infinity;
-        const bTime = b.print_time_seconds ?? Infinity;
-        if (aTime !== bTime) return aTime - bTime;
-        // Position as tiebreaker
-        return a.position - b.position;
-      });
+      return [...items].sort((a, b) => compareQueueOrder(a, b, true));
     }
 
     return [...items].sort((a, b) => {
@@ -1800,10 +2214,12 @@ export function QueuePage() {
   // Queue items eligible for an "if started now" ETA (#2740).
   //
   // The ETA answers "when would this finish if it began right now", so it may
-  // only appear on items that really could begin right now. Deriving that from
-  // waiting_reason alone is not enough: the scheduler only writes that field on
-  // the model-based assignment path (print_scheduler.py), so an item pinned to a
-  // specific printer sits behind a running job with waiting_reason still NULL.
+  // only appear on items that really could begin right now. waiting_reason now
+  // covers the pinned-printer case too (#3074), but it is still not enough on
+  // its own: it says whether the scheduler had a reason to hold the item on its
+  // last pass, not whether this item is the one that printer takes next. Two
+  // items pinned to the same free printer both come back with no reason, and
+  // only one of them can start now — which is what the ordering below works out.
   //
   // Computed from the unfiltered queue on purpose — hiding a printer behind the
   // location filter must not make its printer look free.
@@ -1823,17 +2239,10 @@ export function QueuePage() {
 
     // Mirrors the scheduler's own ordering so "next up" here means the item the
     // scheduler would actually dispatch next, not whatever the user sorted by.
-    const schedulerOrder = (a: PrintQueueItem, b: PrintQueueItem): number => {
-      if (settings?.queue_shortest_first) {
-        const aJumped = a.been_jumped ? 1 : 0;
-        const bJumped = b.been_jumped ? 1 : 0;
-        if (aJumped !== bJumped) return bJumped - aJumped;
-        const aTime = a.print_time_seconds ?? Infinity;
-        const bTime = b.print_time_seconds ?? Infinity;
-        if (aTime !== bTime) return aTime - bTime;
-      }
-      return a.position - b.position;
-    };
+    // Bucketed by printer immediately below, so the within-lane comparator is
+    // the right one -- no cross-lane grouping needed.
+    const schedulerOrder = (a: PrintQueueItem, b: PrintQueueItem): number =>
+      compareQueueOrder(a, b, settings?.queue_shortest_first ?? false);
 
     // Claimants for each printer, in the order the scheduler would take them.
     // Staged and future-scheduled items are excluded: the scheduler skips both
@@ -1943,26 +2352,8 @@ export function QueuePage() {
     return map;
   }, [activePrinterIds, printerStatusQueries]);
 
-  const historyItems = useMemo(() => {
-    let items = queue?.filter(i => ['completed', 'failed', 'skipped', 'cancelled'].includes(i.status)) || [];
-    if (filterLocation) {
-      items = items.filter(matchesLocationFilter);
-    }
-    return [...items].sort((a, b) => {
-      let cmp: number;
-      if (historySortBy === 'name') {
-        const aName = a.archive_name || a.library_file_name || '';
-        const bName = b.archive_name || b.library_file_name || '';
-        cmp = aName.localeCompare(bName);
-      } else if (historySortBy === 'printer') {
-        cmp = (a.printer_name || '').localeCompare(b.printer_name || '');
-      } else {
-        // Default: by date - most recent first (desc) is the natural order
-        cmp = (parseUTCDate(b.completed_at || b.created_at)?.getTime() ?? 0) - (parseUTCDate(a.completed_at || a.created_at)?.getTime() ?? 0);
-      }
-      return historySortAsc ? -cmp : cmp;
-    });
-  }, [queue, historySortBy, historySortAsc, matchesLocationFilter, filterLocation]);
+  // Filtered and sorted by the server; see the history query above.
+  const historyItems = historyPage?.items ?? EMPTY_QUEUE;
 
   // Calculate total queue time
   const totalQueueTime = useMemo(() => {
@@ -2190,6 +2581,20 @@ export function QueuePage() {
           isUnassigned: false,
         };
       }
+      // A cross-model item (#671) is waiting on several models. Its own
+      // target_model is just the first candidate mirrored onto the row, so
+      // bucketing on it would file the job under one printer it might never
+      // run on — and the row underneath already says "Any H2D / X1C".
+      if ((item.variants?.length ?? 0) > 1) {
+        const models = item.variants!.map((v) => v.target_model).join(' / ');
+        return {
+          key: `models:${models}`,
+          label: `${t('queue.filter.any')} ${models}`,
+          printerId: null,
+          targetModel: null,
+          isUnassigned: false,
+        };
+      }
       if (item.target_model) {
         return {
           key: `model:${item.target_model}`,
@@ -2260,6 +2665,25 @@ export function QueuePage() {
       .sort((a, b) => a.printerName.localeCompare(b.printerName));
   }, [queue]);
 
+  // Models whose "any printer" jobs wait because the last print failed on
+  // every free printer of the model (the scheduler's MODEL_GATE_WAIT_REASON).
+  const gateBlockedModels = useMemo<Array<{ model: string; waitingCount: number }>>(() => {
+    const counts = new Map<string, number>();
+    queue?.forEach((item) => {
+      if (
+        item.status === 'pending' &&
+        !item.printer_id &&
+        item.target_model &&
+        item.waiting_reason === MODEL_GATE_WAIT_REASON
+      ) {
+        counts.set(item.target_model, (counts.get(item.target_model) ?? 0) + 1);
+      }
+    });
+    return Array.from(counts.entries())
+      .map(([model, waitingCount]) => ({ model, waitingCount }))
+      .sort((a, b) => a.model.localeCompare(b.model));
+  }, [queue]);
+
   const aggregateForRows = (rows: QueueRow[]) => {
     let count = 0;
     let time = 0;
@@ -2293,7 +2717,8 @@ export function QueuePage() {
       <div className="flex gap-1 border-b border-bambu-dark-tertiary mb-6 overflow-x-auto">
         {([
           { id: 'queue' as const, label: t('queue.tabs.queue'), icon: Clock, count: pendingItems.length + activeItems.length },
-          { id: 'history' as const, label: t('queue.tabs.history'), icon: ListOrdered, count: historyItems.length },
+          { id: 'batches' as const, label: t('queue.tabs.batches'), icon: Package, count: activeBatchCount },
+          { id: 'history' as const, label: t('queue.tabs.history'), icon: ListOrdered, count: historyTotal },
           { id: 'timeline' as const, label: t('queue.tabs.timeline'), icon: GanttChart, count: null as number | null },
           // Slicer Pipelines dashboard (#1425 PR C). Lives here instead of
           // its own sidebar entry so the Print Queue page is the single
@@ -2323,12 +2748,12 @@ export function QueuePage() {
       </div>
 
       {/* Summary Stats — about the print queue, not pipelines. */}
-      {activeTab !== 'pipelines' && <QueueStatsBar
+      {activeTab !== 'pipelines' && activeTab !== 'batches' && <QueueStatsBar
         activeCount={activeItems.length}
         pendingCount={pendingItems.length}
         totalTime={totalQueueTime}
         totalWeight={totalWeight}
-        historyCount={historyItems.length}
+        historyCount={historyTotal}
         t={t}
       />}
 
@@ -2369,10 +2794,38 @@ export function QueuePage() {
         </div>
       )}
 
+      {activeTab === 'queue' && gateBlockedModels.length > 0 && hasPermission('queue:update_all' as Permission) && (
+        <div className="mb-4 space-y-2">
+          {gateBlockedModels.map(({ model, waitingCount }) => (
+            <div
+              key={model}
+              className="flex items-center gap-3 px-4 py-3 bg-orange-50 dark:bg-orange-500/10 border border-orange-300 dark:border-orange-500/30 rounded-lg"
+            >
+              <AlertCircle className="w-5 h-5 text-orange-600 dark:text-orange-400 flex-shrink-0" />
+              <div className="flex-1 min-w-0">
+                <div className="text-sm text-orange-800 dark:text-orange-200">
+                  {t('queue.resumeModelAfterFailure.banner', { model, count: waitingCount })}
+                </div>
+                <div className="text-xs text-orange-800/80 dark:text-orange-200/70 mt-0.5">
+                  {t('queue.resumeModelAfterFailure.bannerHint', { model })}
+                </div>
+              </div>
+              <button
+                onClick={() => setResumeModelConfirm(model)}
+                className="flex items-center gap-1.5 px-3 py-1.5 bg-orange-100 dark:bg-orange-500/20 hover:bg-orange-200 dark:hover:bg-orange-500/30 text-orange-900 dark:text-orange-100 text-sm rounded-md border border-orange-300 dark:border-orange-500/40 transition-colors flex-shrink-0"
+              >
+                <PlayCircle className="w-4 h-4" />
+                {t('queue.resumeAfterFailure.button')}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
       {/* Filters — about the print queue items (printer / status / location).
           The Pipelines tab has its own pipeline + status filters inside the
           dashboard, so this row is hidden when that tab is active. */}
-      {activeTab !== 'pipelines' && (
+      {activeTab !== 'pipelines' && activeTab !== 'batches' && (
       <div className="flex flex-wrap items-center gap-2 sm:gap-4 mb-6">
         <select
           className="px-2 sm:px-3 py-2 text-sm sm:text-base bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none min-w-0 flex-1 sm:flex-none"
@@ -2420,7 +2873,7 @@ export function QueuePage() {
 
         <div className="hidden sm:block flex-1" />
 
-        {activeTab === 'history' && historyItems.length > 0 && (
+        {activeTab === 'history' && historyTotal > 0 && (
           <Button
             className="w-full sm:w-auto"
             variant="secondary"
@@ -2485,9 +2938,11 @@ export function QueuePage() {
           dashboard renders even when the regular queue is empty. */}
       {activeTab === 'pipelines' ? (
         <PipelineRunsView />
-      ) : isLoading ? (
+      ) : activeTab === 'batches' ? (
+        <BatchOrdersView hasPermission={hasPermission} t={t} focusBatchId={focusBatchId} />
+      ) : isLoading || (activeTab === 'history' && historyLoading) ? (
         <div className="text-center py-12 text-bambu-gray">{t('common.loading')}</div>
-      ) : queue?.length === 0 ? (
+      ) : queue?.length === 0 && !historyLoading && historyTotal === 0 ? (
         <Card className="p-12 text-center border-dashed">
           <Calendar className="w-16 h-16 text-bambu-gray mx-auto mb-4 opacity-50" />
           <h3 className="text-xl font-medium text-white mb-2">{t('queue.empty.title')}</h3>
@@ -2500,6 +2955,7 @@ export function QueuePage() {
           queueItems={queue || []}
           printers={printers || []}
           printerStatuses={printerStatusMap}
+          sjfEnabled={settings?.queue_shortest_first ?? false}
           onItemClick={(item) => {
             if (['completed', 'failed', 'skipped', 'cancelled'].includes(item.status)) {
               setRequeueItem(item);
@@ -2514,7 +2970,7 @@ export function QueuePage() {
       ) : activeTab === 'history' ? (
         <HistorySection
           items={historyItems}
-          collapsed={false}
+          total={historyTotal}
           visibleCount={historyVisibleCount}
           onShowMore={() => setHistoryVisibleCount((c) => c + HISTORY_PAGE_SIZE)}
           sortBy={historySortBy}
@@ -2787,7 +3243,7 @@ export function QueuePage() {
           mode="edit-queue-item"
           archiveId={editItem.archive_id ?? undefined}
           libraryFileId={editItem.library_file_id ?? undefined}
-          archiveName={editItem.archive_name || editItem.library_file_name || `File #${editItem.archive_id || editItem.library_file_id}`}
+          archiveName={queueItemDisplayName(editItem, (n) => t('common.plusNMore', { count: n }))}
           queueItem={editItem}
           onClose={() => setEditItem(null)}
         />
@@ -2799,7 +3255,8 @@ export function QueuePage() {
           mode="create"
           archiveId={requeueItem.archive_id ?? undefined}
           libraryFileId={requeueItem.library_file_id ?? undefined}
-          archiveName={requeueItem.archive_name || requeueItem.library_file_name || `File #${requeueItem.archive_id || requeueItem.library_file_id}`}
+          archiveName={queueItemDisplayName(requeueItem, (n) => t('common.plusNMore', { count: n }))}
+          preselectPlateId={requeueItem.plate_id}
           onClose={() => setRequeueItem(null)}
         />
       )}
@@ -2829,6 +3286,19 @@ export function QueuePage() {
             startMutation.mutate({ id: filamentShortConfirm.itemId, skipFilamentCheck: true });
           }}
           onCancel={() => setFilamentShortConfirm(null)}
+        />
+      )}
+
+      {filamentMissingConfirm && (
+        <ConfirmModal
+          title={t('queue.filamentMissing.confirmTitle')}
+          message={t('queue.filamentMissing.confirmIntro') + '\n\n' + filamentMissingConfirm.missing.join('\n')}
+          confirmText={t('queue.filamentShort.printAnyway')}
+          variant="warning"
+          onConfirm={() => {
+            startMutation.mutate({ id: filamentMissingConfirm.itemId, skipFilamentCheck: true });
+          }}
+          onCancel={() => setFilamentMissingConfirm(null)}
         />
       )}
 
@@ -2881,11 +3351,22 @@ export function QueuePage() {
         />
       )}
 
+      {resumeModelConfirm && (
+        <ConfirmModal
+          title={t('queue.resumeAfterFailure.confirmTitle')}
+          message={t('queue.resumeModelAfterFailure.confirmMessage', { model: resumeModelConfirm })}
+          confirmText={t('queue.resumeAfterFailure.button')}
+          variant="warning"
+          onConfirm={() => resumeModelMutation.mutate(resumeModelConfirm)}
+          onCancel={() => setResumeModelConfirm(null)}
+        />
+      )}
+
       {/* Clear History Confirm Modal */}
       {showClearHistoryConfirm && (
         <ConfirmModal
           title={t('queue.confirm.clearHistoryTitle')}
-          message={t('queue.confirm.clearHistoryMessage', { count: historyItems.length })}
+          message={t('queue.confirm.clearHistoryMessage', { count: historyTotal })}
           confirmText={t('queue.clearHistory')}
           variant="danger"
           onConfirm={() => {
@@ -2909,6 +3390,7 @@ export function QueuePage() {
           onClose={() => setShowBulkEditModal(false)}
           isSaving={bulkUpdateMutation.isPending}
           canControlPrinter={hasPermission('printers:control')}
+          hasGcodeSnippets={hasGcodeSnippets(settings)}
           t={t}
         />
       )}

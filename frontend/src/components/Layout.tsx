@@ -1,11 +1,13 @@
-import { useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { Suspense, useState, useEffect, useCallback, useRef, useMemo } from 'react';
+import { PageLoading } from './PageLoading';
 import { NavLink, Outlet, useNavigate, useLocation } from 'react-router-dom';
-import { Printer, Archive, ListOrdered, BarChart3, Cloud, Settings, Sun, Moon, Monitor, ChevronLeft, ChevronRight, Keyboard, Github, ArrowUpCircle, Wrench, FolderKanban, FolderOpen, X, Menu, Info, Plug, Bug, LogOut, Key, Loader2, Disc3, ShieldAlert, Globe, Bell, Radar, type LucideIcon } from 'lucide-react';
+import { Printer, Archive, ListOrdered, BarChart3, Cloud, Settings, Sun, Moon, Monitor, ChevronLeft, ChevronRight, Keyboard, Github, ArrowUpCircle, Wrench, FolderKanban, FolderOpen, X, Menu, Info, Plug, Bug, LogOut, Key, Loader2, Disc3, ShieldAlert, Globe, Bell, Receipt, Megaphone, Radar, type LucideIcon } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
 import { useTheme } from '../contexts/ThemeContext';
 import { KeyboardShortcutsModal } from './KeyboardShortcutsModal';
 import { InstallAppButton } from './InstallAppButton';
 import { SwitchbarPopover } from './SwitchbarPopover';
+import { CameraLauncher } from './CameraLauncher';
 import { useQuery, useQueries } from '@tanstack/react-query';
 import { api, supportApi, pendingUploadsApi, type Permission } from '../api/client';
 import { getIconByName } from './IconPicker';
@@ -14,12 +16,17 @@ import { useColorCatalogVersion } from '../hooks/useColorCatalogVersion';
 import { useSponsorPrompt } from '../hooks/useSponsorPrompt';
 import { useUnknownTagPrompt } from '../hooks/useUnknownTagPrompt';
 import { UnknownSpoolModal } from './UnknownSpoolModal';
+import { ConfirmOutcomeDialog } from './ConfirmOutcomeDialog';
 import { useAuth } from '../contexts/AuthContext';
 import { useToast } from '../contexts/ToastContext';
 import { Card, CardHeader, CardContent } from './Card';
 import { parseUTCDate } from '../utils/date';
 import { Button } from './Button';
 import { BugReportBubble } from './BugReportBubble';
+import { AnnouncementsPanel } from './AnnouncementsPanel';
+import { AnnouncementBanner } from './AnnouncementBanner';
+import { useAnnouncements } from '../hooks/useAnnouncements';
+import { plateCheckFailureText } from '../utils/plateCheck';
 import {
   getHiddenSidebarSystemItemIds,
   getSidebarOrder,
@@ -45,10 +52,14 @@ export const defaultNavItems: NavItem[] = [
   { id: 'queue', to: '/queue', icon: ListOrdered, labelKey: 'nav.queue' },
   { id: 'projects', to: '/projects', icon: FolderKanban, labelKey: 'nav.projects' },
   { id: 'files', to: '/files', icon: FolderOpen, labelKey: 'nav.files' },
-  { id: 'makerworld', to: '/makerworld', icon: Globe, labelKey: 'nav.makerworld' },
+  // Id kept from when the page was MakerWorld-only, so saved sidebar orders and hidden items still apply.
+  { id: 'makerworld', to: '/model-sources', icon: Globe, labelKey: 'nav.modelSources' },
   { id: 'profiles', to: '/profiles', icon: Cloud, labelKey: 'nav.profiles' },
   { id: 'maintenance', to: '/maintenance', icon: Wrench, labelKey: 'nav.maintenance' },
   { id: 'stats', to: '/stats', icon: BarChart3, labelKey: 'nav.stats' },
+  // Opt-in feature: gated in isHidden() on the billing_enabled setting, so the
+  // entry stays out of the sidebar entirely until an admin turns billing on.
+  { id: 'finance', to: '/finance', icon: Receipt, labelKey: 'nav.finance' },
   // User-account feature: gated in isHidden() on advanced auth + user_notifications
   // + the notifications:user_email permission. Kept adjacent to Settings
   // intentionally. Do not drop this entry — without it the /notifications page
@@ -74,6 +85,24 @@ export function Layout() {
   const { t } = useTranslation();
   const isSidebarCompact = useIsSidebarCompact();
 
+  // Bug-report panel state lives here because the trigger moves (#2750,
+  // reporter @goodjaltman). Below the sidebar-compact breakpoint the floating
+  // disc is replaced by a button in the compact header: the bottom-right corner
+  // is the most contended region in the app — the Profiles scroll-to-top FAB,
+  // the floating camera window and its resize handle, the Group Edit save bar,
+  // the bulk-selection toolbars, and the File Manager / Archives per-card
+  // action buttons all live there — and a fixed 48px disc sits on top of
+  // whichever of them happens to be underneath. Moving out of the corner is
+  // the only fix that covers in-flow content as well as fixed overlays.
+  const [bugReportOpen, setBugReportOpen] = useState(false);
+  // A bug-report logging run survives the panel being closed (#2847). The
+  // floating disc shows that itself; the compact header's button and the
+  // debug-logging banner need telling.
+  const [bugReportLogging, setBugReportLogging] = useState(false);
+  // The camera list (#2737), also opened with the C key: from the Printers row
+  // of the sidebar, or from the compact header when the sidebar is a drawer.
+  const [cameraListOpen, setCameraListOpen] = useState(false);
+
   // Theme toggle: mode → icon and tooltip
   const ThemeIcon = { dark: Sun, light: Monitor, system: Moon }[mode];
   const themeSwitchTitle = t({ dark: 'nav.switchToLight', light: 'nav.switchToSystem', system: 'nav.switchToDark' }[mode]);
@@ -83,7 +112,7 @@ export function Layout() {
   // catalog fetched — and cached HSL-fallback color names during their first
   // render — refresh with the real catalog names. See #857.
   useColorCatalogVersion();
-  const { user, authEnabled, logout, hasPermission } = useAuth();
+  const { user, authEnabled, logout, hasPermission, hasAnyPermission, loading: authLoading } = useAuth();
   const { showToast } = useToast();
   const [showChangePasswordModal, setShowChangePasswordModal] = useState(false);
   const [changePasswordData, setChangePasswordData] = useState({ currentPassword: '', newPassword: '', confirmPassword: '' });
@@ -107,6 +136,11 @@ export function Layout() {
     printer_name: string;
     message: string;
   } | null>(null);
+  // Post-print outcome confirmation (#1898): archive waiting for a verdict,
+  // set by the print_confirm_request WebSocket event.
+  const [confirmOutcomeArchiveId, setConfirmOutcomeArchiveId] = useState<number | null>(null);
+  // The run the prompt asks about (a plate of the archive), when it names one.
+  const [confirmOutcomeRunId, setConfirmOutcomeRunId] = useState<number | null>(null);
 
   // Check for updates
   const { data: versionInfo } = useQuery({
@@ -115,14 +149,40 @@ export function Layout() {
     staleTime: Infinity,
   });
 
-  const { data: settings } = useQuery({
-    queryKey: ['settings'],
-    queryFn: api.getSettings,
+  // GET /settings requires settings:read, so for every non-admin this query
+  // 403'd and each of the four gates below silently took its fallback: Finance
+  // vanished from the sidebar for the users cost_centers:read_own exists for,
+  // a disabled user_notifications setting stopped applying to them, the sponsor
+  // prompt showed EUR whatever the install uses, and the update check ran where
+  // it had been switched off. Two of those were invisible to an administrator
+  // testing it, because an administrator can read /settings (#3023).
+  const { data: uiFlags } = useQuery({
+    queryKey: ['ui-flags'],
+    queryFn: api.getUiFlags,
     staleTime: 5 * 60 * 1000, // 5 minutes
   });
 
+  // Announcements from the Bambuddy maintainers: the sidebar entry above System,
+  // the slide-over list, and the banner for unread important/critical ones. The
+  // entry is there for whoever may see announcements, also with none published.
+  const {
+    visible: announcementsVisible,
+    announcements,
+    unread: unreadAnnouncements,
+    bannerItems,
+    markRead: markAnnouncementRead,
+  } = useAnnouncements();
+  const [announcementsOpen, setAnnouncementsOpen] = useState(false);
+  const [announcementFocus, setAnnouncementFocus] = useState<string | null>(null);
+  const openAnnouncements = useCallback((focusId?: string) => {
+    setMobileDrawerOpen(false);
+    setAnnouncementFocus(focusId ?? null);
+    setAnnouncementsOpen(true);
+  }, []);
+  const closeAnnouncements = useCallback(() => setAnnouncementsOpen(false), []);
+
   // Sponsor-prompt toast — fires once per session post-auth if a milestone is eligible.
-  useSponsorPrompt(settings?.currency ?? 'EUR');
+  useSponsorPrompt(uiFlags?.currency ?? 'USD');
 
   // Unknown-spool prompt — surfaces a confirmation modal when the AMS reports a
   // tag with no inventory match (only when `auto_add_unknown_rfid` is off).
@@ -179,7 +239,7 @@ export function Layout() {
   const { data: updateCheck } = useQuery({
     queryKey: ['updateCheck'],
     queryFn: api.checkForUpdates,
-    enabled: settings?.check_updates !== false,
+    enabled: uiFlags?.check_updates !== false,
     staleTime: 60 * 60 * 1000, // 1 hour
     refetchInterval: 60 * 60 * 1000, // Check every hour
   });
@@ -188,6 +248,8 @@ export function Layout() {
   const { data: externalLinks } = useQuery({
     queryKey: ['external-links'],
     queryFn: api.getExternalLinks,
+    // Like the queue badge: apps behind the links report counts.
+    refetchInterval: 30_000,
   });
 
   // Fetch smart plugs to check for switchbar items
@@ -299,8 +361,9 @@ export function Layout() {
       maintenance: 'maintenance:read',
       projects: 'projects:read',
       inventory: 'inventory:read',
+      finance: 'cost_centers:read_own',
       files: ['library:read', 'library:read_own', 'library:read_all'],
-      makerworld: 'makerworld:view',
+      makerworld: ['makerworld:view', 'manyfold:view'],
       settings: 'settings:read',
       // The user-email-preferences API requires notifications:user_email, so
       // gate the nav item on the same permission (both default groups —
@@ -323,7 +386,15 @@ export function Layout() {
         if (!granted) return true;
       }
       // notifications nav item also requires advanced auth to be enabled and user_notifications_enabled setting
-      if (id === 'notifications' && (!authEnabled || !advancedAuthStatus?.advanced_auth_enabled || (settings?.user_notifications_enabled === false))) return true;
+      if (id === 'notifications' && (!authEnabled || !advancedAuthStatus?.advanced_auth_enabled || (uiFlags?.user_notifications_enabled === false))) return true;
+      // Finance is off by default and the page is meaningless without it, so it
+      // stays hidden until billing is explicitly on. Tested for `true` rather
+      // than `!== false` on purpose: the flags are undefined on the first
+      // render, and a nav entry that appears and then vanishes reads as a
+      // glitch. That polarity is also why reading this from /settings hid the
+      // entry outright for anyone without settings:read, rather than failing
+      // open the way the notifications gate two lines up did (#3023).
+      if (id === 'finance' && uiFlags?.billing_enabled !== true) return true;
       return false;
     };
 
@@ -427,6 +498,67 @@ export function Layout() {
     return () => window.removeEventListener('plate-not-empty', handlePlateNotEmpty);
   }, [hasPermission]);
 
+  // A plate check that could not run (no camera image, ...) does not hold the
+  // print, but it is not an empty plate either: say so to those who can act.
+  useEffect(() => {
+    const handlePlateCheckFailed = (event: Event) => {
+      if (!hasPermission('printers:control')) {
+        return;
+      }
+      const detail = (event as CustomEvent).detail ?? {};
+      showToast(
+        t('printers.plateDetection.couldNotRun', {
+          printer: detail.printer_name ?? '',
+          reason: plateCheckFailureText(t, detail.reason),
+        }),
+        'warning',
+      );
+    };
+    window.addEventListener('plate-check-failed', handlePlateCheckFailed);
+    return () => window.removeEventListener('plate-check-failed', handlePlateCheckFailed);
+  }, [hasPermission, showToast, t]);
+
+  // A completed print asked for its outcome verdict (#1898). Same CustomEvent
+  // relay as plate-not-empty, and gated the same way: the PATCH route decides
+  // who may record a verdict, so a user who cannot should not be handed a
+  // dialog whose only outcome is a 403.
+  // Held until the auth state has landed: while it is loading, `authEnabled`
+  // is still false and every permission check answers yes, which would open
+  // the dialog for exactly the user this gate exists to spare.
+  const canConfirmOutcome = !authLoading && hasAnyPermission('archives:update_all', 'archives:update_own');
+  useEffect(() => {
+    const handleConfirmRequest = (event: Event) => {
+      const detail = (event as CustomEvent).detail;
+      if (typeof detail?.archive_id === 'number') {
+        setConfirmOutcomeArchiveId(detail.archive_id);
+        setConfirmOutcomeRunId(typeof detail.run_id === 'number' ? detail.run_id : null);
+      }
+    };
+    window.addEventListener('print-confirm-request', handleConfirmRequest);
+    return () => window.removeEventListener('print-confirm-request', handleConfirmRequest);
+  }, []);
+
+  // The ?confirm=<id> deep link a push notification carries (#1898). It is read
+  // here and not on ArchivesPage because that page renders inside this Layout's
+  // <Outlet />: React flushes a child's effects before its parent's, so a page
+  // dispatching `print-confirm-request` on mount fired before the listener above
+  // existed — which is exactly the cold load a notification tap produces. The
+  // parameter is stripped afterwards so a reload does not re-open the dialog.
+  useEffect(() => {
+    const params = new URLSearchParams(location.search);
+    const confirmId = params.get('confirm');
+    if (!confirmId || !/^\d+$/.test(confirmId)) {
+      return;
+    }
+    const runId = params.get('run');
+    setConfirmOutcomeArchiveId(Number(confirmId));
+    setConfirmOutcomeRunId(runId && /^\d+$/.test(runId) ? Number(runId) : null);
+    params.delete('confirm');
+    params.delete('run');
+    const rest = params.toString();
+    navigate({ pathname: location.pathname, search: rest ? `?${rest}` : '' }, { replace: true });
+  }, [location.pathname, location.search, navigate]);
+
   // Global keyboard shortcuts for navigation
   const handleKeyDown = useCallback((e: KeyboardEvent) => {
     const target = e.target as HTMLElement;
@@ -466,6 +598,11 @@ export function Layout() {
           e.preventDefault();
           setShowShortcuts(true);
           break;
+        case 'c':
+        case 'C':
+          e.preventDefault();
+          setCameraListOpen(open => !open);
+          break;
         case 'Escape':
           setShowShortcuts(false);
           break;
@@ -495,6 +632,21 @@ export function Layout() {
             alt="Bambuddy"
             className="h-8 ml-3"
           />
+          {/* A camera from any page (#2737), beside the bug report. */}
+          <div className="ml-auto">
+            <CameraLauncher placement="down" open={cameraListOpen} onOpenChange={setCameraListOpen} />
+          </div>
+          {/* Bug report — the compact-layout home of the floating bubble. */}
+          <button
+            onClick={() => setBugReportOpen(true)}
+            className={`p-2 -mr-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors ${
+              bugReportLogging ? 'text-amber-500' : 'text-red-500'
+            }`}
+            title={bugReportLogging ? t('bugReport.resumeReport') : t('bugReport.title')}
+            aria-label={bugReportLogging ? t('bugReport.resumeReport') : t('bugReport.title')}
+          >
+            <Bug className={`w-5 h-5 ${bugReportLogging ? 'animate-pulse' : ''}`} />
+          </button>
         </header>
       )}
 
@@ -535,6 +687,29 @@ export function Layout() {
                 if (!link) return null;
 
                 const LinkIcon = link.custom_icon ? null : getIconByName(link.icon);
+                // A count the app behind the link reports (Bambuddy Orders' To do).
+                const linkBadge = link.badge_count ?? 0;
+                const linkIcon = (
+                  <div className="relative">
+                    {link.custom_icon ? (
+                      <img
+                        src={api.getExternalLinkIconUrl(link.id)}
+                        alt=""
+                        className="w-5 h-5 flex-shrink-0"
+                      />
+                    ) : (
+                      LinkIcon && <LinkIcon className="w-5 h-5 flex-shrink-0" />
+                    )}
+                    {linkBadge > 0 && (
+                      <span
+                        data-testid={`external-link-badge-${link.id}`}
+                        className="absolute -top-1.5 -right-1.5 min-w-[18px] h-[18px] px-1 flex items-center justify-center text-[10px] font-bold rounded-full bg-yellow-500 text-black"
+                      >
+                        {linkBadge > 99 ? '99+' : linkBadge}
+                      </span>
+                    )}
+                  </div>
+                );
                 return (
                   <li key={id}>
                     {link.open_in_new_tab ? (
@@ -545,15 +720,7 @@ export function Layout() {
                         className={`flex items-center ${isSidebarCompact || sidebarExpanded ? 'gap-3 px-4' : 'justify-center px-2'} py-3 rounded-lg transition-colors group text-bambu-gray-light hover:bg-bambu-dark-tertiary hover:text-white`}
                         title={!isSidebarCompact && !sidebarExpanded ? link.name : undefined}
                       >
-                        {link.custom_icon ? (
-                          <img
-                            src={api.getExternalLinkIconUrl(link.id)}
-                            alt=""
-                            className="w-5 h-5 flex-shrink-0"
-                          />
-                        ) : (
-                          LinkIcon && <LinkIcon className="w-5 h-5 flex-shrink-0" />
-                        )}
+                        {linkIcon}
                         {(isSidebarCompact || sidebarExpanded) && <span>{link.name}</span>}
                       </a>
                     ) : (
@@ -568,15 +735,7 @@ export function Layout() {
                         }
                         title={!isSidebarCompact && !sidebarExpanded ? link.name : undefined}
                       >
-                        {link.custom_icon ? (
-                          <img
-                            src={api.getExternalLinkIconUrl(link.id)}
-                            alt=""
-                            className="w-5 h-5 flex-shrink-0"
-                          />
-                        ) : (
-                          LinkIcon && <LinkIcon className="w-5 h-5 flex-shrink-0" />
-                        )}
+                        {linkIcon}
                         {(isSidebarCompact || sidebarExpanded) && <span>{link.name}</span>}
                       </NavLink>
                     )}
@@ -594,8 +753,31 @@ export function Layout() {
                 const showBadge = showQueueBadge || showArchiveBadge;
                 const showClearPlateDot = id === 'printers' && needsClearPlate;
 
+                const expanded = isSidebarCompact || sidebarExpanded;
+                // The camera list from any page (#2737), on the row of the page
+                // the cameras belong to. The drawer's copy is not the one the C
+                // key opens: in the compact layout that is the header's.
+                const cameraLauncher = id === 'printers' && (
+                  // Collapsed, the row is 48px wide and the nav clips anything
+                  // past it: a 16px corner button, shown on hover or focus.
+                  <div
+                    className={`absolute ${
+                      expanded
+                        ? 'right-2 top-1/2 -translate-y-1/2'
+                        : `right-0 top-0.5 ${cameraListOpen ? '' : 'opacity-0 group-hover/printers:opacity-100 focus-within:opacity-100'}`
+                    }`}
+                  >
+                    <CameraLauncher
+                      placement="side"
+                      size={expanded ? 'sm' : 'xs'}
+                      onAccent={location.pathname === '/'}
+                      {...(isSidebarCompact ? {} : { open: cameraListOpen, onOpenChange: setCameraListOpen })}
+                    />
+                  </div>
+                );
+
                 return (
-                  <li key={id}>
+                  <li key={id} className={id === 'printers' ? 'relative group/printers' : undefined}>
                     <NavLink
                       to={to}
                       className={({ isActive }) =>
@@ -622,6 +804,7 @@ export function Layout() {
                       </div>
                       {(isSidebarCompact || sidebarExpanded) && <span>{t(labelKey)}</span>}
                     </NavLink>
+                    {cameraLauncher}
                   </li>
                 );
               }
@@ -647,9 +830,11 @@ export function Layout() {
         {/* Footer */}
         <div className="flex-shrink-0 p-2 border-t border-bambu-dark-tertiary">
           {isSidebarCompact || sidebarExpanded ? (
-            <div className="flex flex-col gap-2 px-2">
-              {/* Top row: icons */}
-              <div className="flex items-center justify-center gap-1 flex-wrap">
+            <div className="flex flex-col gap-2">
+              {/* Top row: icons. 32px each with no gap so seven fit the 239px
+                  of an expanded sidebar -- announcements, System, GitHub,
+                  shortcuts, theme, password, logout -- without wrapping. */}
+              <div className="flex items-center justify-center flex-wrap [&>a]:p-1.5 [&>button]:p-1.5 [&>span]:p-1.5 [&>div>button]:p-1.5">
                 {hasSwitchbarPlugs && (
                   <div className="relative">
                     <button
@@ -665,6 +850,25 @@ export function Layout() {
                       <SwitchbarPopover onClose={() => setShowSwitchbar(false)} />
                     )}
                   </div>
+                )}
+                {announcementsVisible && (
+                  <button
+                    onClick={() => openAnnouncements()}
+                    className="relative p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
+                    title={t('announcements.title')}
+                    aria-label={
+                      unreadAnnouncements.length > 0
+                        ? t('announcements.unread', { count: unreadAnnouncements.length })
+                        : t('announcements.title')
+                    }
+                  >
+                    <Megaphone className="w-5 h-5" />
+                    {unreadAnnouncements.length > 0 && (
+                      <span className="absolute -top-0.5 -right-0.5 min-w-[16px] h-4 px-1 flex items-center justify-center text-[10px] font-bold rounded-full bg-bambu-green text-white">
+                        {unreadAnnouncements.length}
+                      </span>
+                    )}
+                  </button>
                 )}
                 {hasPermission('system:read') ? (
                   <NavLink
@@ -771,6 +975,23 @@ export function Layout() {
                   )}
                 </div>
               )}
+              {announcementsVisible && (
+                <button
+                  onClick={() => openAnnouncements()}
+                  className="relative p-2 rounded-lg hover:bg-bambu-dark-tertiary transition-colors text-bambu-gray-light hover:text-white"
+                  title={t('announcements.title')}
+                  aria-label={
+                    unreadAnnouncements.length > 0
+                      ? t('announcements.unread', { count: unreadAnnouncements.length })
+                      : t('announcements.title')
+                  }
+                >
+                  <Megaphone className="w-5 h-5" />
+                  {unreadAnnouncements.length > 0 && (
+                    <span className="absolute top-1 right-1 w-2.5 h-2.5 rounded-full bg-bambu-green ring-2 ring-bambu-dark-secondary" />
+                  )}
+                </button>
+              )}
               {hasPermission('system:read') ? (
                 <NavLink
                   to="/system"
@@ -855,6 +1076,18 @@ export function Layout() {
                   </span>
                 )}
               </span>
+              {/* A run started from the bug-report panel ends at that panel's
+                  Stop Logging button, so send the user back there rather than
+                  to the System page's raw toggle, which would drop the logs
+                  and the description they already wrote (#2847). */}
+              {bugReportLogging && (
+                <button
+                  onClick={() => setBugReportOpen(true)}
+                  className="text-amber-700 dark:text-amber-400 hover:text-amber-900 dark:hover:text-amber-300 font-medium underline ml-2"
+                >
+                  {t('bugReport.resumeReport')}
+                </button>
+              )}
               <button
                 onClick={() => navigate('/system')}
                 className="text-amber-700 dark:text-amber-400 hover:text-amber-900 dark:hover:text-amber-300 font-medium underline ml-2"
@@ -882,6 +1115,7 @@ export function Layout() {
             </div>
           </div>
         )}
+        <AnnouncementBanner items={bannerItems} onOpen={openAnnouncements} markRead={markAnnouncementRead} />
         {/* Persistent update banner */}
         {showUpdateBanner && (
           <div className="bg-bambu-green/20 border-b border-bambu-green/30 px-4 py-2 flex items-center justify-between">
@@ -909,8 +1143,18 @@ export function Layout() {
             </button>
           </div>
         )}
-        <Outlet />
+        {/* Pages load on first open (#3175); the sidebar stays meanwhile. */}
+        <Suspense fallback={<PageLoading />}>
+          <Outlet />
+        </Suspense>
       </main>
+      <AnnouncementsPanel
+        open={announcementsOpen}
+        onClose={closeAnnouncements}
+        announcements={announcements}
+        markRead={markAnnouncementRead}
+        focusId={announcementFocus}
+      />
 
       <UnknownSpoolModal
         prompt={unknownSpool.prompt}
@@ -963,6 +1207,21 @@ export function Layout() {
             </div>
           </div>
         </div>
+      )}
+
+      {/* Post-print outcome confirmation (#1898) */}
+      {/* The dialog's only outcome for a user who may not record a verdict is
+          a 403 from the PATCH, so it is gated on the permissions that route
+          enforces — the names the June migration left in the default groups.
+          Gated on the render rather than on the two ways a request arrives:
+          one of them can land before /auth/me has answered, and a check made
+          then would drop it for everybody. */}
+      {canConfirmOutcome && confirmOutcomeArchiveId !== null && (
+        <ConfirmOutcomeDialog
+          archiveId={confirmOutcomeArchiveId}
+          runId={confirmOutcomeRunId}
+          onClose={() => setConfirmOutcomeArchiveId(null)}
+        />
       )}
 
       {/* Change Password Modal */}
@@ -1109,7 +1368,17 @@ export function Layout() {
           </Card>
         </div>
       )}
-      <BugReportBubble />
+      {/* The panel always mounts here, at the Layout root. It must not move
+          into the header alongside its compact-layout trigger: the header is
+          `fixed z-40` and so its own stacking context, which would cap the
+          z-50 panel at the header's level and bury it under every ordinary
+          modal in the app. */}
+      <BugReportBubble
+        showTrigger={!isSidebarCompact}
+        open={bugReportOpen}
+        onOpenChange={setBugReportOpen}
+        onLoggingChange={setBugReportLogging}
+      />
     </div>
   );
 }

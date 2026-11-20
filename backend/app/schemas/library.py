@@ -2,7 +2,9 @@
 
 from datetime import datetime
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from backend.app.schemas.not_null import IgnoresNullForRequiredColumns
 
 # ============ Folder Schemas ============
 
@@ -26,13 +28,18 @@ class ExternalFolderCreate(BaseModel):
     parent_id: int | None = None
 
 
-class FolderUpdate(BaseModel):
+class FolderUpdate(IgnoresNullForRequiredColumns):
     """Schema for updating a folder."""
+
+    __orm_table__ = "library_folders"
 
     name: str | None = Field(None, min_length=1, max_length=255)
     parent_id: int | None = None
     project_id: int | None = None  # 0 to unlink
     archive_id: int | None = None  # 0 to unlink
+    # Visible to (and writable by) every library:read_own user (#3201).
+    # Only library:update_all may change it.
+    shared: bool | None = None
 
 
 class FolderResponse(BaseModel):
@@ -56,6 +63,13 @@ class FolderResponse(BaseModel):
     # tracks rename/move events. Recursion across subfolders is intentionally
     # left out to keep the route a single GROUP BY rather than a recursive CTE.
     latest_activity_at: datetime | None = None
+    # Ownership (#3201). ``can_*`` are for the user asking: what the File
+    # Manager may offer on this folder. The routes enforce the same rules.
+    created_by_id: int | None = None
+    shared: bool = False
+    can_write: bool = True
+    can_rename: bool = True
+    can_delete: bool = True
     created_at: datetime
     updated_at: datetime
 
@@ -92,6 +106,13 @@ class FolderTreeItem(BaseModel):
     file_count: int = 0
     # See FolderResponse.latest_activity_at — #1770 folder sort source.
     latest_activity_at: datetime | None = None
+    # Ownership (#3201). ``can_*`` are for the user asking: what the File
+    # Manager may offer on this folder. The routes enforce the same rules.
+    created_by_id: int | None = None
+    shared: bool = False
+    can_write: bool = True
+    can_rename: bool = True
+    can_delete: bool = True
     children: list["FolderTreeItem"] = []
 
     class Config:
@@ -101,27 +122,29 @@ class FolderTreeItem(BaseModel):
 # ============ File Schemas ============
 
 
-class FileCreate(BaseModel):
-    """Schema for creating a file entry (internal use after upload)."""
-
-    filename: str
-    file_path: str
-    file_type: str
-    file_size: int
-    file_hash: str | None = None
-    thumbnail_path: str | None = None
-    metadata: dict | None = None
-    folder_id: int | None = None
-    project_id: int | None = None
-
-
-class FileUpdate(BaseModel):
+class FileUpdate(IgnoresNullForRequiredColumns):
     """Schema for updating a file."""
+
+    __orm_table__ = "library_files"
 
     filename: str | None = Field(None, min_length=1, max_length=255)
     folder_id: int | None = None
     project_id: int | None = None
     notes: str | None = None
+    # Empty string clears the link, like ``notes`` (#3077).
+    external_url: str | None = Field(None, max_length=500)
+
+    @field_validator("external_url")
+    @classmethod
+    def validate_external_url(cls, v: str | None) -> str | None:
+        # The link is rendered as an href for every reader of the library, so
+        # only web URLs are accepted (no javascript:/data: schemes).
+        if v is None:
+            return None
+        v = v.strip()
+        if v and not v.lower().startswith(("http://", "https://")):
+            raise ValueError("external_url must start with http:// or https://")
+        return v
 
 
 class FileDuplicate(BaseModel):
@@ -157,6 +180,11 @@ class FileResponse(BaseModel):
     last_printed_at: datetime | None
 
     notes: str | None
+    # User link + photos of the printed result (#3077); ``source_url`` is the
+    # read-only import provenance (MakerWorld) shown next to it.
+    external_url: str | None = None
+    photos: list[str] = []
+    source_url: str | None = None
 
     # Duplicate detection
     duplicates: list[FileDuplicate] | None = None
@@ -220,6 +248,19 @@ class FileListResponse(BaseModel):
     # never null, so the FE can iterate without a guard.
     tags: list[TagSummary] = []
 
+    # Variant grouping (#671 / #2570). ``variant_count`` is the size of the whole
+    # group, not of the current listing — members can live in different folders,
+    # so counting the rows on screen would under-report. Projected in the list
+    # query so the badge and the smart-print decision cost no extra request.
+    variant_group_id: int | None = None
+    variant_count: int = 0
+
+    # Metadata indicators (#3077). The list never ships the notes text itself —
+    # ``has_notes`` is enough for the card badge; the details modal loads the rest.
+    external_url: str | None = None
+    has_notes: bool = False
+    photo_count: int = 0
+
     class Config:
         from_attributes = True
 
@@ -246,8 +287,10 @@ class TagCreate(BaseModel):
     name: str = Field(..., min_length=1, max_length=64)
 
 
-class TagUpdate(BaseModel):
+class TagUpdate(IgnoresNullForRequiredColumns):
     """Rename a tag. ``name`` is required — there's nothing else to update."""
+
+    __orm_table__ = "library_tags"
 
     name: str = Field(..., min_length=1, max_length=64)
 
@@ -294,6 +337,26 @@ class FileUploadResponse(BaseModel):
     metadata: dict | None = None
 
 
+# ============ Combine ============
+
+
+class CombineItem(BaseModel):
+    """One source model in a combine request."""
+
+    file_id: int
+    copies: int = Field(default=1, ge=1, le=100)
+
+
+class CombineFilesRequest(BaseModel):
+    """Combine STL library files into one multi-object 3MF on a single plate."""
+
+    items: list[CombineItem] = Field(..., min_length=1, max_length=100)
+    # Name of the new library file; ``.3mf`` is appended when missing.
+    filename: str = Field(..., min_length=1, max_length=255)
+    # Destination folder; None = library root.
+    folder_id: int | None = None
+
+
 # ============ Bulk Operations ============
 
 
@@ -318,6 +381,13 @@ class AddToQueueRequest(BaseModel):
     """Schema for adding library files to the print queue."""
 
     file_ids: list[int] = Field(..., min_length=1)
+    # Where the items should go. Mutually exclusive, both optional. With
+    # neither, each file's own declared model is used when a printer of that
+    # model is active: an item carrying no printer and no target model matches
+    # neither branch of the scheduler's dispatch, so it is one nothing can ever
+    # pick up (#3112).
+    printer_id: int | None = None
+    target_model: str | None = None
 
 
 class AddToQueueResult(BaseModel):
@@ -397,3 +467,70 @@ class BatchThumbnailResponse(BaseModel):
     succeeded: int
     failed: int
     results: list[BatchThumbnailResult]
+
+
+class ClientThumbnailResponse(BaseModel):
+    """Schema for the client-rendered preview thumbnail upload response (#2976).
+
+    ``updated`` is false when the file already had a thumbnail — the upload is
+    skipped so a stored thumbnail is never silently replaced.
+    """
+
+    updated: bool
+
+
+# ============ Variant Group Schemas (#671 / #2570) ============
+
+
+class VariantGroupMemberRequest(BaseModel):
+    """One file joining a variant group.
+
+    ``target_model`` is optional and normally omitted — it is read from the
+    file's own ``sliced_for_model``. Supply it only for a legacy 3MF that
+    declares no model, where there is nothing else to go on.
+    """
+
+    library_file_id: int
+    target_model: str | None = Field(None, max_length=50)
+
+
+class VariantGroupCreate(BaseModel):
+    """Declare that these files are the same job sliced for different printers.
+
+    Order is significant: it is the priority used when more than one printer is
+    idle at the same moment. Two members minimum — a group of one expresses no
+    choice.
+    """
+
+    members: list[VariantGroupMemberRequest] = Field(..., min_length=2)
+    name: str | None = Field(None, max_length=255)
+
+
+class VariantGroupUpdate(IgnoresNullForRequiredColumns):
+    """Rename a group and/or re-order its members.
+
+    ``member_file_ids`` must list exactly the group's current members; a partial
+    list is rejected rather than guessing where the omitted ones belong.
+    """
+
+    __orm_table__ = "file_variant_groups"
+
+    name: str | None = Field(None, max_length=255)
+    member_file_ids: list[int] | None = None
+
+
+class VariantGroupMemberResponse(BaseModel):
+    """A file within a group, with the model it will be dispatched to."""
+
+    library_file_id: int
+    filename: str
+    target_model: str
+    position: int
+
+
+class VariantGroupResponse(BaseModel):
+    """A variant group and its members, in priority order."""
+
+    id: int
+    name: str
+    members: list[VariantGroupMemberResponse]

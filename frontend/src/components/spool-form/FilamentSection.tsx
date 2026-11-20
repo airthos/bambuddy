@@ -4,6 +4,8 @@ import { useTranslation } from 'react-i18next';
 import type { FilamentSectionProps, FilamentOption } from './types';
 import { KNOWN_VARIANTS } from './constants';
 import { parsePresetName } from './utils';
+import { PresetSourceBadge } from './PresetPicker';
+import { NumberInput } from '../NumberInput';
 
 // The identity fields a slicer preset can auto-fill.
 type PresetFilledField = 'material' | 'brand' | 'subtype';
@@ -268,14 +270,21 @@ export function FilamentSection({
                     <button
                       key={`${option.code}::${option.name}`}
                       type="button"
-                      className={`w-full px-3 py-2 text-left text-sm hover:bg-bambu-dark-tertiary truncate ${
+                      className={`w-full px-3 py-2 text-left text-sm hover:bg-bambu-dark-tertiary flex items-center gap-2 ${
                         selectedPresetOption?.code === option.code
                           ? 'bg-bambu-green/10 text-bambu-green'
                           : 'text-white'
                       }`}
                       onClick={() => handlePresetSelect(option)}
                     >
-                      {option.displayName}
+                      {/* Same origin badge as the Printers tab and the
+                          Configure AMS Slot modal: the same filament exists as
+                          a cloud preset, an imported one and a built-in, and
+                          which is picked decides what reaches the printer. */}
+                      <span className="flex-1 min-w-0 truncate" title={option.displayName}>
+                        {option.displayName}
+                      </span>
+                      <PresetSourceBadge source={option.source} />
                     </button>
                   ))
                 )}
@@ -513,16 +522,13 @@ export function FilamentSection({
       {quickAdd && (
         <div>
           <label className="block text-sm font-medium text-bambu-gray mb-1">{t('inventory.quantity')}</label>
-          <input
-            type="number"
+          <NumberInput
             className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:outline-none focus:border-bambu-green"
             value={quantity}
             min={1}
             max={100}
-            onChange={(e) => {
-              const val = Math.max(1, Math.min(100, parseInt(e.target.value) || 1));
-              onQuantityChange(val);
-            }}
+            onChange={onQuantityChange}
+            fallback={1}
           />
         </div>
       )}

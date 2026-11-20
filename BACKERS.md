@@ -17,7 +17,7 @@ If you sponsor and your name isn't here within 48h, please write an email to mar
 
 ## Sustaining Sponsors ($150/mo+)
 
-*None yet.*
+- [@simplytoast1](https://github.com/simplytoast1)
 
 ## Patrons ($35/mo+)
 
@@ -29,39 +29,40 @@ If you sponsor and your name isn't here within 48h, please write an email to mar
 - [@Rayvenhaus](https://github.com/Rayvenhaus)
 - [@TheUltimateC0der](https://github.com/TheUltimateC0der)
 - [@rstocks](https://github.com/rstocks)
+- [@Neasham21](https://github.com/Neasham21)
+- [@strikerfab](https://github.com/strikerfab)
+- [@TheVikingTech(https://github.com/TheVikingTech)
 
 ## Supporters ($15/mo+)
 
 - [@rewart01](https://github.com/rewart01)
 - [@sixfootseven](https://github.com/sixfootseven)
 - [@MethodicalMartian](https://github.com/MethodicalMartian)
-- [@brianharwell](https://github.com/brianharwell)
 - [@shosier01](https://github.com/shosier01)
 - [@freifunk-bamberg](https://github.com/freifunk-bamberg)
+- [@davisgoodmanv](https://github.com/davisgoodman)
+- [@Heidelberger2000](https://github.com/Heidelberger2000)
+- [@Xethm81](https://github.com/Xethm81)
+- [@JmanB52D](https://github.com/JmanB52D)
 
 ## Backers ($5/mo+)
 
 - [@aneopsy](https://github.com/aneopsy)
-- [@flom89](https://github.com/flom89)
 - [@grizz0blaw](https://github.com/grizz0blaw)
 - [@NoahTingey](https://github.com/NoahTingey)
 - [@sentinel-center](https://github.com/sentinel-center)
 - [@brianehlert](https://github.com/brianehlert)
-- [@siiruup](https://github.com/siiruup)
 - [@agntcoopersea](https://github.com/agntcoopersea)
-- [@PJMCL1618033](https://github.com/PJMCL1618033
 - [@mgf99](https://github.com/mgf99)
 - [@Geoff-S](https://github.com/Geoff-S)
 - [@andyspinball](https://github.com/andyspinball
 - [@avandeputte](https://github.com/avandeputte)
-- [@joeferrante](https://github.com/joeferrante)
 - [@GPop61](https://github.com)
 - [@CooleyMcCoolson](https://github.com/CooleyMcCoolson)
 - [@mikeloveridge](https://github.com/mikeloveridge)
 - [@boernie](https://github.com/boernie)
 - [@qoatzelcoat](https://github.com/qoatzelcoat)
 - [@Sanaki](https://github.com/Sanaki)
-- [@jlofshult](https://github.com/jlofshult)
 - [@TriadX1](https://github.com/TriadX1)
 - [@hazzardr](https://github.com/hazzardr)
 - [@Shihchiun](https://github.com/Shihchiun)
@@ -69,8 +70,11 @@ If you sponsor and your name isn't here within 48h, please write an email to mar
 - [@iljur](https://github.com/iljur)
 - [@bhamiltoncx](https://github.com/bhamiltoncx)
 - [@g7ufo](https://github.com/g7ufo)
-- [@Heidelberger2000](https://github.com/Heidelberger2000)
-
+- [@MorganMLGman](https://github.com/MorganMLGman)
+- [@NeighborGeek](https://github.com/NeighborGeek)
+- [@frantiseklorenc](https://github.com/frantiseklorenc)
+- [@adamspicedev](https://github.com/adamspicedev)
+- [@jsstone88-oss](https://github.com/jsstone88-oss)
 ---
 
 ## One-time and historical supporters

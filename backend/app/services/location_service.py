@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from dataclasses import dataclass
 
@@ -17,6 +18,23 @@ from backend.app.models.spool import Spool
 logger = logging.getLogger(__name__)
 
 DUPLICATE_LOCATION_NAME = "A location with this name already exists"
+
+# AMS residency markers, not storage locations. Bambuddy used to write the slot
+# a spool was loaded into -- "<printer> - AMS A1", "<printer> - AMS-HT A1" or
+# "<printer> - External Spool" -- straight into Spoolman's `location` field. That writer went away when Storage Location
+# became a place the user chooses (#1114), but the strings survive on people's
+# Spoolman spools, and importing them offers a printer slot as somewhere to put
+# a spool away. A slot is where a spool is loaded, not where it is stored, and
+# Bambuddy tracks that separately through slot assignments.
+_AMS_SLOT_LOCATION_RE = re.compile(
+    r"^(?:.+\s-\s)?(?:AMS[- ]HT [A-Z]\d+|AMS [A-Z]\d+|External Spool)$",
+    re.IGNORECASE,
+)
+
+
+def is_ams_slot_location(name: str) -> bool:
+    """True when a location string names a printer slot rather than a storage place."""
+    return bool(_AMS_SLOT_LOCATION_RE.match(name.strip()))
 
 
 def normalize_location_name(name: str) -> str:
@@ -194,21 +212,6 @@ async def count_internal_spools_at_location(db: AsyncSession, location_id: int) 
     return int(result.scalar() or 0)
 
 
-async def count_spools_at_location_by_name(db: AsyncSession, name: str) -> int:
-    normalized = name.strip()
-    if not normalized:
-        return 0
-    result = await db.execute(
-        select(func.count())
-        .select_from(Spool)
-        .where(
-            Spool.archived_at.is_(None),
-            func.lower(func.trim(Spool.storage_location)) == normalized.lower(),
-        )
-    )
-    return int(result.scalar() or 0)
-
-
 async def enrich_spool_dicts_with_location_id(db: AsyncSession, spools: list[dict]) -> None:
     """Attach location_id to mapped Spoolman-style spool dicts in place."""
     keys = {location_name_key(s["storage_location"]) for s in spools if (s.get("storage_location") or "").strip()}
@@ -280,6 +283,9 @@ async def sync_locations_from_spoolman(db: AsyncSession, client) -> bool:
     for raw in names:
         name = (raw or "").strip()
         if not name:
+            continue
+        if is_ams_slot_location(name):
+            logger.debug("Skipping AMS slot marker %r from the Spoolman location import", name)
             continue
         key = location_name_key(name)
         if key not in by_key:

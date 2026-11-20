@@ -46,11 +46,13 @@ def _clear_cover_state():
 @pytest.mark.asyncio
 async def test_concurrent_cover_requests_download_once():
     printer = SimpleNamespace(id=1, ip_address="127.0.0.1", access_code="x", model="X1C", name="P")
-    state = SimpleNamespace(subtask_name="job", state="RUNNING")
+    state = SimpleNamespace(subtask_name="job", state="RUNNING", subtask_id="", gcode_file="", current_print="")
 
     produce_calls = {"n": 0}
 
-    async def slow_produce(printer_row, printer_id, subtask_name, view, view_key, plate_num, cache_key):
+    async def slow_produce(
+        printer_row, printer_id, subtask_name, view, view_key, plate_num, cache_key, archive_path=None
+    ):
         produce_calls["n"] += 1
         await asyncio.sleep(0.1)  # hold leadership long enough for followers to attach
         printers_mod._cover_cache.setdefault(printer_id, {})[cache_key] = b"PNGDATA"
@@ -72,11 +74,11 @@ async def test_concurrent_cover_requests_download_once():
 async def test_second_request_serves_from_positive_cache():
     """A follower arriving after the leader filled the cache serves it directly."""
     printer = SimpleNamespace(id=1, ip_address="127.0.0.1", access_code="x", model="X1C", name="P")
-    state = SimpleNamespace(subtask_name="job", state="RUNNING")
+    state = SimpleNamespace(subtask_name="job", state="RUNNING", subtask_id="", gcode_file="", current_print="")
 
     produce_calls = {"n": 0}
 
-    async def produce(printer_row, printer_id, subtask_name, view, view_key, plate_num, cache_key):
+    async def produce(printer_row, printer_id, subtask_name, view, view_key, plate_num, cache_key, archive_path=None):
         produce_calls["n"] += 1
         printers_mod._cover_cache.setdefault(printer_id, {})[cache_key] = b"PNGDATA"
         return b"PNGDATA"

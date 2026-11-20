@@ -12,6 +12,18 @@ import { getPrinterImage, isGcodeCompatible, filterCompatibleQueueItems } from '
 import type { PrintQueueItem } from '../../api/client';
 
 describe('getPrinterImage', () => {
+  describe('H3C', () => {
+    it('uses its own image, by name or model code', () => {
+      expect(getPrinterImage('H3C')).toBe('/img/printers/h3c.png');
+      expect(getPrinterImage('h3c')).toBe('/img/printers/h3c.png');
+      expect(getPrinterImage('N10')).toBe('/img/printers/h3c.png');
+    });
+
+    it('does not take the H2C image', () => {
+      expect(getPrinterImage('H2C')).toBe('/img/printers/h2c.png');
+    });
+  });
+
   describe('X2D (#988)', () => {
     it('resolves display name "X2D" to x2d.png', () => {
       expect(getPrinterImage('X2D')).toBe('/img/printers/x2d.png');
@@ -74,10 +86,13 @@ describe('getPrinterImage', () => {
       expect(getPrinterImage('H2D Pro')).toBe('/img/printers/h2dpro.png');
     });
 
-    it('P2S → p1s.png (shared with P1S)', () => {
-      // Pre-existing behaviour: P2S currently reuses the P1S artwork. Not
-      // changed by the X2D diff; asserted to catch accidental regressions.
-      expect(getPrinterImage('P2S')).toBe('/img/printers/p1s.png');
+    it('P2S → p2s.png', () => {
+      expect(getPrinterImage('P2S')).toBe('/img/printers/p2s.png');
+    });
+
+    it('P1S → p1s.png', () => {
+      // Ensure that P1S still resolves correctly
+      expect(getPrinterImage('P1S')).toBe('/img/printers/p1s.png');
     });
 
     it('A1 Mini → a1mini.png (not a1.png)', () => {
@@ -174,5 +189,24 @@ describe('filterCompatibleQueueItems — force-color PLA variant (#2650)', () =>
     const noIdxJob = makeItem([{ slot_id: 1, type: 'PLA', color: '#FFFFFF', force_color_match: true }]);
     const variants = new Set(['PLA:ffffff:GFA06']);
     expect(filterCompatibleQueueItems([noIdxJob], loadedTypes, loaded, variants)).toHaveLength(1);
+  });
+});
+
+describe('filterCompatibleQueueItems — printer-targeted jobs (#3133)', () => {
+  // A job moved from "Any P2S" to one P2S keeps its override. The printer is
+  // already chosen, so a colour it has not loaded must not hide the job from
+  // that printer's card — the scheduler maps the trays at dispatch.
+  const boneWhite = [{ slot_id: 1, type: 'PLA', color: '#F5F5DC', force_color_match: false }];
+  const loadedTypes = new Set(['PLA']);
+  const loadedBrown = new Set(['PLA:8b4513']);
+
+  it('keeps a specific-printer job whose override colour is not loaded', () => {
+    const item = { id: 1, printer_id: 3, filament_overrides: boneWhite } as unknown as PrintQueueItem;
+    expect(filterCompatibleQueueItems([item], loadedTypes, loadedBrown)).toHaveLength(1);
+  });
+
+  it('still filters the same job while it targets any printer of a model', () => {
+    const item = { id: 1, printer_id: null, target_model: 'P2S', filament_overrides: boneWhite } as unknown as PrintQueueItem;
+    expect(filterCompatibleQueueItems([item], loadedTypes, loadedBrown)).toHaveLength(0);
   });
 });

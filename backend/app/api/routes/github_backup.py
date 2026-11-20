@@ -12,6 +12,7 @@ from backend.app.core.permissions import Permission
 from backend.app.models.github_backup import GitHubBackupConfig, GitHubBackupLog
 from backend.app.models.user import User
 from backend.app.schemas.github_backup import (
+    REF_PATTERN,
     CloudAccountCounts,
     GitHubBackupConfigCreate,
     GitHubBackupConfigResponse,
@@ -19,10 +20,16 @@ from backend.app.schemas.github_backup import (
     GitHubBackupLogResponse,
     GitHubBackupStatus,
     GitHubBackupTriggerResponse,
+    GitHubCommitListResponse,
+    GitHubRestorePreview,
+    GitHubRestoreRequest,
+    GitHubRestoreResponse,
+    GitHubTestConnectionRequest,
     GitHubTestConnectionResponse,
-    ProviderType,
+    RestoreCategory,
 )
 from backend.app.services.github_backup import github_backup_service
+from backend.app.services.github_restore import github_restore_service
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +50,33 @@ _UNKNOWN_VISIBILITY_ERROR = (
     "and that your provider exposes the 'private' / 'visibility' field on its "
     "repo API."
 )
+
+# The permission that owns each category's rows, required on top of
+# github:restore. Backup is its own permission group, so without this a role
+# holding only Backup writes — via a restore — rows it cannot write through the
+# endpoint that owns them.
+#
+# Each entry is the permission that endpoint actually gates its writes on:
+#
+#   * SETTINGS   → PUT /api/v1/settings/ (settings:update)
+#   * SPOOLS     → POST/PATCH /api/v1/inventory/spools (inventory:update). Spool
+#     rows and their usage history both restore under this category.
+#   * ARCHIVES   → archives:update_all, not archives:create. A restore writes
+#     rows owned by other users — that is the whole point of carrying
+#     created_by_id — and update_all is the permission that means "may write an
+#     archive that is not yours". create alone would let an operator with
+#     archives:create_own-shaped access seed history onto someone else.
+#   * KPROFILES  → POST /api/v1/printers/{id}/kprofiles (kprofiles:update),
+#     which is what the restore ultimately calls through set_kprofiles_batch.
+#
+# Cloud profiles are absent because they are not a restorable category
+# (RestoreCategory's docstring).
+_CATEGORY_WRITE_PERMISSION = {
+    RestoreCategory.SETTINGS: Permission.SETTINGS_UPDATE,
+    RestoreCategory.SPOOLS: Permission.INVENTORY_UPDATE,
+    RestoreCategory.ARCHIVES: Permission.ARCHIVES_UPDATE_ALL,
+    RestoreCategory.KPROFILES: Permission.KPROFILES_UPDATE,
+}
 
 
 async def _enforce_private_repo(repo_url: str, token: str, provider: str) -> None:
@@ -95,7 +129,7 @@ async def _count_cloud_accounts(db: AsyncSession) -> tuple[int, int]:
 
 @router.get("/cloud-accounts", response_model=CloudAccountCounts)
 async def get_cloud_accounts(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
 ):
     """How many cloud accounts the Cloud Profiles category would collect from.
@@ -138,7 +172,7 @@ def _config_to_response(config: GitHubBackupConfig) -> dict:
 
 @router.get("/config", response_model=GitHubBackupConfigResponse | None)
 async def get_config(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
 ):
     """Get the current GitHub backup configuration."""
@@ -154,7 +188,7 @@ async def get_config(
 @router.post("/config", response_model=GitHubBackupConfigResponse)
 async def save_config(
     config_data: GitHubBackupConfigCreate,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
 ):
     """Create or update GitHub backup configuration.
@@ -230,7 +264,7 @@ async def save_config(
 @router.patch("/config", response_model=GitHubBackupConfigResponse)
 async def update_config(
     update_data: GitHubBackupConfigUpdate,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
 ):
     """Partially update GitHub backup configuration."""
@@ -291,7 +325,7 @@ async def update_config(
 
 @router.delete("/config")
 async def delete_config(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
 ):
     """Delete the GitHub backup configuration and all logs."""
@@ -311,19 +345,25 @@ async def delete_config(
 
 @router.post("/test", response_model=GitHubTestConnectionResponse)
 async def test_connection(
-    repo_url: str = Query(..., description="Repository URL"),
-    token: str = Query(..., description="Personal Access Token"),
-    provider: ProviderType = Query(default=ProviderType.GITHUB, description="Git provider key"),
+    body: GitHubTestConnectionRequest,
     _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
 ):
     """Test Git provider connection with provided credentials."""
-    result = await github_backup_service.test_connection(repo_url, token, provider=provider)
+    from backend.app.api.routes._url_safety import assert_safe_lan_service_url
+
+    # Checked like a saved repository URL (see _enforce_private_repo).
+    try:
+        assert_safe_lan_service_url(body.repo_url, label="Repository URL")
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    result = await github_backup_service.test_connection(body.repo_url, body.token, provider=body.provider)
     return GitHubTestConnectionResponse(**result)
 
 
 @router.post("/test-stored", response_model=GitHubTestConnectionResponse)
 async def test_stored_connection(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
 ):
     """Test GitHub connection using stored configuration."""
@@ -346,7 +386,7 @@ async def test_stored_connection(
 
 @router.post("/run", response_model=GitHubBackupTriggerResponse)
 async def trigger_backup(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
 ):
     """Manually trigger a backup."""
@@ -366,7 +406,7 @@ async def trigger_backup(
 
 @router.get("/status", response_model=GitHubBackupStatus)
 async def get_status(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
 ):
     """Get current backup status."""
@@ -388,18 +428,110 @@ async def get_status(
         configured=True,
         enabled=config.enabled,
         is_running=github_backup_service.is_running,
-        progress=github_backup_service.progress,
+        restore_running=github_restore_service.is_running,
+        progress=github_backup_service.progress or github_restore_service.progress,
         last_backup_at=config.last_backup_at,
         last_backup_status=config.last_backup_status,
         next_scheduled_run=config.next_scheduled_run,
     )
 
 
+@router.get("/commits", response_model=GitHubCommitListResponse)
+async def list_commits(
+    limit: int = Query(default=20, ge=1, le=100),
+    db: AsyncSession = Depends(get_db, scope="function"),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_RESTORE),
+):
+    """List recent backup commits so the user can pick one to restore from."""
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if not config:
+        raise HTTPException(status_code=404, detail="No configuration found. Configure backup first.")
+
+    commit_result = await github_restore_service.list_commits(config, limit=limit)
+    return GitHubCommitListResponse(**commit_result)
+
+
+@router.get("/restore/preview", response_model=GitHubRestorePreview)
+async def preview_restore(
+    ref: str = Query(default="HEAD", pattern=REF_PATTERN),
+    db: AsyncSession = Depends(get_db, scope="function"),
+    current_user: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_RESTORE),
+):
+    """Report which categories a given backup commit contains."""
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if not config:
+        raise HTTPException(status_code=404, detail="No configuration found. Configure backup first.")
+
+    preview = await github_restore_service.preview(
+        db, config, ref=ref, as_admin=current_user is None or current_user.is_admin
+    )
+    return GitHubRestorePreview(**preview)
+
+
+@router.post("/restore", response_model=GitHubRestoreResponse)
+async def restore_backup(
+    request: GitHubRestoreRequest,
+    db: AsyncSession = Depends(get_db, scope="function"),
+    current_user: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_RESTORE),
+):
+    """Restore selected categories from one backup commit.
+
+    Note there is no private-repo gate here, unlike the config endpoints: that
+    check exists to stop credentials leaving the instance, and this path only
+    reads. A config can only be saved against a private repo anyway.
+
+    Every category needs the permission that owns the rows it writes, on top of
+    ``github:restore`` — see ``_CATEGORY_WRITE_PERMISSION`` and the check below.
+    """
+    if current_user is not None:
+        # Each category rewrites rows some other endpoint already owns, and
+        # Backup is its own permission group — so a role holding only Backup
+        # could otherwise write, through a restore, what it cannot write through
+        # the endpoint that owns them. This module already makes that argument;
+        # it is why the four protected auth keys are refused outright.
+        #
+        # current_user is None only when auth is disabled: github:restore is in
+        # _APIKEY_DENIED_PERMISSIONS, so an API key never gets past the
+        # dependency to reach this line.
+        missing = sorted(
+            {
+                permission.value
+                for category, permission in _CATEGORY_WRITE_PERMISSION.items()
+                if category in request.categories and not current_user.has_all_permissions(permission.value)
+            }
+        )
+        if missing:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Missing required permissions: {', '.join(missing)}",
+            )
+
+    result = await db.execute(select(GitHubBackupConfig).limit(1))
+    config = result.scalar_one_or_none()
+
+    if not config:
+        raise HTTPException(status_code=404, detail="No configuration found. Configure backup first.")
+
+    restore_result = await github_restore_service.run_restore(
+        config.id,
+        ref=request.ref,
+        categories=request.categories,
+        overwrite_existing=request.overwrite_existing,
+        # A non-admin's restore keeps the sign-in and mail settings as they are.
+        as_admin=current_user is None or current_user.is_admin,
+    )
+    return GitHubRestoreResponse(**restore_result)
+
+
 @router.get("/logs", response_model=list[GitHubBackupLogResponse])
 async def get_logs(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
 ):
     """Get backup logs."""
@@ -437,7 +569,7 @@ async def get_logs(
 @router.delete("/logs")
 async def clear_logs(
     keep_last: int = Query(default=10, ge=0, le=100, description="Number of recent logs to keep"),
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.GITHUB_BACKUP),
 ):
     """Clear backup logs, optionally keeping the most recent entries."""

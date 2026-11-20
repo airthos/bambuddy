@@ -8,7 +8,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, waitFor, fireEvent } from '@testing-library/react';
+import { screen, waitFor, fireEvent, act } from '@testing-library/react';
 import React from 'react';
 import { render } from '@testing-library/react';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
@@ -16,6 +16,12 @@ import { MemoryRouter, Route, Routes, Outlet } from 'react-router-dom';
 import { ToastProvider } from '../../contexts/ToastContext';
 import { SpoolBuddyWriteTagPage } from '../../pages/spoolbuddy/SpoolBuddyWriteTagPage';
 import { api as mockedApi, spoolbuddyApi as mockedSpoolbuddyApi } from '../../api/client';
+
+// The kiosk runs signed in; these tests render it without the auth provider.
+vi.mock('../../contexts/AuthContext', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../../contexts/AuthContext')>();
+  return { ...actual, useAuth: () => ({ hasPermission: () => true }) };
+});
 
 // Mock the API modules. spoolman-* mocks default to "spoolman disabled" so
 // existing tests run in internal-inventory mode — the new spoolman parity
@@ -30,6 +36,14 @@ vi.mock('../../api/client', () => ({
     }),
     getSpoolmanInventorySpools: vi.fn().mockResolvedValue([]),
     createSpoolmanInventorySpool: vi.fn().mockResolvedValue({ id: 1, material: 'PLA' }),
+    // Read by the new-spool form's own data load; empty unless a test says otherwise.
+    getSpoolCatalog: vi.fn().mockResolvedValue([]),
+    getColorCatalog: vi.fn().mockResolvedValue([]),
+    getLocalPresets: vi.fn().mockResolvedValue({ filament: [] }),
+    getBuiltinFilaments: vi.fn().mockResolvedValue([]),
+    getPrinters: vi.fn().mockResolvedValue([]),
+    getCloudStatus: vi.fn().mockResolvedValue({ is_authenticated: false }),
+    orcaCloudStatus: vi.fn().mockResolvedValue({ connected: false }),
   },
   spoolbuddyApi: {
     getDevices: vi.fn().mockResolvedValue([]),
@@ -41,7 +55,9 @@ vi.mock('../../api/client', () => ({
 // Mock i18n
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({
-    t: (key: string, fallback: string) => fallback,
+    // The second argument is an options object on some calls (the full
+    // form's sections); only a string is a fallback.
+    t: (key: string, fallback?: unknown) => (typeof fallback === 'string' ? fallback : key),
     i18n: { language: 'en', changeLanguage: vi.fn() },
   }),
 }));
@@ -202,6 +218,104 @@ describe('SpoolBuddyWriteTagPage', () => {
     mockOutletContext.sbState.deviceOnline = false; // reset
   });
 
+  it('leaves "Writing tag..." with the reason when the written tag could not be linked', async () => {
+    const spool = {
+      id: 99,
+      material: 'PLA',
+      label_weight: 1000,
+      weight_used: 0,
+      tag_uid: null,
+      tray_uuid: null,
+      archived_at: null,
+      rgba: 'FF0000FF',
+    };
+    vi.mocked(mockedApi.getSpools).mockResolvedValue([spool as never]);
+    vi.mocked(mockedSpoolbuddyApi.getDevices).mockResolvedValue([
+      { device_id: 'sb-test', hostname: 'sb-test.local' } as never,
+    ]);
+    vi.mocked(mockedSpoolbuddyApi.writeTag).mockResolvedValueOnce({ status: 'queued' } as never);
+
+    mockOutletContext.sbState.deviceOnline = true;
+    renderPage();
+    await waitFor(() => expect(screen.getByText('PLA')).toBeDefined());
+    fireEvent.click(screen.getByText('PLA'));
+    await waitFor(() => expect((screen.getByText('Write Tag') as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByText('Write Tag'));
+    await waitFor(() => expect(screen.getByText('Writing tag...')).toBeDefined());
+
+    act(() => {
+      window.dispatchEvent(
+        new CustomEvent('spoolbuddy-tag-link-failed', {
+          detail: { type: 'spoolbuddy_tag_link_failed', spool_id: 99, reason: 'spool_not_found', message: 'Spool not found' },
+        }),
+      );
+    });
+
+    await waitFor(() => expect(screen.getByText('spoolbuddy.writeTag.linkFailedSpoolNotFound')).toBeDefined());
+    expect(screen.queryByText('Writing tag...')).toBeNull();
+    mockOutletContext.sbState.deviceOnline = false; // reset
+  });
+
+  it('says Spoolman is unavailable when the server refuses the write for that reason', async () => {
+    const spool = {
+      id: 99,
+      material: 'PLA',
+      label_weight: 1000,
+      weight_used: 0,
+      tag_uid: null,
+      tray_uuid: null,
+      archived_at: null,
+      rgba: 'FF0000FF',
+    };
+    vi.mocked(mockedApi.getSpools).mockResolvedValue([spool as never]);
+    vi.mocked(mockedSpoolbuddyApi.getDevices).mockResolvedValue([
+      { device_id: 'sb-test', hostname: 'sb-test.local' } as never,
+    ]);
+    vi.mocked(mockedSpoolbuddyApi.writeTag).mockRejectedValueOnce(
+      Object.assign(new Error('Spoolman is unavailable'), { status: 503 }),
+    );
+
+    mockOutletContext.sbState.deviceOnline = true;
+    renderPage();
+    await waitFor(() => expect(screen.getByText('PLA')).toBeDefined());
+    fireEvent.click(screen.getByText('PLA'));
+    await waitFor(() => expect((screen.getByText('Write Tag') as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByText('Write Tag'));
+
+    await waitFor(() => expect(screen.getByText('spoolbuddy.writeTag.spoolmanUnavailable')).toBeDefined());
+    mockOutletContext.sbState.deviceOnline = false; // reset
+  });
+
+  it('says why a write for a spool linked to its AMS RFID tag is refused (SM-C5)', async () => {
+    const spool = {
+      id: 98,
+      material: 'PLA',
+      label_weight: 1000,
+      weight_used: 0,
+      tag_uid: null,
+      tray_uuid: null,
+      archived_at: null,
+      rgba: 'FF0000FF',
+    };
+    vi.mocked(mockedApi.getSpools).mockResolvedValue([spool as never]);
+    vi.mocked(mockedSpoolbuddyApi.getDevices).mockResolvedValue([
+      { device_id: 'sb-test', hostname: 'sb-test.local' } as never,
+    ]);
+    vi.mocked(mockedSpoolbuddyApi.writeTag).mockRejectedValueOnce(
+      Object.assign(new Error('linked to its Bambu RFID tag'), { status: 409 }),
+    );
+
+    mockOutletContext.sbState.deviceOnline = true;
+    renderPage();
+    await waitFor(() => expect(screen.getByText('PLA')).toBeDefined());
+    fireEvent.click(screen.getByText('PLA'));
+    await waitFor(() => expect((screen.getByText('Write Tag') as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(screen.getByText('Write Tag'));
+
+    await waitFor(() => expect(screen.getByText('spoolbuddy.writeTag.linkedToAms')).toBeDefined());
+    mockOutletContext.sbState.deviceOnline = false; // reset
+  });
+
   it('reads from internal inventory when Spoolman mode is OFF (#1439 parity baseline)', async () => {
     vi.mocked(mockedApi.getSpoolmanSettings).mockResolvedValue({
       spoolman_enabled: 'false',
@@ -279,5 +393,230 @@ describe('SpoolBuddyWriteTagPage', () => {
     });
 
     mockOutletContext.sbState.deviceOnline = false;
+  });
+
+  it('leaves a spool linked by its AMS tray UUID out of the untagged list (SM-C5)', async () => {
+    // A Bambu spool created from the AMS is linked by its tray UUID; listed as
+    // untagged, a sticker written to it replaced that link in Spoolman.
+    const spools = [
+      { id: 50, material: 'PLA', label_weight: 1000, weight_used: 0, tag_uid: null, tray_uuid: null, archived_at: null, rgba: 'FF0000FF' },
+      { id: 51, material: 'PLA', label_weight: 1000, weight_used: 0, tag_uid: null, tray_uuid: '9E0B0717BEE94D7887EB1D8DFD1A14F3', archived_at: null, rgba: 'FF0000FF' },
+    ];
+    vi.mocked(mockedApi.getSpools).mockResolvedValue(spools as never);
+    mockOutletContext.sbState.deviceOnline = true;
+    renderPage();
+
+    await waitFor(() => expect(screen.getByText('#50')).toBeDefined());
+    expect(screen.queryByText('#51')).toBeNull();
+
+    mockOutletContext.sbState.deviceOnline = false;
+  });
+
+  describe('per-spool tare in Spoolman mode (#2908)', () => {
+    beforeEach(() => {
+      vi.mocked(mockedApi.getSpoolmanSettings).mockResolvedValue({
+        spoolman_enabled: 'true',
+        spoolman_url: 'http://spoolman.test',
+        spoolman_sync_mode: '',
+        spoolman_disable_weight_sync: '',
+        spoolman_report_partial_usage: '',
+      });
+      vi.mocked(mockedApi.getSpoolCatalog).mockResolvedValue([
+        { id: 3, name: 'Standard 300g', weight: 300 },
+      ] as never);
+    });
+
+    async function openNewSpoolForm() {
+      renderPage();
+      await waitFor(() => {
+        expect(vi.mocked(mockedApi.getSpoolmanInventorySpools)).toHaveBeenCalled();
+      });
+      fireEvent.click(screen.getByText('New Spool'));
+      await waitFor(() => screen.getByText('Create Spool'));
+      // The one field the simple view requires.
+      const material = screen.getAllByRole('combobox').find((el) => el.querySelector('option[value="PLA"]'));
+      fireEvent.change(material!, { target: { value: 'PLA' } });
+    }
+
+    async function createdPayload() {
+      fireEvent.click(screen.getAllByText('Create Spool').at(-1)!);
+      await waitFor(() => {
+        expect(vi.mocked(mockedApi.createSpoolmanInventorySpool)).toHaveBeenCalledTimes(1);
+      });
+      return vi.mocked(mockedApi.createSpoolmanInventorySpool).mock.calls[0][0] as unknown as Record<string, unknown>;
+    }
+
+    it('does not send the form default when the tare was left alone', async () => {
+      await openNewSpoolForm();
+
+      const payload = await createdPayload();
+
+      expect(payload).not.toHaveProperty('core_weight');
+      expect(payload).not.toHaveProperty('core_weight_catalog_id');
+    });
+
+    it('sends the tare the user picked, without the catalogue id', async () => {
+      await openNewSpoolForm();
+      fireEvent.click(screen.getByText('Full'));
+      const picker = await waitFor(() => {
+        const input = screen
+          .getAllByPlaceholderText(/search/i)
+          .find((el) => el.getAttribute('placeholder')?.toLowerCase().includes('spool'));
+        expect(input).toBeTruthy();
+        return input!;
+      });
+      fireEvent.focus(picker);
+      fireEvent.click(await screen.findByText('Standard 300g'));
+      // Back to the simple view to submit: it validates on material alone, and
+      // the form state, touched flag included, is shared by both views.
+      fireEvent.click(screen.getByText('Simple'));
+
+      const payload = await createdPayload();
+
+      expect(payload).toHaveProperty('core_weight', 300);
+      // No field for it on the Spoolman create schema; it would be dropped.
+      expect(payload).not.toHaveProperty('core_weight_catalog_id');
+    });
+  });
+
+  // #2870: the form rendered a Material No. input whose value never made it
+  // into the create payload, so the spool was saved with an inherited number
+  // or none at all — silently, with no hint that the typed one was dropped.
+  async function openFullNewSpoolForm() {
+    const rendered = renderPage();
+    fireEvent.click(screen.getByText('New Spool'));
+    await waitFor(() => {
+      expect(screen.getByText('Material')).toBeDefined();
+    });
+    // The simple view's material select is the cheapest way to satisfy the
+    // only field validateForm insists on.
+    fireEvent.change(screen.getByRole('combobox'), { target: { value: 'PLA' } });
+    fireEvent.click(screen.getByText('Full'));
+    await waitFor(() => {
+      expect(screen.getByText('Quick Add')).toBeDefined();
+    });
+    return rendered;
+  }
+
+  it('sends the material number the operator typed (#2870)', async () => {
+    const { container } = await openFullNewSpoolForm();
+
+    // Quick Add so material is the only required field on this form.
+    const quickAddToggle = screen.getByText('Quick Add').parentElement?.querySelector('button');
+    expect(quickAddToggle).toBeTruthy();
+    fireEvent.click(quickAddToggle as HTMLElement);
+
+    const numberInput = container.querySelector('#spool-material-number') as HTMLInputElement;
+    expect(numberInput).toBeTruthy();
+    fireEvent.change(numberInput, { target: { value: '77' } });
+
+    fireEvent.click(screen.getByText('Create Spool'));
+
+    await waitFor(() => {
+      expect(vi.mocked(mockedApi.createSpool)).toHaveBeenCalled();
+    });
+    expect(vi.mocked(mockedApi.createSpool).mock.calls[0][0]).toEqual(
+      expect.objectContaining({ material_number: '77' }),
+    );
+  });
+
+  it('does not offer the material number in Spoolman mode (#2870)', async () => {
+    // There the number is Spoolman's filament-level article_number; an input
+    // the internal create path cannot store must not be shown.
+    vi.mocked(mockedApi.getSpoolmanSettings).mockResolvedValue({
+      spoolman_enabled: 'true',
+      spoolman_url: 'http://spoolman.test',
+      spoolman_sync_mode: '',
+      spoolman_disable_weight_sync: '',
+      spoolman_report_partial_usage: '',
+    });
+    const { container } = await openFullNewSpoolForm();
+
+    expect(container.querySelector('#spool-material-number')).toBeNull();
+  });
+
+  describe('which device writes (#3504)', () => {
+    const spool = {
+      id: 7,
+      material: 'PLA',
+      label_weight: 1000,
+      weight_used: 0,
+      tag_uid: null,
+      tray_uuid: null,
+      archived_at: null,
+      rgba: 'FF0000FF',
+    };
+
+    beforeEach(() => {
+      localStorage.clear();
+      vi.mocked(mockedApi.getSpools).mockResolvedValue([spool as never]);
+      mockOutletContext.sbState.deviceOnline = true;
+    });
+
+    async function selectSpool() {
+      await waitFor(() => expect(screen.getByText('PLA')).toBeDefined());
+      fireEvent.click(screen.getByText('PLA'));
+      await waitFor(() => expect((screen.getByText('Write Tag') as HTMLButtonElement).disabled).toBe(false));
+    }
+
+    async function writeSelectedSpool() {
+      await selectSpool();
+      fireEvent.click(screen.getByText('Write Tag'));
+    }
+
+    it('sends the write to the online device, not an offline one listed first', async () => {
+      vi.mocked(mockedSpoolbuddyApi.getDevices).mockResolvedValue([
+        { device_id: 'old-console', hostname: 'old', online: false } as never,
+        { device_id: 'kiosk', hostname: 'kiosk', online: true } as never,
+      ]);
+      renderPage();
+
+      await writeSelectedSpool();
+
+      await waitFor(() => expect(mockedSpoolbuddyApi.writeTag).toHaveBeenCalledWith('kiosk', 7));
+      // One online device: nothing to choose.
+      expect(screen.queryByText('spoolbuddy.writeTag.writeWith')).toBeNull();
+      mockOutletContext.sbState.deviceOnline = false;
+    });
+
+    it('offers a choice with two online devices and writes with the chosen one', async () => {
+      vi.mocked(mockedSpoolbuddyApi.getDevices).mockResolvedValue([
+        { device_id: 'left', hostname: 'left', online: true } as never,
+        { device_id: 'right', hostname: 'right', online: true } as never,
+      ]);
+      renderPage();
+
+      const picker = await screen.findByRole('combobox');
+      fireEvent.change(picker, { target: { value: 'right' } });
+      await writeSelectedSpool();
+
+      await waitFor(() => expect(mockedSpoolbuddyApi.writeTag).toHaveBeenCalledWith('right', 7));
+      expect(localStorage.setItem).toHaveBeenCalledWith('spoolbuddy.kioskDeviceId', 'right');
+      mockOutletContext.sbState.deviceOnline = false;
+    });
+
+    it("ignores a tag on another device's reader", async () => {
+      vi.mocked(mockedSpoolbuddyApi.getDevices).mockResolvedValue([
+        { device_id: 'kiosk', hostname: 'kiosk', online: true } as never,
+      ]);
+      renderPage();
+      await selectSpool();
+
+      act(() => {
+        window.dispatchEvent(
+          new CustomEvent('spoolbuddy-unknown-tag', { detail: { tag_uid: '04FFEE', sak: 0, device_id: 'elsewhere' } }),
+        );
+      });
+      expect(screen.queryByText('Tag detected — ready to write')).toBeNull();
+
+      act(() => {
+        window.dispatchEvent(
+          new CustomEvent('spoolbuddy-unknown-tag', { detail: { tag_uid: '04FFEE', sak: 0, device_id: 'kiosk' } }),
+        );
+      });
+      await waitFor(() => expect(screen.getByText('Tag detected — ready to write')).toBeDefined());
+      expect(screen.getByText('04FFEE')).toBeDefined();
+      mockOutletContext.sbState.deviceOnline = false;
+    });
   });
 });

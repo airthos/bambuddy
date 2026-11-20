@@ -1,5 +1,6 @@
+import { useTranslation } from 'react-i18next';
 import type { AMSUnit, AMSTray } from '../../api/client';
-import { getFillBarColor } from '../../utils/amsHelpers';
+import { amsUnitSlotCount, getEmptySlotKind, getFillBarColor, isAms3hUnit, spoolBuddyAmsName } from '../../utils/amsHelpers';
 
 function trayColorToCSS(color: string | null): string {
   if (!color) return '#808080';
@@ -8,25 +9,6 @@ function trayColorToCSS(color: string | null): string {
 
 function isTrayEmpty(tray: AMSTray): boolean {
   return !tray.tray_type || tray.tray_type === '';
-}
-
-// Mirror of PrintersPage.getEmptySlotKind (#1694, #2527): 'physical' when
-// firmware confirms no spool, 'reset' when a spool is present but has no
-// tray_type (= loaded, slot just unconfigured — e.g. a non-RFID spool).
-// tray_exist_bits (exists) is authoritative when present; otherwise fall back
-// to the state=9/10 heuristic.
-function getEmptySlotKind(tray: AMSTray): 'physical' | 'reset' | null {
-  if (tray.tray_type) return null;
-  if (tray.exists === true) return 'reset';
-  if (tray.exists === false) return 'physical';
-  const state = tray.state ?? null;
-  return state === 9 || state === 10 ? 'physical' : 'reset';
-}
-
-function getAmsName(id: number): string {
-  if (id <= 3) return `AMS ${String.fromCharCode(65 + id)}`;
-  if (id >= 128 && id <= 135) return `AMS HT ${String.fromCharCode(65 + id - 128)}`;
-  return `AMS ${id}`;
 }
 
 // --- SVG Icons (matching PrintersPage Bambu Lab style) ---
@@ -155,10 +137,11 @@ interface SpoolSlotProps {
   isActive: boolean;
   fillOverride?: number | null;
   spoolmanFill?: number | null;
+  accessibleLabel?: string;
   onClick?: () => void;
 }
 
-function SpoolSlot({ tray, slotIndex, isActive, fillOverride, spoolmanFill, onClick }: SpoolSlotProps) {
+function SpoolSlot({ tray, slotIndex, isActive, fillOverride, spoolmanFill, accessibleLabel, onClick }: SpoolSlotProps) {
   const isEmpty = isTrayEmpty(tray);
   const emptyKind = getEmptySlotKind(tray);
   const color = trayColorToCSS(tray.tray_color);
@@ -170,9 +153,24 @@ function SpoolSlot({ tray, slotIndex, isActive, fillOverride, spoolmanFill, onCl
 
   return (
     <div
-      className={`relative flex flex-col items-center p-2.5 rounded-lg transition-all ${isActive ? 'ring-2 ring-bambu-green' : ''} ${onClick ? 'cursor-pointer hover:bg-white/5' : ''}`}
+      className={`relative flex flex-col items-center p-2.5 rounded-lg border transition-all ${
+        isActive
+          ? 'ring-2 ring-bambu-green border-bambu-green bg-bambu-green/10'
+          : 'border-transparent'
+      } ${onClick ? 'cursor-pointer hover:border-bambu-gray hover:bg-bambu-dark-tertiary' : ''}`}
       onClick={onClick}
-      title={onClick ? `AMS Slot ${slotIndex + 1}` : undefined}
+      onKeyDown={onClick ? (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          onClick();
+        }
+      } : undefined}
+      role={onClick ? 'button' : undefined}
+      tabIndex={onClick ? 0 : undefined}
+      aria-pressed={onClick ? isActive : undefined}
+      aria-label={onClick ? accessibleLabel : undefined}
+      title={onClick ? accessibleLabel : undefined}
+      data-testid={onClick ? 'ams-slot' : undefined}
     >
       {/* Spool visualization */}
       <div className="relative w-16 h-16 mb-1">
@@ -196,7 +194,7 @@ function SpoolSlot({ tray, slotIndex, isActive, fillOverride, spoolmanFill, onCl
 
       {/* Material type */}
       <span
-        className="text-sm text-white/70 truncate max-w-full"
+        className="text-sm text-bambu-gray-light truncate max-w-full"
         title={emptyKind === 'reset' ? 'Spool loaded — slot not configured' : undefined}
       >
         {isEmpty ? (emptyKind === 'reset' ? '?' : 'Empty') : tray.tray_type || 'Unknown'}
@@ -216,7 +214,9 @@ function SpoolSlot({ tray, slotIndex, isActive, fillOverride, spoolmanFill, onCl
       )}
 
       {/* Slot number */}
-      <span className="absolute top-1 right-1 text-xs text-white/30">{slotIndex + 1}</span>
+      <span className="absolute top-1 right-1 rounded bg-bambu-dark-tertiary px-1.5 py-0.5 text-[10px] font-semibold text-bambu-gray-light">
+        {slotIndex + 1}
+      </span>
     </div>
   );
 }
@@ -240,16 +240,19 @@ interface AmsUnitCardProps {
 }
 
 export function AmsUnitCard({ unit, activeSlot, onConfigureSlot, isDualNozzle, nozzleSide, thresholds, fillOverrides, spoolmanFillOverrides }: AmsUnitCardProps) {
+  const { t } = useTranslation();
   const trays = unit.tray || [];
   const isHt = unit.is_ams_ht;
-  const slotCount = isHt ? 1 : 4;
+  const isAms3h = isAms3hUnit(unit);
+  const slotCount = isHt ? 1 : amsUnitSlotCount(unit);
+  const amsName = spoolBuddyAmsName(unit.id, unit.ams_type);
 
   return (
-    <div className="bg-bambu-dark-secondary rounded-lg p-3">
+    <div className="bg-bambu-dark-secondary rounded-xl border border-[var(--border-color)] p-3 shadow-sm">
       {/* Header */}
       <div className="flex items-center justify-between mb-2">
         <div className="flex items-center gap-1.5">
-          <span className="text-white font-medium text-base">{getAmsName(unit.id)}</span>
+          <span className="text-white font-medium text-base">{amsName}</span>
           {isDualNozzle && nozzleSide && (
             <NozzleBadge side={nozzleSide} />
           )}
@@ -273,7 +276,7 @@ export function AmsUnitCard({ unit, activeSlot, onConfigureSlot, isDualNozzle, n
       </div>
 
       {/* Slots grid */}
-      <div className={`grid ${isHt ? 'grid-cols-1 max-w-[100px] mx-auto' : 'grid-cols-4'} gap-2`}>
+      <div className={`grid ${isHt ? 'grid-cols-1 max-w-[100px] mx-auto' : isAms3h ? 'grid-cols-5 md:grid-cols-9' : 'grid-cols-4'} gap-2`}>
         {Array.from({ length: slotCount }).map((_, i) => {
           const tray = trays[i] || {
             id: i,
@@ -298,6 +301,7 @@ export function AmsUnitCard({ unit, activeSlot, onConfigureSlot, isDualNozzle, n
               isActive={activeSlot === i}
               fillOverride={fillOverrides?.[`${unit.id}-${i}`] ?? null}
               spoolmanFill={spoolmanFillOverrides?.[`${unit.id}-${i}`] ?? null}
+              accessibleLabel={t('configureAmsSlot.slotLabel', { ams: amsName, slot: i + 1 })}
               onClick={onConfigureSlot ? () => onConfigureSlot(unit.id, i, isTrayEmpty(tray) ? null : tray) : undefined}
             />
           );

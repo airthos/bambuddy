@@ -118,15 +118,9 @@ class TestCheckPort:
     async def test_unreachable_port(self):
         from backend.app.api.routes.support import _check_port
 
-        with (
-            patch(
-                "backend.app.api.routes.support.asyncio.open_connection",
-                side_effect=ConnectionRefusedError,
-            ),
-            patch(
-                "backend.app.api.routes.support.asyncio.wait_for",
-                side_effect=ConnectionRefusedError,
-            ),
+        with patch(
+            "backend.app.api.routes.support.asyncio.open_connection",
+            side_effect=ConnectionRefusedError,
         ):
             result = await _check_port("192.168.1.1", 8883, timeout=1.0)
 
@@ -137,10 +131,12 @@ class TestCheckPort:
     async def test_timeout(self):
         from backend.app.api.routes.support import _check_port
 
-        with patch(
-            "backend.app.api.routes.support.asyncio.wait_for",
-            side_effect=asyncio.TimeoutError,
-        ):
+        # Closes the connect it was handed: left unawaited, it is reported in a later test.
+        async def _times_out(coro, timeout):
+            coro.close()
+            raise TimeoutError
+
+        with patch("backend.app.api.routes.support.asyncio.wait_for", side_effect=_times_out):
             result = await _check_port("192.168.1.1", 8883, timeout=0.1)
 
         assert result is False
@@ -268,6 +264,44 @@ class TestSanitizeLogContent:
         assert "192.168.1.5" not in result
         assert "01.07.02.00" in result
         assert "[IP] running firmware 01.07.02.00" in result
+
+    def test_oid_is_not_masked_as_an_ip(self):
+        """A longer dotted number is not an address. Masking its first four parts
+        turned lldap's StartTLS refusal into "[IP].4.1.1466.20037" (#3197)."""
+        from backend.app.services.log_reader import sanitize_log_content as _sanitize_log_content
+
+        content = "Unsupported extended operation: 1.3.6.1.4.1.1466.20037 - extendedResp"
+        assert _sanitize_log_content(content) == content
+
+    @pytest.mark.parametrize(
+        ("content", "expected"),
+        [
+            ("Connected to 192.168.1.5.", "Connected to [IP]."),
+            ("(10.0.0.1)", "([IP])"),
+            ("ftp://10.0.0.1:990/cache", "ftp://[IP]:990/cache"),
+            ("peers 10.0.0.1,10.0.0.2", "peers [IP],[IP]"),
+            ("[IP]:54054 via 172.16.0.9:443", "[IP]:54054 via [IP]:443"),
+        ],
+    )
+    def test_ips_are_still_masked_next_to_punctuation(self, content, expected):
+        from backend.app.services.log_reader import sanitize_log_content as _sanitize_log_content
+
+        assert _sanitize_log_content(content) == expected
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "at 192.168.1.5 and 1.3.6.1.4.1.1466.20037",
+            "firmware 01.07.02.00 on 10.1.2.3.",
+            "Connected to 192.168.1.5.",
+        ],
+    )
+    def test_diagnostic_snapshot_masks_the_same_way(self, content):
+        """diagnostic_snapshot keeps its own copy of the pattern; the two must agree."""
+        from backend.app.services.diagnostic_snapshot import _IPV4_RE
+        from backend.app.services.log_reader import sanitize_log_content as _sanitize_log_content
+
+        assert _IPV4_RE.sub("[IP]", content) == _sanitize_log_content(content)
 
     def test_printer_ip_from_sensitive_strings(self):
         """Printer IPs in sensitive_strings are replaced before regex pass."""
@@ -650,6 +684,10 @@ class TestCollectSupportInfo:
             # named without "auth_key" but whose value starts with the Tailscale
             # prefix must still redact.
             MagicMock(key="some_future_ts_setting", value="tskey-other-secret"),
+            # The Manyfold connection (#1471): all three halves of the login.
+            MagicMock(key="manyfold_url", value="http://192.168.1.10:3214"),
+            MagicMock(key="manyfold_client_id", value="app-id"),
+            MagicMock(key="manyfold_client_secret", value="app-secret"),
         ]
 
         def make_result(rows=None):
@@ -698,6 +736,9 @@ class TestCollectSupportInfo:
         assert s.get("mqtt_broker") == "[REDACTED]"
         assert s.get("virtual_printer_tailscale_auth_key") == "[REDACTED]"
         assert s.get("some_future_ts_setting") == "[REDACTED]"
+        assert s.get("manyfold_url") == "[REDACTED]"
+        assert s.get("manyfold_client_id") == "[REDACTED]"
+        assert s.get("manyfold_client_secret") == "[REDACTED]"
 
 
 class TestParseObicoEnabledPrinters:
@@ -743,46 +784,6 @@ class TestParseObicoEnabledPrinters:
 
         # Falls through to the comma parser, which finds no integers.
         assert _parse_obico_enabled_printers('{"1": true}') == set()
-
-
-class TestCheckUrlReachable:
-    """Tests for the slicer-API reachability ping."""
-
-    @pytest.mark.asyncio
-    async def test_empty_url_returns_none(self):
-        from backend.app.api.routes.support import _check_url_reachable
-
-        assert await _check_url_reachable("") is None
-        assert await _check_url_reachable("   ") is None
-
-    @pytest.mark.asyncio
-    async def test_successful_response_is_reachable_even_on_404(self):
-        # A 404 means the API is up; we want to separate network failure from
-        # configuration mistakes, so non-empty status counts as reachable.
-        from backend.app.api.routes.support import _check_url_reachable
-
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client = AsyncMock()
-            mock_client_cls.return_value.__aenter__.return_value = mock_client
-            mock_client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
-            mock_response = MagicMock()
-            mock_response.status_code = 404
-            mock_client.get = AsyncMock(return_value=mock_response)
-
-            result = await _check_url_reachable("http://localhost:3001/api")
-
-        assert result is True
-
-    @pytest.mark.asyncio
-    async def test_connection_error_returns_false(self):
-        from backend.app.api.routes.support import _check_url_reachable
-
-        with patch("httpx.AsyncClient") as mock_client_cls:
-            mock_client_cls.return_value.__aenter__.side_effect = ConnectionError("boom")
-
-            result = await _check_url_reachable("http://nowhere:9999")
-
-        assert result is False
 
 
 class TestFetchSlicerHealth:

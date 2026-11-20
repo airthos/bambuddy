@@ -2,7 +2,9 @@ import { useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { Circle, RotateCcw, Palette } from 'lucide-react';
 import { getColorName } from '../../utils/colors';
-import { canonicalFilamentType } from '../../utils/amsHelpers';
+import { canonicalFilamentType, normalizeColorForCompare } from '../../utils/amsHelpers';
+import { SlotPicker } from './SlotPicker';
+import { displayHex } from './displayHex';
 import { useFilamentLabels } from './useFilamentLabels';
 import type { FilamentReqsData } from './types';
 
@@ -109,44 +111,55 @@ export function FilamentOverride({
 
           return (
             <div key={req.slot_id} className="space-y-1">
-              <div
-                className="grid items-center gap-2 text-xs"
-                style={{ gridTemplateColumns: '16px minmax(70px, 1fr) auto 2fr 20px' }}
-              >
+              {/* Below `sm` the picker gets a line of its own, as on the
+                  mapping row (#3294). */}
+              <div className="grid items-center gap-2 text-xs grid-cols-[16px_minmax(0,1fr)_20px] sm:grid-cols-[16px_minmax(70px,1fr)_auto_2fr_20px]">
                 {/* Original color swatch */}
                 <span title={`${t('printModal.originalFilament')}: ${resolvedName} - ${colorLabel}`}>
                   <Circle className="w-3 h-3" fill={req.color} stroke={req.color} />
                 </span>
                 {/* Original type + grams */}
-                <span className="text-white truncate">
+                <span className="text-white truncate col-span-2 sm:col-span-1">
                   {resolvedName} <span className="text-bambu-gray">({req.used_grams}g)</span>
                 </span>
                 {/* Arrow */}
                 <span className="text-bambu-gray">→</span>
-                {/* Override dropdown — only compatible (same-type) filaments */}
-                <select
+                {/* Override picker — only compatible (same-type) filaments.
+                    Carries a swatch for the same reason the mapping row does
+                    (#3159): this is the model-mode half of the same choice,
+                    and leaving it text-only would make the two paths read
+                    differently for one decision. Model mode pools filaments
+                    across every printer of the model, so there is no slot
+                    binding behind an entry and the swatch is the plain tray
+                    colour -- solid, with no multi-colour stops to draw. */}
+                <SlotPicker
                   value={isOverridden ? `${override.type}|${override.color}` : ''}
-                  onChange={(e) => handleChange(req.slot_id, e.target.value)}
+                  onChange={(next) => handleChange(req.slot_id, next)}
+                  placeholder={`${t('printModal.originalFilament')}: ${resolvedName} (${colorLabel})`}
+                  placeholderOption={{ rgba: req.color, hex: displayHex(req.color) }}
                   disabled={compatible.length === 0}
-                  className={`flex-1 px-2 py-1 rounded border text-xs bg-bambu-dark-secondary focus:outline-none focus:ring-1 focus:ring-bambu-green ${
+                  ariaLabel={t('printModal.overrideForFilament', { name: resolvedName })}
+                  exactMatchLabel={t('printModal.exactColorMatch')}
+                  className={
                     isOverridden
                       ? 'border-blue-500/50 dark:border-blue-400/50 text-blue-700 dark:text-blue-400'
                       : 'border-bambu-gray/30 text-bambu-gray'
-                  }`}
-                >
-                  <option value="" className="bg-bambu-dark text-bambu-gray">
-                    {t('printModal.originalFilament')}: {resolvedName} ({colorLabel})
-                  </option>
-                  {compatible.map((f, idx) => (
-                    <option
-                    key={`${f.type}-${f.color}-${f.tray_sub_brands}-${idx}`}
-                      value={`${f.type}|${f.color}`}
-                      className="bg-bambu-dark text-white"
-                    >
-                    {f.tray_sub_brands || f.type} ({getColorName(f.color)})
-                    </option>
-                  ))}
-                </select>
+                  }
+                  options={compatible.map((f, idx) => ({
+                    // The value has to stay `TYPE|COLOR` -- `handleChange`
+                    // parses it -- but two spools of the same type and colour
+                    // on different printers collapse to one value, so the key
+                    // keeps the sub-brand and the index as it did before.
+                    value: `${f.type}|${f.color}`,
+                    key: `${f.type}-${f.color}-${f.tray_sub_brands}-${idx}`,
+                    label: `${f.tray_sub_brands || f.type} (${getColorName(f.color, f.tray_sub_brands, f.tray_info_idx)})`,
+                    rgba: f.color,
+                    hex: displayHex(f.color),
+                    exactMatch:
+                      normalizeColorForCompare(req.color) !== '' &&
+                      normalizeColorForCompare(f.color) === normalizeColorForCompare(req.color),
+                  }))}
+                />
                 {/* Reset button */}
                 {isOverridden ? (
                   <button

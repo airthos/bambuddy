@@ -5,12 +5,18 @@ from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from backend.app.core.auth import RequirePermissionIfAuthEnabled
+from backend.app.core.auth import (
+    RequestPrinterScope,
+    RequirePermissionIfAuthEnabled,
+    RequirePrinterPermissionIfAuthEnabled,
+)
 from backend.app.core.database import get_db
 from backend.app.core.permissions import Permission
+from backend.app.core.printer_scope import PrinterScope
 from backend.app.models.maintenance import MaintenanceHistory, MaintenanceType, PrinterMaintenance
 from backend.app.models.printer import Printer
 from backend.app.models.user import User
@@ -26,7 +32,7 @@ from backend.app.schemas.maintenance import (
     PrinterMaintenanceUpdate,
 )
 from backend.app.services.notification_service import notification_service
-from backend.app.utils.printer_models import get_rod_type
+from backend.app.utils.printer_models import get_rod_type, normalize_printer_model_id
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +102,147 @@ DEFAULT_MAINTENANCE_TYPES = [
     },
 ]
 
+# H3C tasks, from Bambu's H3C and AMS 3H maintenance guides. Those give an
+# interval only for the air filter (1440 h of printing); the others follow
+# Bambu's H2C table (/en/h2c/maintenance/period-maintenance), and the AMS 3H
+# ones, which have none published, use conservative defaults. All intervals are
+# editable per printer.
+_H3C_WIKI = "https://wiki.bambulab.com/en/h3c"
+H3C_MAINTENANCE_TYPES = [
+    {
+        "name": "Lubricate X/Y Rails (H3C)",
+        "description": "Wipe old oil and dust off the X and Y guide rails, put a drop of lubricant oil along "
+        "each (oil only, no grease), then run Vibration Compensation",
+        "default_interval_hours": 30.0,
+        "interval_type": "days",
+        "icon": "Droplet",
+        "wiki_url": f"{_H3C_WIKI}/maintenance/lubricate-x-y-z-axis",
+    },
+    {
+        "name": "Grease Z Screws (H3C)",
+        "description": "Wipe and lightly grease all three Z lead screws, wipe and oil the Z linear rods, "
+        "then run Vibration Compensation",
+        "default_interval_hours": 90.0,
+        "interval_type": "days",
+        "icon": "Droplet",
+        "wiki_url": f"{_H3C_WIKI}/maintenance/lubricate-x-y-z-axis",
+    },
+    {
+        "name": "Oil XY Idler Pulleys (H3C)",
+        "description": "Wipe the 12 XY idler pulleys and oil their bearings; sooner if the toolhead gets noisy",
+        "default_interval_hours": 90.0,
+        "interval_type": "days",
+        "icon": "Cog",
+        "wiki_url": f"{_H3C_WIKI}/maintenance/idle-gear",
+    },
+    {
+        "name": "Grease Toolhead (H3C)",
+        "description": "Take off the toolhead front-left cover, grease the pitch change cam and the ToolLock pin, "
+        "and turn both motors with the release socket to spread it",
+        "default_interval_hours": 90.0,
+        "interval_type": "days",
+        "icon": "Wrench",
+        "wiki_url": f"{_H3C_WIKI}/maintenance/periodic-maintenance",
+    },
+    {
+        "name": "Oil SwapTek Rack (H3C)",
+        "description": "Wipe both ends of the SwapTek rack hanger, add a drop of lubricating oil to each bearing "
+        "and push the hanger up and down",
+        "default_interval_hours": 30.0,
+        "interval_type": "days",
+        "icon": "Layers",
+        "wiki_url": f"{_H3C_WIKI}/maintenance/periodic-maintenance",
+    },
+    {
+        "name": "Clean Hotends (H3C)",
+        "description": "Fetch each hotend, heat it above the filament's softening point and wipe it "
+        "with the nozzle cleaning sponge",
+        "default_interval_hours": 100.0,
+        "interval_type": "hours",
+        "icon": "Flame",
+        "wiki_url": f"{_H3C_WIKI}/maintenance/periodic-maintenance",
+    },
+    {
+        "name": "Clean Extruder Wheel (H3C)",
+        "description": "Check the toolhead extruder wheel for filament debris and brush it clean",
+        "default_interval_hours": 7.0,
+        "interval_type": "days",
+        "icon": "CircleDot",
+        "wiki_url": f"{_H3C_WIKI}/troubleshooting/extruder-cleaning-guide",
+    },
+    {
+        "name": "Clean Cameras (H3C)",
+        "description": "Wipe the live view, toolhead and BirdsEye camera lenses with a cleaning wipe",
+        "default_interval_hours": 90.0,
+        "interval_type": "days",
+        "icon": "Target",
+        "wiki_url": f"{_H3C_WIKI}/maintenance/periodic-maintenance",
+    },
+    {
+        "name": "Clean Fans (H3C)",
+        "description": "Brush the dust off the part cooling, hotend cooling and chamber cooling fans",
+        "default_interval_hours": 90.0,
+        "interval_type": "days",
+        "icon": "Fan",
+        "wiki_url": f"{_H3C_WIKI}/maintenance/periodic-maintenance",
+    },
+    {
+        "name": "Replace Air Filter (H3C)",
+        "description": "Bambu rates the filter for 1440 hours of printing (about 60 days)",
+        "default_interval_hours": 1440.0,
+        "interval_type": "hours",
+        "icon": "Filter",
+        "wiki_url": f"{_H3C_WIKI}/maintenance/replace-air-filter",
+    },
+    {
+        "name": "Check Filament Tubes (H3C)",
+        "description": "Look for tubes bent out of shape behind the purge wiper and for worn AMS 3H tubes; "
+        "straighten or replace them",
+        "default_interval_hours": 500.0,
+        "interval_type": "hours",
+        "icon": "Cable",
+        "wiki_url": f"{_H3C_WIKI}/maintenance/periodic-maintenance",
+    },
+    {
+        "name": "AMS 3H: Check Desiccant",
+        "description": "Check the desiccant on the drying chamber cover; dry or replace it when it is spent",
+        "default_interval_hours": 30.0,
+        "interval_type": "days",
+        "icon": "Wind",
+        "wiki_url": f"{_H3C_WIKI}/maintenance/ams_3h",
+    },
+    {
+        "name": "AMS 3H: Inlets & Gears",
+        "description": "Clear filament debris from the inlet funnels, grease the loading gears and the "
+        "air inlet/outlet flap gears",
+        "default_interval_hours": 90.0,
+        "interval_type": "days",
+        "icon": "Box",
+        "wiki_url": f"{_H3C_WIKI}/maintenance/ams_3h",
+    },
+    {
+        "name": "AMS 3H: Clean Dryer Fans",
+        "description": "Unload all filament, lift the AMS 3H off and brush the dust off the heating unit fans",
+        "default_interval_hours": 180.0,
+        "interval_type": "days",
+        "icon": "Thermometer",
+        "wiki_url": f"{_H3C_WIKI}/maintenance/ams_3h",
+    },
+]
+# System types of one model (short name): seeded and listed only while a
+# printer of that model exists, so other installs see just the defaults above.
+MODEL_MAINTENANCE_TYPES: dict[str, list[dict]] = {"H3C": H3C_MAINTENANCE_TYPES}
+_MODEL_ONLY_TYPES: dict[str, str] = {t["name"]: m for m, types in MODEL_MAINTENANCE_TYPES.items() for t in types}
+
+_H3C_MODELS = frozenset(["H3C"])
+# Generic system types a model's own one replaces there.
+_REPLACED_ON_MODELS: dict[str, frozenset[str]] = {
+    "Lubricate Linear Rails": _H3C_MODELS,  # -> X/Y rails + Z lead screws
+    "Clean Linear Rails": _H3C_MODELS,  # -> X/Y rails (wiped before oiling)
+    "Clean Nozzle/Hotend": _H3C_MODELS,  # -> Clean Hotends
+    "Check PTFE Tube": _H3C_MODELS,  # -> Check Filament Tubes
+}
+
 # System types that only apply to printers with a specific rod/rail type.
 # "carbon" = X1/P1 series (carbon rods), "steel_rod" = P2S (steel rods),
 # "linear_rail" = A1/H2 series. Types not listed here apply to all printers.
@@ -108,8 +255,23 @@ _ROD_TYPE_REQUIREMENTS: dict[str, str] = {
 }
 
 
+def _short_model(printer_model: str | None) -> str:
+    """ "N10" or "H3C" -> "H3C": the short name, uppercase, no spaces or dashes."""
+    if not printer_model:
+        return ""
+    short = normalize_printer_model_id(printer_model.strip()) or ""
+    return short.upper().replace(" ", "").replace("-", "")
+
+
 def _should_apply_to_printer(type_name: str, printer_model: str | None) -> bool:
     """Check if a system maintenance type should apply to a given printer model."""
+    model = _short_model(printer_model)
+    only_on = _MODEL_ONLY_TYPES.get(type_name)
+    if only_on is not None:
+        return model == only_on
+    if model in _REPLACED_ON_MODELS.get(type_name, frozenset()):
+        return False
+
     rod_requirement = _ROD_TYPE_REQUIREMENTS.get(type_name)
     if rod_requirement is None:
         return True  # Not model-specific, applies to all
@@ -144,6 +306,18 @@ async def get_printer_total_hours(db: AsyncSession, printer_id: int) -> float:
     return runtime_hours + offset
 
 
+async def _printer_models_present(db: AsyncSession) -> set[str]:
+    """The short model names of the printers this install has."""
+    models = (await db.execute(select(Printer.model).distinct())).scalars().all()
+    return {_short_model(m) for m in models if m}
+
+
+def _hidden_model_type(maint_type: MaintenanceType, models_present: set[str]) -> bool:
+    """A model's own system type while no printer of that model exists."""
+    model = _MODEL_ONLY_TYPES.get(maint_type.name)
+    return bool(maint_type.is_system) and model is not None and model not in models_present
+
+
 async def ensure_default_types(db: AsyncSession) -> None:
     """Ensure default maintenance types exist, remove stale/duplicate ones."""
     result = await db.execute(
@@ -151,7 +325,12 @@ async def ensure_default_types(db: AsyncSession) -> None:
     )
     existing = result.scalars().all()
 
-    default_names = {t["name"] for t in DEFAULT_MAINTENANCE_TYPES}
+    models_present = await _printer_models_present(db)
+    wanted = DEFAULT_MAINTENANCE_TYPES + [
+        type_def for model, types in MODEL_MAINTENANCE_TYPES.items() if model in models_present for type_def in types
+    ]
+    # A model's types are kept (hidden) while no printer of it exists.
+    default_names = {t["name"] for t in DEFAULT_MAINTENANCE_TYPES} | set(_MODEL_ONLY_TYPES)
 
     # Remove stale system types no longer in defaults (e.g. renamed types)
     # and deduplicate: if concurrent requests created the same type twice,
@@ -164,13 +343,15 @@ async def ensure_default_types(db: AsyncSession) -> None:
             seen_names.add(t.name)
 
     # Create any missing default types
-    for type_def in DEFAULT_MAINTENANCE_TYPES:
+    for type_def in wanted:
         if type_def["name"] not in seen_names:
             new_type = MaintenanceType(
                 name=type_def["name"],
                 description=type_def["description"],
                 default_interval_hours=type_def["default_interval_hours"],
+                interval_type=type_def.get("interval_type", "hours"),
                 icon=type_def["icon"],
+                wiki_url=type_def.get("wiki_url"),
                 is_system=True,
             )
             db.add(new_type)
@@ -183,7 +364,7 @@ async def ensure_default_types(db: AsyncSession) -> None:
 
 @router.get("/types", response_model=list[MaintenanceTypeResponse])
 async def get_maintenance_types(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.MAINTENANCE_READ),
 ):
     """Get all maintenance types."""
@@ -193,13 +374,14 @@ async def get_maintenance_types(
         .where(MaintenanceType.is_deleted.is_(False))
         .order_by(MaintenanceType.is_system.desc(), MaintenanceType.name)
     )
-    return result.scalars().all()
+    models_present = await _printer_models_present(db)
+    return [t for t in result.scalars().all() if not _hidden_model_type(t, models_present)]
 
 
 @router.post("/types", response_model=MaintenanceTypeResponse)
 async def create_maintenance_type(
     data: MaintenanceTypeCreate,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.MAINTENANCE_CREATE),
 ):
     """Create a custom maintenance type."""
@@ -222,7 +404,7 @@ async def create_maintenance_type(
 async def update_maintenance_type(
     type_id: int,
     data: MaintenanceTypeUpdate,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.MAINTENANCE_UPDATE),
 ):
     """Update a maintenance type."""
@@ -243,7 +425,7 @@ async def update_maintenance_type(
 @router.delete("/types/{type_id}")
 async def delete_maintenance_type(
     type_id: int,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.MAINTENANCE_DELETE),
 ):
     """Delete a maintenance type."""
@@ -264,7 +446,7 @@ async def delete_maintenance_type(
 
 @router.post("/types/restore-defaults")
 async def restore_default_maintenance_types(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.MAINTENANCE_DELETE),
 ):
     """Restore deleted default maintenance types."""
@@ -281,6 +463,57 @@ async def restore_default_maintenance_types(
 
 
 # ============== Printer Maintenance ==============
+
+
+def maintenance_alert_values(item: MaintenanceStatus) -> tuple[float, float, str]:
+    """What the MQTT relay's maintenance/alert reports: (value, threshold, unit).
+
+    Print-hour items count hours since the last maintenance against the
+    interval; time-based ones count days, and their interval_hours holds days.
+    """
+    if item.interval_type == "days":
+        return (item.days_since_maintenance or 0.0, item.interval_hours, "days")
+    return (item.hours_since_maintenance, item.interval_hours, "hours")
+
+
+async def _get_or_create_maintenance_item(db: AsyncSession, printer_id: int, type_id: int) -> PrinterMaintenance:
+    """The printer's row for this type, created with defaults if missing.
+
+    Insert first, in a savepoint: two reads of a new printer (two dashboards,
+    or a dashboard and the background check) each used to create the row. The
+    unique index now refuses the second, which takes the first's (FO-C14).
+    """
+    item = PrinterMaintenance(
+        printer_id=printer_id,
+        maintenance_type_id=type_id,
+        enabled=True,
+        last_performed_hours=0.0,
+    )
+    try:
+        async with db.begin_nested():
+            db.add(item)
+            await db.flush()
+        return item
+    except IntegrityError:
+        existing = await db.scalar(
+            select(PrinterMaintenance).where(
+                PrinterMaintenance.printer_id == printer_id,
+                PrinterMaintenance.maintenance_type_id == type_id,
+            )
+        )
+        if existing is None:
+            raise
+        return existing
+
+
+def _start_model_task_clock(item: PrinterMaintenance, maint_type: MaintenanceType, printer: Printer, now) -> None:
+    """Count a model's own task from when the printer was added, not from "never".
+
+    Otherwise a new printer's calendar tasks all open as overdue. Fills only an
+    empty last_performed_at and writes no history row.
+    """
+    if maint_type.name in _MODEL_ONLY_TYPES and item.last_performed_at is None:
+        item.last_performed_at = printer.created_at or now.replace(tzinfo=None)
 
 
 async def _get_printer_maintenance_internal(
@@ -327,6 +560,7 @@ async def _get_printer_maintenance_internal(
         default_interval_type = getattr(maint_type, "interval_type", "hours") or "hours"
 
         if item:
+            _start_model_task_clock(item, maint_type, printer, now)
             interval = item.custom_interval_hours or maint_type.default_interval_hours
             # Use custom interval type if set, otherwise use type's default
             interval_type = getattr(item, "custom_interval_type", None) or default_interval_type
@@ -340,21 +574,16 @@ async def _get_printer_maintenance_internal(
             if not maint_type.is_system:
                 continue
 
-            # Create default entry for this printer/type
-            item = PrinterMaintenance(
-                printer_id=printer_id,
-                maintenance_type_id=maint_type.id,
-                enabled=True,
-                last_performed_hours=0.0,
-            )
-            db.add(item)
-            await db.flush()
+            # Create default entry for this printer/type, or take the one a
+            # concurrent read just created.
+            item = await _get_or_create_maintenance_item(db, printer_id, maint_type.id)
+            _start_model_task_clock(item, maint_type, printer, now)
 
-            interval = maint_type.default_interval_hours
-            interval_type = default_interval_type
-            enabled = True
-            last_performed_hours = 0.0
-            last_performed_at = None
+            interval = item.custom_interval_hours or maint_type.default_interval_hours
+            interval_type = getattr(item, "custom_interval_type", None) or default_interval_type
+            enabled = item.enabled
+            last_performed_hours = item.last_performed_hours
+            last_performed_at = item.last_performed_at
             item_id = item.id
 
         # Calculate status based on interval type
@@ -439,8 +668,8 @@ async def _get_printer_maintenance_internal(
 @router.get("/printers/{printer_id}", response_model=PrinterMaintenanceOverview)
 async def get_printer_maintenance(
     printer_id: int,
-    db: AsyncSession = Depends(get_db),
-    _: User | None = RequirePermissionIfAuthEnabled(Permission.MAINTENANCE_READ),
+    db: AsyncSession = Depends(get_db, scope="function"),
+    _: User | None = RequirePrinterPermissionIfAuthEnabled(Permission.MAINTENANCE_READ),
 ):
     """Get maintenance overview for a specific printer."""
     return await _get_printer_maintenance_internal(printer_id, db, commit=True)
@@ -448,14 +677,15 @@ async def get_printer_maintenance(
 
 @router.get("/overview", response_model=list[PrinterMaintenanceOverview])
 async def get_all_maintenance_overview(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.MAINTENANCE_READ),
+    printer_scope: PrinterScope = RequestPrinterScope,
 ):
     """Get maintenance overview for all active printers."""
     await ensure_default_types(db)
 
     result = await db.execute(select(Printer).where(Printer.is_active.is_(True)))
-    printers = result.scalars().all()
+    printers = [p for p in result.scalars().all() if printer_scope.allows(p.id)]
 
     overviews = []
     for printer in printers:
@@ -473,8 +703,9 @@ async def get_all_maintenance_overview(
 async def update_printer_maintenance(
     item_id: int,
     data: PrinterMaintenanceUpdate,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.MAINTENANCE_UPDATE),
+    printer_scope: PrinterScope = RequestPrinterScope,
 ):
     """Update a printer maintenance item (e.g., custom interval, enabled)."""
     result = await db.execute(
@@ -483,7 +714,7 @@ async def update_printer_maintenance(
         .options(selectinload(PrinterMaintenance.maintenance_type))
     )
     item = result.scalar_one_or_none()
-    if not item:
+    if not item or not printer_scope.allows(item.printer_id):
         raise HTTPException(status_code=404, detail="Maintenance item not found")
 
     update_data = data.model_dump(exclude_unset=True)
@@ -499,8 +730,8 @@ async def update_printer_maintenance(
 async def assign_maintenance_type(
     printer_id: int,
     type_id: int,
-    db: AsyncSession = Depends(get_db),
-    _: User | None = RequirePermissionIfAuthEnabled(Permission.MAINTENANCE_CREATE),
+    db: AsyncSession = Depends(get_db, scope="function"),
+    _: User | None = RequirePrinterPermissionIfAuthEnabled(Permission.MAINTENANCE_CREATE),
 ):
     """Assign a maintenance type to a specific printer (for custom types)."""
     # Verify printer exists
@@ -534,7 +765,13 @@ async def assign_maintenance_type(
         last_performed_hours=0.0,
     )
     db.add(item)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        # A concurrent assign (a double click) passed the check above too; the
+        # unique index refuses this one (FO-C14).
+        await db.rollback()
+        raise HTTPException(status_code=400, detail="Maintenance type already assigned to this printer") from None
 
     # Re-fetch with relationship loaded for response serialization
     from sqlalchemy.orm import selectinload
@@ -552,8 +789,9 @@ async def assign_maintenance_type(
 @router.delete("/items/{item_id}")
 async def remove_maintenance_item(
     item_id: int,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.MAINTENANCE_DELETE),
+    printer_scope: PrinterScope = RequestPrinterScope,
 ):
     """Remove a maintenance item (unassign a custom type from a printer)."""
     result = await db.execute(
@@ -562,7 +800,7 @@ async def remove_maintenance_item(
         .options(selectinload(PrinterMaintenance.maintenance_type))
     )
     item = result.scalar_one_or_none()
-    if not item:
+    if not item or not printer_scope.allows(item.printer_id):
         raise HTTPException(status_code=404, detail="Maintenance item not found")
 
     # Only allow removing custom (non-system) types
@@ -579,8 +817,9 @@ async def remove_maintenance_item(
 async def perform_maintenance(
     item_id: int,
     data: PerformMaintenanceRequest,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.MAINTENANCE_UPDATE),
+    printer_scope: PrinterScope = RequestPrinterScope,
 ):
     """Mark maintenance as performed (reset the counter)."""
     result = await db.execute(
@@ -589,7 +828,7 @@ async def perform_maintenance(
         .options(selectinload(PrinterMaintenance.maintenance_type))
     )
     item = result.scalar_one_or_none()
-    if not item:
+    if not item or not printer_scope.allows(item.printer_id):
         raise HTTPException(status_code=404, detail="Maintenance item not found")
 
     # Get printer for name
@@ -627,7 +866,8 @@ async def perform_maintenance(
 
     # Calculate status
     interval = item.custom_interval_hours or item.maintenance_type.default_interval_hours
-    interval_type = getattr(item.maintenance_type, "interval_type", "hours") or "hours"
+    # The item's own interval type first, as the status list reads it (dbcol-09).
+    interval_type = item.custom_interval_type or getattr(item.maintenance_type, "interval_type", "hours") or "hours"
     hours_since = current_hours - item.last_performed_hours
     hours_until = interval - hours_since
 
@@ -657,10 +897,16 @@ async def perform_maintenance(
 @router.get("/items/{item_id}/history", response_model=list[MaintenanceHistoryResponse])
 async def get_maintenance_history(
     item_id: int,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.MAINTENANCE_READ),
+    printer_scope: PrinterScope = RequestPrinterScope,
 ):
     """Get maintenance history for a specific item."""
+    item_printer_id = (
+        await db.execute(select(PrinterMaintenance.printer_id).where(PrinterMaintenance.id == item_id))
+    ).scalar_one_or_none()
+    if not printer_scope.allows(item_printer_id):
+        raise HTTPException(status_code=404, detail="Maintenance item not found")
     result = await db.execute(
         select(MaintenanceHistory)
         .where(MaintenanceHistory.printer_maintenance_id == item_id)
@@ -671,14 +917,15 @@ async def get_maintenance_history(
 
 @router.get("/summary")
 async def get_maintenance_summary(
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession = Depends(get_db, scope="function"),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.MAINTENANCE_READ),
+    printer_scope: PrinterScope = RequestPrinterScope,
 ):
     """Get a summary of maintenance status across all printers."""
     await ensure_default_types(db)
 
     result = await db.execute(select(Printer).where(Printer.is_active.is_(True)))
-    printers = result.scalars().all()
+    printers = [p for p in result.scalars().all() if printer_scope.allows(p.id)]
 
     total_due = 0
     total_warning = 0
@@ -709,8 +956,8 @@ async def get_maintenance_summary(
 async def set_printer_hours(
     printer_id: int,
     total_hours: float,
-    db: AsyncSession = Depends(get_db),
-    _: User | None = RequirePermissionIfAuthEnabled(Permission.MAINTENANCE_UPDATE),
+    db: AsyncSession = Depends(get_db, scope="function"),
+    _: User | None = RequirePrinterPermissionIfAuthEnabled(Permission.MAINTENANCE_UPDATE),
 ):
     """Set the total print hours for a printer (adjusts offset to match).
 

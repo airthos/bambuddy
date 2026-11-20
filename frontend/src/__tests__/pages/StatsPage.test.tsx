@@ -2,7 +2,7 @@
  * Tests for the StatsPage component.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { screen, waitFor } from '@testing-library/react';
 import { render } from '../utils';
 import { StatsPage } from '../../pages/StatsPage';
@@ -265,6 +265,27 @@ describe('StatsPage', () => {
       await waitFor(() => {
         expect(screen.getByText('Energy Cost')).toBeInTheDocument();
       });
+    });
+
+    it('shows printer wear cost once a printer has a rate (#694)', async () => {
+      server.use(
+        http.get('/api/v1/archives/stats', () => HttpResponse.json({ ...mockStats, total_wear_cost: 7.25 })),
+      );
+      render(<StatsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Wear Cost')).toBeInTheDocument();
+      });
+      expect(screen.getByText(/7\.25/)).toBeInTheDocument();
+    });
+
+    it('leaves the wear tile out when no wear was recorded (#694)', async () => {
+      render(<StatsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Energy Cost')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('Wear Cost')).not.toBeInTheDocument();
     });
   });
 
@@ -555,6 +576,22 @@ describe('StatsPage', () => {
         expect(screen.getByText('Recalculate Costs')).toBeInTheDocument();
       });
     });
+
+    it('says when Spoolman could not be reached for its prices (#3414)', async () => {
+      server.use(
+        http.post('/api/v1/archives/recalculate-costs', () =>
+          HttpResponse.json({ message: '', updated: 2, preserved: 0, usage_repriced: 3, spoolman_unreachable: 4 })
+        )
+      );
+      render(<StatsPage />);
+      const button = await screen.findByText('Recalculate Costs');
+
+      button.click();
+
+      expect(
+        await screen.findByText('Spoolman could not be reached: 4 usage records of its spools kept their old price')
+      ).toBeInTheDocument();
+    });
   });
 
   describe('user filter', () => {
@@ -619,6 +656,48 @@ describe('StatsPage', () => {
       expect(totalPrints?.querySelector('svg[aria-label]')).toBeNull();
       const printTime = screen.getByText('Print Time').closest('div');
       expect(printTime?.querySelector('svg[aria-label]')).toBeNull();
+    });
+  });
+
+  describe('deleted printers (#2873)', () => {
+    // The per-printer breakdown only renders at half width, and the dashboard
+    // reads its sizes back from localStorage.
+    const halfWidthSuccessRate = JSON.stringify({
+      order: ['success-rate'],
+      hidden: [],
+      sizes: { 'success-rate': 2 },
+    });
+
+    afterEach(() => {
+      vi.mocked(localStorage.getItem).mockReset();
+    });
+
+    it('labels history from a deleted printer with the name it ran under', async () => {
+      vi.mocked(localStorage.getItem).mockImplementation((key: string) =>
+        key === 'bambusy-dashboard-layout-v2' ? halfWidthSuccessRate : null
+      );
+      server.use(
+        http.get('/api/v1/archives/stats', () =>
+          HttpResponse.json({
+            ...mockStats,
+            // Printer 7 was deleted with its prints kept, so it is missing from
+            // /printers and used to show as "Printer 7".
+            prints_by_printer: { '1': 100, '7': 12 },
+            printer_names: { '1': 'Name At The Time', '7': 'Ultron' },
+          })
+        )
+      );
+
+      render(<StatsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Ultron')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('Printer 7')).not.toBeInTheDocument();
+      // A printer that still exists is named from the live record instead, so a
+      // rename shows up without waiting for the next print.
+      expect(screen.getAllByText('X1 Carbon').length).toBeGreaterThan(0);
+      expect(screen.queryByText('Name At The Time')).not.toBeInTheDocument();
     });
   });
 });

@@ -27,6 +27,7 @@ const mockSettings = {
   ams_humidity_fair: 60,
   ams_temp_good: 30,
   ams_temp_fair: 35,
+  ams_temp_alarm: null,
   time_format: 'system',
   date_format: 'system',
   mqtt_enabled: false,
@@ -91,6 +92,25 @@ describe('SettingsPage', () => {
   });
 
   describe('rendering', () => {
+    it('opens notification settings from the OctoEverywhere readiness link', async () => {
+      window.history.replaceState({}, '', '/settings?tab=failure-detection');
+      server.use(
+        http.get('/api/v1/settings/', () => HttpResponse.json({
+          ...mockSettings,
+          octoeverywhere_enabled: true,
+          octoeverywhere_api_key: '',
+          octoeverywhere_api_key_configured: true,
+        })),
+      );
+      render(<SettingsPage />);
+
+      await userEvent.click(await screen.findByRole('link', { name: 'Configure notifications' }));
+
+      expect(await screen.findByRole('button', { name: /add provider/i })).toBeInTheDocument();
+      expect(screen.queryByRole('heading', { name: 'OctoEverywhere AI Detection' })).not.toBeInTheDocument();
+      expect(window.location.search).toBe('?tab=notifications');
+    });
+
     it('renders the page title', async () => {
       render(<SettingsPage />);
 
@@ -175,6 +195,80 @@ describe('SettingsPage', () => {
     });
   });
 
+  describe('electricity price source (#1251)', () => {
+    const haSettings = {
+      ...mockSettings,
+      ha_enabled: true,
+      energy_cost_per_kwh: 0.42,
+      energy_price_source: 'homeassistant',
+      energy_price_ha_entity: 'sensor.amber_general_price',
+    };
+
+    beforeEach(() => {
+      server.use(
+        http.get('/api/v1/ha-sensors/entities', () =>
+          HttpResponse.json([
+            { entity_id: 'sensor.amber_general_price', friendly_name: 'Amber price', state: '0.42', domain: 'sensor', device_class: null, unit_of_measurement: 'AUD/kWh' },
+            { entity_id: 'sensor.room_temperature', friendly_name: 'Room', state: '21', domain: 'sensor', device_class: 'temperature', unit_of_measurement: '°C' },
+          ])
+        )
+      );
+    });
+
+    it('offers a fixed price by default, with no sensor field', async () => {
+      render(<SettingsPage />);
+
+      const input = (await screen.findByText('Electricity cost per kWh')).parentElement!.querySelector('input')!;
+      expect(input).not.toBeDisabled();
+      expect(screen.queryByPlaceholderText('sensor.electricity_price')).not.toBeInTheDocument();
+    });
+
+    it('shows the sensor and the last price read, read-only, with Home Assistant as the source', async () => {
+      server.use(http.get('/api/v1/settings/', () => HttpResponse.json(haSettings)));
+      render(<SettingsPage />);
+
+      expect(await screen.findByPlaceholderText('sensor.electricity_price')).toHaveValue('sensor.amber_general_price');
+      const input = screen.getByText('Last price read per kWh').parentElement!.querySelector('input')!;
+      expect(input).toBeDisabled();
+      expect(input).toHaveValue(0.42);
+      // Only price sensors are suggested, not every sensor in Home Assistant.
+      await waitFor(() => {
+        const options = document.querySelectorAll('#ha-price-entities option');
+        expect(Array.from(options).map((o) => o.getAttribute('value'))).toEqual(['sensor.amber_general_price']);
+      });
+    });
+
+    it('warns when Home Assistant is not connected', async () => {
+      server.use(http.get('/api/v1/settings/', () => HttpResponse.json({ ...haSettings, ha_enabled: false })));
+      render(<SettingsPage />);
+
+      expect(await screen.findByText(/Home Assistant is not set up/)).toBeInTheDocument();
+    });
+
+    it('does not send its stale copy of a price read from Home Assistant', async () => {
+      let saved: Record<string, unknown> | null = null;
+      server.use(
+        http.get('/api/v1/settings/', () => HttpResponse.json(haSettings)),
+        http.put('/api/v1/settings/', async ({ request }) => {
+          saved = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...haSettings, ...saved });
+        })
+      );
+      render(<SettingsPage />);
+
+      const label = await screen.findByText('Restore plate for finish photo');
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await userEvent.click(within(label.closest('div')!.parentElement!).getByRole('checkbox'));
+
+      await waitFor(() => {
+        expect(saved).not.toBeNull();
+      }, { timeout: 3000 });
+      expect(saved!).not.toHaveProperty('energy_cost_per_kwh');
+      expect(saved!.energy_price_source).toBe('homeassistant');
+      expect(saved!.energy_price_ha_entity).toBe('sensor.amber_general_price');
+    });
+  });
+
   describe('general settings', () => {
     it('shows date format setting', async () => {
       render(<SettingsPage />);
@@ -190,6 +284,20 @@ describe('SettingsPage', () => {
       await waitFor(() => {
         expect(screen.getByText('Time Format')).toBeInTheDocument();
       });
+    });
+
+    it('no longer offers Camera View Mode, which moved to the printer card', async () => {
+      // The camera button on each printer card is a split control now, so the
+      // choice is made per stream rather than once for the whole install. The
+      // External Cameras section is still here, which is what keeps this from
+      // passing merely because the Camera card failed to render.
+      window.history.replaceState({}, '', '/?tab=camera');
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('External Cameras')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('Camera View Mode')).toBeNull();
     });
 
     it('shows default printer setting', async () => {
@@ -368,7 +476,7 @@ describe('SettingsPage', () => {
 
       expect(localStorage.setItem).toHaveBeenCalledWith(
         SIDEBAR_ORDER_KEY,
-        JSON.stringify(['ext-7', 'printers', 'inventory', 'archives', 'queue', 'projects', 'files', 'makerworld', 'profiles', 'maintenance', 'stats', 'notifications', 'settings']),
+        JSON.stringify(['ext-7', 'printers', 'cameras', 'inventory', 'archives', 'queue', 'projects', 'files', 'makerworld', 'profiles', 'maintenance', 'stats', 'finance', 'notifications', 'settings']),
       );
     });
 
@@ -410,7 +518,7 @@ describe('SettingsPage', () => {
       expect(localStorage.setItem).toHaveBeenCalledWith(SIDEBAR_HIDDEN_SYSTEM_ITEMS_KEY, JSON.stringify([]));
       expect(localStorage.setItem).toHaveBeenCalledWith(
         SIDEBAR_ORDER_KEY,
-        JSON.stringify(['printers', 'inventory', 'archives', 'queue', 'projects', 'files', 'makerworld', 'profiles', 'maintenance', 'stats', 'notifications', 'settings', 'ext-7']),
+        JSON.stringify(['printers', 'cameras', 'inventory', 'archives', 'queue', 'projects', 'files', 'makerworld', 'profiles', 'maintenance', 'stats', 'finance', 'notifications', 'settings', 'ext-7']),
       );
 
       const settingsRow = screen.getAllByText('Settings')
@@ -472,6 +580,7 @@ describe('SettingsPage', () => {
       expect(JSON.parse(defaultSidebarOrderPayload!)).toEqual({
         order: [
           'printers',
+          'cameras', // Airtho fork: Sentry nav item
           'inventory',
           'archives',
           'queue',
@@ -481,6 +590,7 @@ describe('SettingsPage', () => {
           'profiles',
           'maintenance',
           'stats',
+          'finance',
           'notifications',
           'settings',
         ],
@@ -497,10 +607,11 @@ describe('SettingsPage', () => {
     // users never see the in-app Install button (which would no-op).
     const renderWithUpdateCheck = async (
       checkBody: Record<string, unknown>,
+      settingsOverrides: Record<string, unknown> = {},
     ) => {
       server.use(
         http.get('/api/v1/settings/', () =>
-          HttpResponse.json({ ...mockSettings, check_updates: true }),
+          HttpResponse.json({ ...mockSettings, check_updates: true, ...settingsOverrides }),
         ),
         http.get('/api/v1/updates/check', () => HttpResponse.json(checkBody)),
       );
@@ -553,6 +664,80 @@ describe('SettingsPage', () => {
       });
       expect(screen.queryByText(/Home Assistant Supervisor/i)).not.toBeInTheDocument();
       expect(screen.queryByRole('button', { name: /install update/i })).not.toBeInTheDocument();
+    });
+
+    // #2664: the bare command only works if the user is already standing in
+    // the directory holding their compose file, which is exactly the thing
+    // they came to the page not knowing.
+    const DOCKER_CHECK = {
+      update_available: true,
+      current_version: '0.2.4',
+      latest_version: '0.2.5',
+      release_name: '0.2.5',
+      release_notes: '',
+      release_url: 'https://example.invalid/r',
+      published_at: '2099-01-01T00:00:00Z',
+      is_docker: true,
+      is_ha_addon: false,
+      update_method: 'docker',
+    };
+
+    it('prefixes the command with cd when the backend detected a compose directory', async () => {
+      await renderWithUpdateCheck({ ...DOCKER_CHECK, compose_dir_detected: '/opt/bambuddy' });
+
+      await waitFor(() => {
+        expect(
+          screen.getByText('cd /opt/bambuddy && docker compose pull && docker compose up -d'),
+        ).toBeInTheDocument();
+      });
+    });
+
+    it('prefers the saved directory over the detected one', async () => {
+      await renderWithUpdateCheck(
+        { ...DOCKER_CHECK, compose_dir_detected: '/opt/guessed' },
+        { docker_compose_dir: '/srv/stacks/bambuddy' },
+      );
+
+      await waitFor(() => {
+        expect(
+          screen.getByText('cd /srv/stacks/bambuddy && docker compose pull && docker compose up -d'),
+        ).toBeInTheDocument();
+      });
+      expect(screen.queryByText(/\/opt\/guessed/)).not.toBeInTheDocument();
+    });
+
+    it('quotes a directory containing a space so the cd does not split', async () => {
+      await renderWithUpdateCheck(DOCKER_CHECK, { docker_compose_dir: '/srv/bambu buddy' });
+
+      await waitFor(() => {
+        expect(
+          screen.getByText('cd "/srv/bambu buddy" && docker compose pull && docker compose up -d'),
+        ).toBeInTheDocument();
+      });
+    });
+
+    it('copies the full command including the cd', async () => {
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+      Object.defineProperty(window, 'isSecureContext', { value: true, configurable: true });
+
+      await renderWithUpdateCheck({ ...DOCKER_CHECK, compose_dir_detected: '/opt/bambuddy' });
+
+      const copy = await screen.findByRole('button', { name: /copy update command/i });
+      await userEvent.click(copy);
+
+      expect(writeText).toHaveBeenCalledWith(
+        'cd /opt/bambuddy && docker compose pull && docker compose up -d',
+      );
+    });
+
+    it('offers an editable compose directory field seeded with the detected path', async () => {
+      await renderWithUpdateCheck({ ...DOCKER_CHECK, compose_dir_detected: '/opt/bambuddy' });
+
+      const field = await screen.findByPlaceholderText('/opt/bambuddy');
+      // Placeholder, not value — the detected path is a guess the user has
+      // not accepted, so saving must not silently adopt it.
+      expect(field).toHaveValue('');
     });
 
     it('shows the installer-download link for Windows installer installs', async () => {
@@ -649,6 +834,126 @@ describe('SettingsPage', () => {
       await waitFor(() => {
         expect(screen.getByText('AMS Display Thresholds')).toBeInTheDocument();
       });
+    });
+
+    // #2770: an AMS reads 15-20% while its own heater runs, so a drying
+    // threshold set below that can never be met and auto-drying ends one
+    // cycle only to arm the next. The default of 60 must stay quiet.
+    const openFilamentTab = async (humidityFair: number) => {
+      server.use(
+        http.get('/api/v1/settings/', () =>
+          HttpResponse.json({ ...mockSettings, ams_humidity_fair: humidityFair })
+        )
+      );
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await waitFor(() => {
+        expect(screen.getAllByText('Filament').length).toBeGreaterThan(0);
+      });
+      await user.click(screen.getAllByText('Filament')[0]);
+      await waitFor(() => {
+        expect(screen.getByText('AMS Display Thresholds')).toBeInTheDocument();
+      });
+    };
+
+    it('warns when the humidity threshold is below what a drying AMS reports', async () => {
+      await openFilamentTab(14);
+
+      expect(await screen.findByText(/Auto-drying cannot reach this value/)).toBeInTheDocument();
+    });
+
+    it('stays quiet for a humidity threshold auto-drying can actually reach', async () => {
+      await openFilamentTab(60);
+
+      expect(screen.queryByText(/Auto-drying cannot reach this value/)).not.toBeInTheDocument();
+    });
+
+    // #2905: the alarm threshold is a separate value from the Fair display
+    // band, and unset means "use Fair" rather than "never alarm". Everything
+    // below turns on telling those two apart.
+    const openFilamentTabWith = async (overrides: Record<string, unknown>) => {
+      server.use(
+        http.get('/api/v1/settings/', () => HttpResponse.json({ ...mockSettings, ...overrides }))
+      );
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await waitFor(() => {
+        expect(screen.getAllByText('Filament').length).toBeGreaterThan(0);
+      });
+      await user.click(screen.getAllByText('Filament')[0]);
+      await waitFor(() => {
+        expect(screen.getByText('AMS Display Thresholds')).toBeInTheDocument();
+      });
+    };
+
+    const alarmInput = () =>
+      within(screen.getByText('Alarm above').parentElement!).getByRole('spinbutton');
+
+    it('shows the fair threshold as the placeholder while the alarm threshold is unset', async () => {
+      // The fallback has to be visible in the field itself. Blank with no hint
+      // reads as "no alarm", which is the opposite of what unset does.
+      await openFilamentTabWith({ ams_temp_fair: 38, ams_temp_alarm: null });
+
+      const input = alarmInput();
+      expect(input).toHaveValue(null);
+      expect(input).toHaveAttribute('placeholder', '38');
+    });
+
+    it('sends the typed alarm threshold on save', async () => {
+      let saved: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          saved = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...saved });
+        })
+      );
+      await openFilamentTabWith({ ams_temp_alarm: null });
+      // The page suppresses auto-save for 100ms after the settings load.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      await userEvent.type(alarmInput(), '45');
+
+      // Assert on the value rather than merely on a save having happened: two
+      // keystrokes can straddle the 500ms debounce on a slow runner, and the
+      // first save would then carry 4. Waiting for 45 rides that out.
+      await waitFor(() => {
+        expect(saved?.ams_temp_alarm).toBe(45);
+      }, { timeout: 3000 });
+    });
+
+    it('sends null when the alarm threshold is cleared', async () => {
+      // The one path the backend tests cannot reach on their own: clearing has
+      // to send an explicit null, not omit the key, or the old threshold stays.
+      let saved: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          saved = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...saved });
+        })
+      );
+      await openFilamentTabWith({ ams_temp_alarm: 45 });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      await userEvent.clear(alarmInput());
+
+      await waitFor(() => {
+        expect(saved).not.toBeNull();
+        expect(saved!.ams_temp_alarm).toBeNull();
+      }, { timeout: 3000 });
+    });
+
+    it('warns that a non-positive alarm threshold is ignored', async () => {
+      // The backend refuses <= 0 and falls back to Fair. Saying so beats a min=
+      // attribute the browser only enforces on submit.
+      await openFilamentTabWith({ ams_temp_alarm: 0 });
+
+      expect(await screen.findByText(/A threshold of 0 or less is ignored/)).toBeInTheDocument();
+    });
+
+    it('stays quiet for an alarm threshold the backend will honour', async () => {
+      await openFilamentTabWith({ ams_temp_alarm: 45 });
+
+      expect(screen.queryByText(/A threshold of 0 or less is ignored/)).not.toBeInTheDocument();
     });
   });
 
@@ -755,6 +1060,118 @@ describe('SettingsPage', () => {
 
       await waitFor(() => {
         expect(screen.getByText(/overridden per print in the print dialog/)).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('sustained-minutes input drafts while typing (#2518)', () => {
+    const openWorkflowTab = async (user: ReturnType<typeof userEvent.setup>) => {
+      render(<SettingsPage />);
+      await waitFor(() => {
+        expect(screen.getByText('Workflow')).toBeInTheDocument();
+      });
+      await user.click(screen.getByText('Workflow'));
+      await waitFor(() => {
+        expect(screen.getByText('Queue Auto-Drying')).toBeInTheDocument();
+      });
+      // 15 is unique to this input in the mock settings below
+      return screen.getByDisplayValue('15') as HTMLInputElement;
+    };
+
+    beforeEach(() => {
+      server.use(
+        http.get('/api/v1/settings/', () => {
+          return HttpResponse.json({
+            ...mockSettings,
+            ambient_drying_enabled: true,
+            ambient_drying_sustained_minutes: 15,
+          });
+        })
+      );
+    });
+
+    it('seeds a new sustained wait at 15 minutes when enabled from off', async () => {
+      const user = userEvent.setup();
+      let saved: Record<string, unknown> | null = null;
+      server.use(
+        http.get('/api/v1/settings/', () =>
+          HttpResponse.json({
+            ...mockSettings,
+            ambient_drying_enabled: true,
+            ambient_drying_sustained_minutes: 0,
+          })
+        ),
+        http.put('/api/v1/settings/', async ({ request }) => {
+          saved = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...saved });
+        })
+      );
+
+      render(<SettingsPage />);
+      await user.click(await screen.findByText('Workflow'));
+      const label = await screen.findByText('Require sustained humidity');
+      const row = label.closest('div')!.parentElement!;
+      const toggle = within(row).getByRole('checkbox');
+      expect(toggle).not.toBeChecked();
+
+      // Wait out the page's initial-load save suppression before toggling.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      await user.click(toggle);
+
+      expect(toggle).toBeChecked();
+      expect(screen.getByDisplayValue('15')).toBeInTheDocument();
+      await waitFor(() => {
+        expect(saved).not.toBeNull();
+      }, { timeout: 3000 });
+      expect(saved!.ambient_drying_sustained_minutes).toBe(15);
+    });
+
+    it('clearing the field does not snap it to a value mid-edit', async () => {
+      const user = userEvent.setup();
+      const input = await openWorkflowTab(user);
+
+      await user.clear(input);
+      // The old per-keystroke clamp rewrote '' to 10 immediately.
+      expect(input.value).toBe('');
+    });
+
+    it('intermediate below-minimum digits are not rewritten while typing', async () => {
+      const user = userEvent.setup();
+      const input = await openWorkflowTab(user);
+
+      await user.clear(input);
+      await user.type(input, '2');
+      // The old clamp turned the '2' (on the way to '25') into 5.
+      expect(input.value).toBe('2');
+      await user.type(input, '5');
+      expect(input.value).toBe('25');
+
+      await user.tab();
+      await waitFor(() => {
+        expect(input.value).toBe('25');
+      });
+    });
+
+    it('blur with an empty field reverts to the saved value instead of inventing one', async () => {
+      const user = userEvent.setup();
+      const input = await openWorkflowTab(user);
+
+      await user.clear(input);
+      await user.tab();
+      await waitFor(() => {
+        expect(input.value).toBe('15');
+      });
+    });
+
+    it('still clamps an out-of-range value on blur', async () => {
+      const user = userEvent.setup();
+      const input = await openWorkflowTab(user);
+
+      await user.clear(input);
+      await user.type(input, '500');
+      await user.tab();
+      await waitFor(() => {
+        expect(input.value).toBe('240');
       });
     });
   });
@@ -1196,6 +1613,149 @@ describe('SettingsPage', () => {
     });
   });
 
+  describe('Camera tab and menu order', () => {
+    const tabLabels = () => Array.from(document.querySelectorAll('nav button')).map((button) => button.textContent?.trim() ?? '');
+
+    it('lists General first and the other tabs alphabetically', async () => {
+      render(<SettingsPage />);
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Camera' })).toBeInTheDocument());
+      const labels = tabLabels().map((label) => label.replace(/\d+$/, ''));
+      expect(labels[0]).toBe('General');
+      const rest = labels.slice(1);
+      expect(rest).toEqual([...rest].sort((a, b) => a.localeCompare(b, 'en')));
+      expect(rest).toContain('Camera');
+    });
+
+    it('holds external cameras, camera tokens and the streaming overlay', async () => {
+      window.history.replaceState({}, '', '/?tab=camera');
+      render(<SettingsPage />);
+      await waitFor(() => expect(screen.getByText('External Cameras')).toBeInTheDocument());
+      expect(document.getElementById('card-camera-tokens')).not.toBeNull();
+      expect(document.getElementById('card-stream-overlay')).not.toBeNull();
+    });
+
+    it('no longer shows camera settings on General or API Keys', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await waitFor(() => expect(screen.getByText('Default Printer')).toBeInTheDocument());
+      expect(screen.queryByText('External Cameras')).toBeNull();
+      await user.click(screen.getByRole('button', { name: /^API Keys/ }));
+      await waitFor(() => expect(document.getElementById('card-createapi')).not.toBeNull());
+      expect(document.getElementById('card-camera-tokens')).toBeNull();
+      expect(document.getElementById('card-stream-overlay')).toBeNull();
+    });
+
+    const signInWith = (permissions: string[]) => {
+      server.use(
+        http.get('/api/v1/auth/status', () => HttpResponse.json({ auth_enabled: true, requires_setup: false })),
+        http.get('/api/v1/auth/me', () => HttpResponse.json({
+          id: 2, username: 'viewer', role: 'user', is_active: true, is_admin: false,
+          groups: [{ id: 2, name: 'Viewers' }], permissions, created_at: '2026-01-01T00:00:00Z',
+        })),
+      );
+      setAuthToken('test-token');
+    };
+
+    it('hides API Keys from a user who may see nothing on it, but keeps Camera', async () => {
+      signInWith(['settings:read', 'camera:view']);
+      render(<SettingsPage />);
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Camera' })).toBeInTheDocument());
+      expect(screen.queryByRole('button', { name: /^API Keys/ })).toBeNull();
+    });
+
+    it('sends an API Keys link to the Camera tab for a user who cannot see API Keys', async () => {
+      signInWith(['settings:read', 'camera:view']);
+      window.history.replaceState({}, '', '/?tab=apikeys');
+      render(<SettingsPage />);
+      await waitFor(() => expect(screen.getByText('External Cameras')).toBeInTheDocument());
+    });
+
+    it.each([['api_keys:read'], ['settings:update']])('shows API Keys to a user with %s', async (permission) => {
+      signInWith(['settings:read', permission]);
+      render(<SettingsPage />);
+      await waitFor(() => expect(screen.getByRole('button', { name: /^API Keys/ })).toBeInTheDocument());
+    });
+
+    it.each(['#card-camera-tokens', '#card-stream-overlay'])('opens the Camera tab for an old API Keys link to %s', async (hash) => {
+      window.history.replaceState({}, '', `/?tab=apikeys${hash}`);
+      render(<SettingsPage />);
+      await waitFor(() => expect(screen.getByText('External Cameras')).toBeInTheDocument());
+    });
+
+    describe('WLED permission', () => {
+      const serveWledPrinter = (onPresetRequest: () => void) => server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json([{
+          id: 1, name: 'Printer 1', wled_config: {
+            enabled: true, base_url: 'http://wled.local', presets: { printing: 3 }, finished_timeout_seconds: 0,
+          },
+        }])),
+        http.post('/api/v1/printers/1/wled/presets', () => {
+          onPresetRequest();
+          return HttpResponse.json([{ id: 3, name: 'Printing' }]);
+        }),
+      );
+
+      it.each([true, false])('shows WLED and loads presets when auth enabled=%s with access', async (authEnabled) => {
+        if (authEnabled) signInWith(['settings:read', 'printers:update']);
+        let presetRequests = 0;
+        serveWledPrinter(() => { presetRequests += 1; });
+        render(<SettingsPage />);
+        await userEvent.click(await screen.findByRole('button', { name: 'WLED' }));
+        expect(await screen.findByText('1 presets loaded')).toBeInTheDocument();
+        expect(document.getElementById('card-wled')).not.toBeNull();
+        expect(presetRequests).toBeGreaterThan(0);
+      });
+
+      it('hides WLED from navigation and search without printers:update', async () => {
+        signInWith(['settings:read']);
+        let presetRequests = 0;
+        serveWledPrinter(() => { presetRequests += 1; });
+        render(<SettingsPage />);
+        await screen.findByRole('heading', { name: 'Settings' });
+        expect(screen.queryByRole('button', { name: 'WLED' })).toBeNull();
+        await userEvent.type(screen.getByPlaceholderText(/Search settings/), 'wled');
+        expect(screen.queryByText('WLED')).toBeNull();
+        expect(document.getElementById('card-wled')).toBeNull();
+        expect(presetRequests).toBe(0);
+      });
+
+      it('redirects an unauthorized WLED deep link without mounting or loading presets', async () => {
+        signInWith(['settings:read']);
+        window.history.replaceState({}, '', '/settings?tab=wled');
+        let presetRequests = 0;
+        serveWledPrinter(() => { presetRequests += 1; });
+        render(<SettingsPage />);
+        await waitFor(() => expect(window.location.search).toBe(''));
+        expect(screen.getByRole('button', { name: 'General' })).toBeInTheDocument();
+        expect(screen.queryByRole('button', { name: 'WLED' })).toBeNull();
+        expect(document.getElementById('card-wled')).toBeNull();
+        expect(presetRequests).toBe(0);
+      });
+
+      it('unmounts WLED when printers:update is revoked during the session', async () => {
+        let permissions = ['settings:read', 'printers:update'];
+        signInWith(permissions);
+        server.use(http.get('/api/v1/auth/me', () => HttpResponse.json({
+          id: 2, username: 'viewer', role: 'user', is_active: true, is_admin: false,
+          groups: [], permissions, created_at: '2026-01-01T00:00:00Z',
+        })));
+        let presetRequests = 0;
+        serveWledPrinter(() => { presetRequests += 1; });
+        render(<SettingsPage />);
+        await userEvent.click(await screen.findByRole('button', { name: 'WLED' }));
+        expect(await screen.findByText('1 presets loaded')).toBeInTheDocument();
+        const requestsBeforeRevocation = presetRequests;
+
+        permissions = ['settings:read'];
+        window.dispatchEvent(new CustomEvent('auth:recheck'));
+        await waitFor(() => expect(document.getElementById('card-wled')).toBeNull());
+        await waitFor(() => expect(window.location.search).toBe(''));
+        expect(screen.queryByRole('button', { name: 'WLED' })).toBeNull();
+        expect(presetRequests).toBe(requestsBeforeRevocation);
+      });
+    });
+  });
+
   describe('external camera snapshot URL override (#1177)', () => {
     /**
      * The snapshot URL input only appears for stream camera types where the
@@ -1224,12 +1784,23 @@ describe('SettingsPage', () => {
       updated_at: '2026-01-01T00:00:00Z',
     };
 
+    // External cameras live on the Camera tab.
+    beforeEach(() => {
+      window.history.replaceState({}, '', '/?tab=camera');
+    });
+
+    // A camera's fields stay folded until its row is opened.
+    const openCameraFields = async () => {
+      await userEvent.setup().click(await screen.findByLabelText('Camera settings: go2rtc Cam'));
+    };
+
     it('renders the snapshot URL input when camera_type is mjpeg', async () => {
       server.use(
         http.get('/api/v1/printers/', () => HttpResponse.json([mjpegPrinter])),
       );
 
       render(<SettingsPage />);
+      await openCameraFields();
 
       await waitFor(() => {
         expect(screen.getByPlaceholderText(/api\/frame\.jpeg\?src=printer/)).toBeInTheDocument();
@@ -1244,6 +1815,7 @@ describe('SettingsPage', () => {
       );
 
       render(<SettingsPage />);
+      await openCameraFields();
 
       // Wait for the live-stream URL placeholder to render so we know the
       // camera section finished mounting before asserting absence of the
@@ -1267,6 +1839,7 @@ describe('SettingsPage', () => {
         );
 
         render(<SettingsPage />);
+        await openCameraFields();
 
         const input = await waitFor(() =>
           screen.getByPlaceholderText(/api\/frame\.jpeg\?src=printer/),
@@ -1293,6 +1866,224 @@ describe('SettingsPage', () => {
       // mode on PR #1263).
       15_000,
     );
+  });
+
+  describe('chamber light for the camera (#1655)', () => {
+    const base = {
+      serial_number: 'S',
+      ip_address: '192.168.1.100',
+      access_code: 'XXXX',
+      model: 'P1S',
+      location: null,
+      nozzle_count: 1,
+      is_active: true,
+      auto_archive: true,
+      external_camera_url: null,
+      external_camera_type: null,
+      external_camera_enabled: false,
+      external_camera_snapshot_url: null,
+      camera_rotation: 0,
+      camera_light_auto: false,
+      plate_detection_enabled: false,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+    };
+    const farm = (n: number) =>
+      Array.from({ length: n }, (_, i) => ({ ...base, id: 100 + i, name: `Farm ${i + 1}`, serial_number: `S${i}` }));
+
+    const withSettings = (overrides: Record<string, unknown>) =>
+      http.get('/api/v1/settings/', () => HttpResponse.json({ ...mockSettings, ...overrides }));
+
+    // The page ignores edits for 100ms after the settings load.
+    const settle = () => new Promise(resolve => setTimeout(resolve, 200));
+
+    beforeEach(() => {
+      window.history.replaceState({}, '', '/?tab=camera');
+    });
+
+    it('is off by default and lists no printers, however many there are', async () => {
+      server.use(http.get('/api/v1/printers/', () => HttpResponse.json(farm(120))));
+
+      render(<SettingsPage />);
+
+      expect(await screen.findByRole('radio', { name: 'Off' })).toBeChecked();
+      expect(screen.queryByLabelText('Wait before snapshot')).toBeNull();
+      expect(screen.queryByTestId('camera-light-printers')).toBeNull();
+      expect(within(document.getElementById('card-camera')!).queryByText('Farm 77')).toBeNull();
+    });
+
+    it('switches every printer on with one choice and saves it', async () => {
+      let saved: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          saved = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...saved });
+        }),
+      );
+
+      render(<SettingsPage />);
+      const all = await screen.findByRole('radio', { name: 'All printers' });
+      await settle();
+      await userEvent.click(all);
+
+      await waitFor(() => expect(saved?.camera_light_mode).toBe('all'), { timeout: 3000 });
+      expect(screen.getByLabelText('Wait before snapshot')).toHaveValue(2);
+      expect(screen.queryByTestId('camera-light-printers')).toBeNull();
+    });
+
+    it('saves one delay for all printers, never one the server would refuse', async () => {
+      const saves: Record<string, unknown>[] = [];
+      server.use(
+        withSettings({ camera_light_mode: 'all', camera_light_delay: 2 }),
+        http.put('/api/v1/settings/', async ({ request }) => {
+          const body = (await request.json()) as Record<string, unknown>;
+          saves.push(body);
+          return HttpResponse.json({ ...mockSettings, camera_light_mode: 'all', ...body });
+        }),
+      );
+
+      render(<SettingsPage />);
+      const input = await screen.findByLabelText('Wait before snapshot');
+      await settle();
+      const user = userEvent.setup();
+      await user.clear(input);
+      await user.type(input, '9');
+      await new Promise(resolve => setTimeout(resolve, 1000));
+      expect(saves.some(b => b.camera_light_delay === 9)).toBe(false);
+
+      await user.clear(input);
+      await user.type(input, '1.5');
+      await waitFor(() => expect(saves.some(b => b.camera_light_delay === 1.5)).toBe(true), { timeout: 3000 });
+    }, 10_000);
+
+    it('picks printers for the selected mode from a searchable list and removes them again', async () => {
+      const printers = farm(120);
+      printers[41] = { ...printers[41], camera_light_auto: true };
+      const patches: { id: number; body: Record<string, unknown> }[] = [];
+      server.use(
+        withSettings({ camera_light_mode: 'selected' }),
+        http.get('/api/v1/printers/', () => HttpResponse.json(printers)),
+        http.patch('/api/v1/printers/:id', async ({ params, request }) => {
+          const body = (await request.json()) as Record<string, unknown>;
+          patches.push({ id: Number(params.id), body });
+          return HttpResponse.json({ ...printers[Number(params.id) - 100], ...body });
+        }),
+      );
+
+      render(<SettingsPage />);
+      const chips = await screen.findByTestId('camera-light-printers');
+      expect(within(chips).getByText('Farm 42')).toBeInTheDocument();
+      expect(within(chips).queryByText('Farm 7')).toBeNull();
+
+      const user = userEvent.setup();
+      await user.click(within(chips).getByRole('button', { name: 'Add printer' }));
+      await user.type(screen.getByLabelText('Search printers'), 'farm 7');
+      const options = within(screen.getByRole('listbox', { name: 'Add printer' })).getAllByRole('option');
+      // Farm 7 and Farm 70-79; Farm 42, already picked, is not offered.
+      expect(options).toHaveLength(11);
+      await user.click(within(options[0]).getByRole('button', { name: 'Farm 7' }));
+      await waitFor(() => expect(patches).toContainEqual({ id: 106, body: { camera_light_auto: true } }));
+
+      await user.click(screen.getByRole('button', { name: 'Remove Farm 42' }));
+      await waitFor(() => expect(patches).toContainEqual({ id: 141, body: { camera_light_auto: false } }));
+    });
+  });
+
+  describe('external cameras list only the printers that have one', () => {
+    const cam = (id: number, name: string, extra: Record<string, unknown> = {}) => ({
+      id,
+      name,
+      serial_number: `S${id}`,
+      ip_address: '192.168.1.100',
+      access_code: 'XXXX',
+      model: 'P1S',
+      location: null,
+      nozzle_count: 1,
+      is_active: true,
+      auto_archive: true,
+      external_camera_url: null,
+      external_camera_type: null,
+      external_camera_enabled: false,
+      external_camera_snapshot_url: null,
+      camera_rotation: 0,
+      camera_light_auto: false,
+      plate_detection_enabled: false,
+      created_at: '2026-01-01T00:00:00Z',
+      updated_at: '2026-01-01T00:00:00Z',
+      ...extra,
+    });
+
+    beforeEach(() => {
+      window.history.replaceState({}, '', '/?tab=camera');
+    });
+
+    it('shows a farm\'s two external cameras, not its 120 printers, folded with where each points', async () => {
+      const printers = Array.from({ length: 120 }, (_, i) => cam(100 + i, `Farm ${i + 1}`));
+      printers[4] = cam(104, 'Farm 5', {
+        external_camera_enabled: true,
+        external_camera_type: 'mjpeg',
+        external_camera_url: 'http://192.168.1.60:1984/api/stream.mjpeg',
+      });
+      printers[9] = cam(109, 'Farm 10', {
+        external_camera_enabled: true,
+        external_camera_type: 'rtsp',
+        external_camera_url: 'rtsp://user:pw@192.168.1.61:554/live',
+      });
+      server.use(http.get('/api/v1/printers/', () => HttpResponse.json(printers)));
+
+      render(<SettingsPage />);
+      const list = await screen.findByTestId('external-camera-list');
+
+      expect(within(list).getAllByRole('button', { name: /^Camera settings:/ })).toHaveLength(2);
+      expect(within(list).getByText('MJPEG · 192.168.1.60:1984')).toBeInTheDocument();
+      expect(within(list).getByText('RTSP · 192.168.1.61:554')).toBeInTheDocument();
+      expect(screen.queryByPlaceholderText(/Camera URL/i)).toBeNull();
+
+      const user = userEvent.setup();
+      await user.click(screen.getByLabelText('Camera settings: Farm 5'));
+      expect(screen.getByDisplayValue('http://192.168.1.60:1984/api/stream.mjpeg')).toBeInTheDocument();
+      await user.click(screen.getByLabelText('Camera settings: Farm 10'));
+      expect(screen.getByDisplayValue('rtsp://user:pw@192.168.1.61:554/live')).toBeInTheDocument();
+      expect(screen.queryByDisplayValue('http://192.168.1.60:1984/api/stream.mjpeg')).toBeNull();
+    });
+
+    it('adds an external camera from the printer picker and opens its fields', async () => {
+      const printers = [cam(1, 'Garage X1C'), cam(2, 'Office A1')];
+      let body: Record<string, unknown> | null = null;
+      server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json(printers)),
+        http.patch('/api/v1/printers/2', async ({ request }) => {
+          body = (await request.json()) as Record<string, unknown>;
+          Object.assign(printers[1], body);
+          return HttpResponse.json(printers[1]);
+        }),
+      );
+
+      render(<SettingsPage />);
+      const user = userEvent.setup();
+      await user.click(await screen.findByRole('button', { name: 'Add external camera' }));
+      await user.click(screen.getByRole('button', { name: 'Office A1' }));
+
+      await waitFor(() => expect(body).toEqual({ external_camera_enabled: true }));
+      expect(await screen.findByPlaceholderText(/Camera URL/i)).toBeInTheDocument();
+    });
+
+    it('removes an external camera', async () => {
+      const printers = [cam(1, 'Garage X1C', { external_camera_enabled: true, external_camera_url: 'http://192.168.1.9/s' })];
+      let body: Record<string, unknown> | null = null;
+      server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json(printers)),
+        http.patch('/api/v1/printers/1', async ({ request }) => {
+          body = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...printers[0], ...body });
+        }),
+      );
+
+      render(<SettingsPage />);
+      await userEvent.click(await screen.findByRole('button', { name: 'Remove the external camera from Garage X1C' }));
+
+      await waitFor(() => expect(body).toEqual({ external_camera_enabled: false }));
+    });
   });
 
   describe('theme mode buttons', () => {
@@ -1406,6 +2197,362 @@ describe('SettingsPage', () => {
         expect(window.location.search).toContain('sub=pipelines');
       });
     });
+  });
+
+  describe('printer access sub-tab (#1727)', () => {
+    const asAdmin = (isAdmin: boolean) => {
+      setAuthToken('test-token', 'session');
+      server.use(
+        http.get('*/api/v1/auth/status', () => HttpResponse.json({ auth_enabled: true, requires_setup: false })),
+        http.get('*/api/v1/auth/me', () =>
+          HttpResponse.json({ id: 1, username: 'u', is_admin: isAdmin, groups: [], permissions: ['settings:read', 'users:read', 'groups:read'] })
+        ),
+        http.get('/api/v1/groups/', () => HttpResponse.json([])),
+        http.get('/api/v1/users/', () => HttpResponse.json([]))
+      );
+    };
+
+    it('opens straight on Printer access from a deep link', async () => {
+      asAdmin(true);
+      window.history.replaceState({}, '', '/settings?tab=users&sub=printer-access&view=printers');
+      render(<SettingsPage />);
+
+      expect(await screen.findByText(/Besides the groups listed here/)).toBeInTheDocument();
+    });
+
+    it('drops the sub-tab from the URL when leaving it', async () => {
+      asAdmin(true);
+      window.history.replaceState({}, '', '/settings?tab=users&sub=printer-access&group=4');
+      render(<SettingsPage />);
+      const user = userEvent.setup();
+      await screen.findByText(/Pick a group to choose its printers/);
+
+      await user.click(screen.getByRole('button', { name: 'General' }));
+      await waitFor(() => expect(window.location.search).toBe(''));
+    });
+
+    it('lands non-admins on the Users sub-tab instead', async () => {
+      asAdmin(false);
+      window.history.replaceState({}, '', '/settings?tab=users&sub=printer-access');
+      render(<SettingsPage />);
+
+      // The sub-tab row is there, without Printer access
+      expect(await screen.findByRole('button', { name: /Two-Factor|2FA/i })).toBeInTheDocument();
+      expect(screen.queryByRole('button', { name: 'Printer access' })).not.toBeInTheDocument();
+      expect(screen.queryByText(/Pick a group to choose its printers/)).not.toBeInTheDocument();
+    });
+  });
+
+  // --------------------------------------------------------------------
+  // Ask for the outcome of prints Bambuddy did not start (#1898)
+  // --------------------------------------------------------------------
+  describe('outcome prompt for external prints (#1898)', () => {
+    const externalLabel = 'Also ask for prints started outside Bambuddy';
+
+    const openDefaultPrintOptions = async () => {
+      render(<SettingsPage />);
+      const user = userEvent.setup();
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Workflow' })).toBeInTheDocument());
+      await user.click(screen.getByRole('button', { name: 'Workflow' }));
+      return user;
+    };
+
+    it('offers the toggle alongside the per-job outcome default', async () => {
+      await openDefaultPrintOptions();
+
+      expect(await screen.findByText(externalLabel)).toBeInTheDocument();
+      expect(screen.getByText('Ask for Outcome')).toBeInTheDocument();
+    });
+
+    it('shows it off when the backend has no value for it', async () => {
+      // Default false: an install that never touches it keeps today's
+      // behaviour, where only queued prints are asked about.
+      await openDefaultPrintOptions();
+
+      const label = await screen.findByText(externalLabel);
+      const row = label.closest('div')!.parentElement!;
+      expect(within(row).getByRole('checkbox')).not.toBeChecked();
+    });
+
+    it('sends the new value on save', async () => {
+      let saved: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          saved = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...saved });
+        })
+      );
+      const user = await openDefaultPrintOptions();
+
+      const label = await screen.findByText(externalLabel);
+      // The page suppresses auto-save for 100ms after the settings load.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const row = label.closest('div')!.parentElement!;
+      await user.click(within(row).getByRole('checkbox'));
+
+      await waitFor(() => {
+        expect(saved).not.toBeNull();
+      }, { timeout: 3000 });
+      expect(saved!.confirm_outcome_external_prints).toBe(true);
+    });
+
+    it('reflects a value the backend already has', async () => {
+      server.use(
+        http.get('/api/v1/settings/', () =>
+          HttpResponse.json({ ...mockSettings, confirm_outcome_external_prints: true })
+        )
+      );
+      await openDefaultPrintOptions();
+
+      const label = await screen.findByText(externalLabel);
+      const row = label.closest('div')!.parentElement!;
+      expect(within(row).getByRole('checkbox')).toBeChecked();
+    });
+  });
+
+  // --------------------------------------------------------------------
+  // The plate-clear default answers outcome prompts on its own (#1898), so
+  // its help text has to name that consequence — the farm case was a user
+  // who had it on and could not work out why Telegram said "already used".
+  // --------------------------------------------------------------------
+  describe('plate-clear outcome default help text (#1898)', () => {
+    it('warns that a later Telegram or link answer only shows the result', async () => {
+      render(<SettingsPage />);
+      const user = userEvent.setup();
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Workflow' })).toBeInTheDocument());
+      await user.click(screen.getByRole('button', { name: 'Workflow' }));
+
+      const label = await screen.findByText('Count unanswered outcomes as good on plate release');
+      const row = label.closest('div')!;
+      expect(row).toHaveTextContent(
+        /a Telegram or link answer after that only shows the recorded result/i,
+      );
+    });
+  });
+});
+
+/**
+ * Location sensor cards on Settings -> Sensors read the live readings
+ * endpoint (reachable-aware) rather than the sensor row's last_state, so an
+ * entity Home Assistant has stopped reporting shows "Unavailable" instead of
+ * silently keeping its last colorized value on screen forever.
+ */
+describe('SettingsPage — location sensor reachability', () => {
+  beforeEach(() => {
+    window.history.replaceState({}, '', '/');
+  });
+
+  const locationSensor = {
+    id: 1,
+    location_id: 7,
+    name: 'Drybox 1 Temperature',
+    entity_id: 'sensor.drybox_1_temperature',
+    kind: 'numeric',
+    device_class: 'temperature',
+    unit: '°C',
+    alert_state: null,
+    alert_above: 30,
+    alert_below: 20,
+    notify_on_alert: false,
+    show_on_card: true,
+    sort_order: 0,
+    last_state: '65.0',
+    last_changed: null,
+    last_checked: null,
+    created_at: '',
+    updated_at: '',
+  };
+
+  it('shows "Unavailable" for an unreachable sensor instead of its stale last value', async () => {
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json([locationSensor])),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () =>
+        HttpResponse.json([
+          {
+            id: 1,
+            name: 'Drybox 1 Temperature',
+            entity_id: 'sensor.drybox_1_temperature',
+            kind: 'numeric',
+            device_class: 'temperature',
+            unit: '°C',
+            state: null,
+            value: null,
+            alerting: false,
+            reachable: false,
+            alert_state: null,
+            alert_above: 30,
+            alert_below: 20,
+            last_changed: null,
+          },
+        ])
+      ),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([{ id: 7, name: 'Drybox 1', identifier: null, spool_count: 0, created_at: '', updated_at: '' }])
+      )
+    );
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+    await screen.findByText('sensor.drybox_1_temperature');
+
+    expect(await screen.findByText('Unavailable')).toBeInTheDocument();
+    expect(screen.queryByText('65.00 °C')).not.toBeInTheDocument();
+  });
+
+  it('shows the live value, not last_state, when the sensor is reachable', async () => {
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json([locationSensor])),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () =>
+        HttpResponse.json([
+          {
+            id: 1,
+            name: 'Drybox 1 Temperature',
+            entity_id: 'sensor.drybox_1_temperature',
+            kind: 'numeric',
+            device_class: 'temperature',
+            unit: '°C',
+            state: '24.5',
+            value: 24.5,
+            alerting: false,
+            reachable: true,
+            alert_state: null,
+            alert_above: 30,
+            alert_below: 20,
+            last_changed: null,
+          },
+        ])
+      ),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([{ id: 7, name: 'Drybox 1', identifier: null, spool_count: 0, created_at: '', updated_at: '' }])
+      )
+    );
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+    await screen.findByText('sensor.drybox_1_temperature');
+
+    expect(await screen.findByText('24.50 °C')).toBeInTheDocument();
+    expect(screen.queryByText('Unavailable')).not.toBeInTheDocument();
+  });
+
+  it('shows the entity id in the overview row, with the display name as its hover title', async () => {
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json([locationSensor])),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () => HttpResponse.json([])),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([{ id: 7, name: 'Drybox 1', identifier: null, spool_count: 0, created_at: '', updated_at: '' }])
+      )
+    );
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+
+    const entityIdText = await screen.findByText('sensor.drybox_1_temperature');
+    expect(entityIdText).toHaveAttribute('title', 'Drybox 1 Temperature');
+    expect(screen.queryByText('Drybox 1 Temperature')).not.toBeInTheDocument();
+  });
+
+  it('refreshes the sensor list even when a bulk delete partially fails', async () => {
+    let sensors = [
+      { ...locationSensor, id: 1, name: 'Drybox 1 Temperature' },
+      {
+        ...locationSensor,
+        id: 2,
+        name: 'Drybox 1 Humidity',
+        entity_id: 'sensor.drybox_1_humidity',
+        device_class: 'humidity',
+        unit: '%',
+      },
+    ];
+
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json(sensors)),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () => HttpResponse.json([])),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([{ id: 7, name: 'Drybox 1', identifier: null, spool_count: 0, created_at: '', updated_at: '' }])
+      ),
+      // The first delete succeeds and actually removes the row; the second
+      // fails, simulating a partial failure partway through the sequential
+      // delete loop.
+      http.delete('/api/v1/location-ha-sensors/1', () => {
+        sensors = sensors.filter((s) => s.id !== 1);
+        return HttpResponse.json({ message: 'Sensor removed' });
+      }),
+      http.delete('/api/v1/location-ha-sensors/2', () => new HttpResponse(null, { status: 500 }))
+    );
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+    await screen.findByText('sensor.drybox_1_temperature');
+    await screen.findByText('sensor.drybox_1_humidity');
+
+    await user.click(screen.getByRole('button', { name: 'Delete' }));
+    await user.click(await screen.findByRole('button', { name: 'Confirm' }));
+
+    // The sensor that actually got deleted on the backend must not linger on
+    // screen just because the batch as a whole reported an error.
+    await waitFor(() => expect(screen.queryByText('sensor.drybox_1_temperature')).not.toBeInTheDocument());
+    expect(screen.getByText('sensor.drybox_1_humidity')).toBeInTheDocument();
+  });
+
+  it('orders location cards by location, not by the order their sensors were created', async () => {
+    // Sensor for location 8 ("Drybox 10") appears in the array before the
+    // sensor for location 7 ("Drybox 2") — a naive Map-insertion-order
+    // render would put "Drybox 10" first. Card order must follow the
+    // (naturally sorted) locations list instead.
+    const sensors = [
+      {
+        id: 1,
+        location_id: 8,
+        name: 'Drybox 10 Temperature',
+        entity_id: 'sensor.drybox_10_temperature',
+        device_class: 'temperature',
+        unit: '°C',
+      },
+      {
+        id: 2,
+        location_id: 7,
+        name: 'Drybox 2 Temperature',
+        entity_id: 'sensor.drybox_2_temperature',
+        device_class: 'temperature',
+        unit: '°C',
+      },
+    ];
+
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json(sensors)),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () => HttpResponse.json([])),
+      http.get('/api/v1/location-ha-sensors/by-location/8/readings', () => HttpResponse.json([])),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([
+          { id: 7, name: 'Drybox 2', identifier: null, spool_count: 0, created_at: '', updated_at: '' },
+          { id: 8, name: 'Drybox 10', identifier: null, spool_count: 0, created_at: '', updated_at: '' },
+        ])
+      )
+    );
+
+    const user = userEvent.setup();
+    const { container } = render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+    await screen.findByText('sensor.drybox_10_temperature');
+
+    const cardTitles = Array.from(container.querySelectorAll('.text-white.font-medium.truncate')).map(
+      (el) => el.textContent
+    );
+    const drybox2Index = cardTitles.indexOf('Drybox 2');
+    const drybox10Index = cardTitles.indexOf('Drybox 10');
+    expect(drybox2Index).toBeGreaterThanOrEqual(0);
+    expect(drybox10Index).toBeGreaterThanOrEqual(0);
+    expect(drybox2Index).toBeLessThan(drybox10Index);
   });
 });
 
@@ -1602,5 +2749,70 @@ describe('SettingsPage — settings changed outside the page (#2716)', () => {
 
     await waitFor(() => expect(puts).toHaveLength(1), { timeout: 3000 });
     expect(puts[0].external_url).toBe(window.location.origin);
+  });
+
+  describe('as a non-admin with settings:update', () => {
+    // Only an administrator may change the sign-in settings; the server refuses
+    // a save that changes one, which would take the rest of the save with it.
+    beforeEach(() => {
+      server.use(
+        http.get('/api/v1/auth/status', () => HttpResponse.json({ auth_enabled: true, requires_setup: false })),
+        http.get('/api/v1/auth/me', () =>
+          HttpResponse.json({
+            id: 2, username: 'manager', role: 'user', is_active: true, is_admin: false,
+            groups: [{ id: 5, name: 'Settings managers' }],
+            permissions: ['settings:read', 'settings:update', 'users:read'],
+            created_at: '2026-01-01T00:00:00Z',
+          }),
+        ),
+      );
+      setAuthToken('test-token');
+    });
+
+    it('does not fill in the external URL from the browser', async () => {
+      served = { ...mockSettings, external_url: '' };
+      renderPage();
+      await screen.findByText(restoreLabel);
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      await changeOnServer({ spoolman_url: 'http://spoolman.example' });
+      await new Promise((resolve) => setTimeout(resolve, 1500));
+
+      expect(puts.filter((body) => body.external_url === window.location.origin)).toEqual([]);
+    });
+
+    it('shows the external URL read-only', async () => {
+      served = { ...mockSettings };
+      window.history.replaceState({}, '', '/?tab=network');
+      renderPage();
+
+      const input = await screen.findByPlaceholderText('http://192.168.1.100:8000');
+      await waitFor(() => expect(input).toBeDisabled());
+      expect(screen.getAllByText('Only an administrator can change this.').length).toBeGreaterThan(0);
+      window.history.replaceState({}, '', '/');
+    });
+
+    it('does not offer the connected apps', async () => {
+      // An app's redirect address decides where an admin's sign-in is sent.
+      served = { ...mockSettings };
+      window.history.replaceState({}, '', '/?tab=apikeys');
+      renderPage();
+
+      await waitFor(() => expect(screen.getByRole('button', { name: /^API Keys/ })).toBeInTheDocument());
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      expect(screen.queryByText('Connected Apps')).toBeNull();
+      window.history.replaceState({}, '', '/');
+    });
+
+    it('does not offer the mail server and LDAP sub-tabs', async () => {
+      served = { ...mockSettings };
+      window.history.replaceState({}, '', '/?tab=users');
+      renderPage();
+
+      await waitFor(() => expect(screen.getByRole('button', { name: /^Two-Factor Auth/ })).toBeInTheDocument());
+      expect(screen.queryByRole('button', { name: /^LDAP/ })).toBeNull();
+      expect(screen.queryByRole('button', { name: /^Email Authentication/ })).toBeNull();
+      window.history.replaceState({}, '', '/');
+    });
   });
 });

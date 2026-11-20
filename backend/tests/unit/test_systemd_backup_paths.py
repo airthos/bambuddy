@@ -22,7 +22,7 @@ INSTALLERS = ["install/install.sh", "spoolbuddy/install/install.sh"]
 
 # The service unit + install scripts these tests read live at the repo root and
 # are not copied into the Docker test image (Dockerfile.test ships only backend/,
-# pyproject.toml, gcode_viewer/ and requirements). In a source checkout they are
+# pyproject.toml and requirements). In a source checkout they are
 # always present and the guard below is live; in the stripped test image there is
 # nothing to check, so skip rather than fail. `frontend/package.json` exists in
 # every checkout but never in the test image, so it distinguishes the two.
@@ -69,3 +69,17 @@ class TestInstallersPreserveCustomPaths:
             f"{installer} no longer carries the previous unit's ReadWritePaths forward"
         )
         assert ".bak-" in script, f"{installer} overwrites the unit without backing it up first"
+
+
+class TestInstallersKeepHomeInstallsRunnable:
+    """ProtectHome=true hides /home from the service, so an install there fails
+    with 203/EXEC before Bambuddy starts (#1685). Both installers loosen it to
+    read-only for a /home install; the SpoolBuddy one kept a literal true."""
+
+    @pytest.mark.parametrize("installer", INSTALLERS)
+    def test_protect_home_follows_the_install_path(self, installer):
+        script = _read(installer)
+        line = next(line for line in script.splitlines() if line.startswith("ProtectHome="))
+        assert line == "ProtectHome=$protect_home", f"{installer} hard-codes {line}"
+        assert 'if [[ "$INSTALL_PATH" == /home/* ]]; then' in script
+        assert 'protect_home="read-only"' in script

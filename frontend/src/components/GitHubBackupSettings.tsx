@@ -36,12 +36,15 @@ import type {
   CloudAuthStatus,
   Printer,
 } from '../api/client';
+import { useAuth } from '../contexts/AuthContext';
 import { Card, CardContent, CardHeader } from './Card';
 import { Button } from './Button';
 import { Toggle } from './Toggle';
 import { ConfirmModal } from './ConfirmModal';
+import { GitHubRestoreModal } from './GitHubRestoreModal';
 import { useToast } from '../contexts/ToastContext';
 import { formatRelativeTime, parseUTCDate } from '../utils/date';
+import { NumberInput } from './NumberInput';
 
 function formatDateTime(dateStr: string | null): string {
   if (!dateStr) return '-';
@@ -93,6 +96,16 @@ const PROVIDER_TOKEN_PLACEHOLDER: Record<GitProviderType, string> = {
   gitlab: 'glpat-xxxxxxxxxxxx',
 };
 
+// Each provider names its scopes differently, so a single hint could only ever
+// be right for one of them (#2775). Naming the scopes up front is also what
+// keeps a token from being minted more permissive than a backup needs.
+const PROVIDER_TOKEN_HINT_I18N_KEY: Record<GitProviderType, string> = {
+  github: 'backup.tokenHintGitHub',
+  gitea: 'backup.tokenHintGitea',
+  forgejo: 'backup.tokenHintForgejo',
+  gitlab: 'backup.tokenHintGitLab',
+};
+
 interface GitHubBackupAutosaveState {
   repository_url: string;
   branch: string;
@@ -133,6 +146,14 @@ export function GitHubBackupSettings() {
   const queryClient = useQueryClient();
   const { showToast } = useToast();
   const { t } = useTranslation();
+  const { hasPermission, isAdmin } = useAuth();
+
+  // All three restore endpoints are gated on GITHUB_RESTORE server-side, so a
+  // user without it gets a 403 the moment the modal opens its preview. Hide the
+  // button rather than offer an action that cannot work. Deliberately scoped to
+  // the button: the card itself stays visible, since backup configuration is a
+  // separate permission. hasPermission returns true when auth is off.
+  const canRestoreFromGit = hasPermission('github:restore');
 
   // Local state for form
   const [repoUrl, setRepoUrl] = useState('');
@@ -158,8 +179,12 @@ export function GitHubBackupSettings() {
   const [restoreResult, setRestoreResult] = useState<{ success: boolean; message: string } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Restore from the Git backup repository (#2656)
+  const [showGitRestore, setShowGitRestore] = useState(false);
+
   // Scheduled local backup state
   const [deleteConfirmFile, setDeleteConfirmFile] = useState<string | null>(null);
+  const [showClearLogsConfirm, setShowClearLogsConfirm] = useState(false);
   const [restoreConfirmFile, setRestoreConfirmFile] = useState<string | null>(null);
   const [localBackupPath, setLocalBackupPath] = useState('');
 
@@ -211,9 +236,15 @@ export function GitHubBackupSettings() {
 
   const deleteLocalBackupMutation = useMutation({
     mutationFn: (filename: string) => api.deleteLocalBackup(filename),
-    onSuccess: () => {
+    onSuccess: (data) => {
       refetchLocalBackups();
       setDeleteConfirmFile(null);
+      // A refused delete answers 200 with success false.
+      if (!data.success) showToast(data.message, 'error');
+    },
+    onError: (error: Error) => {
+      setDeleteConfirmFile(null);
+      showToast(error.message, 'error');
     },
   });
 
@@ -701,7 +732,7 @@ export function GitHubBackupSettings() {
                     className="w-full h-10 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
                   />
                   <p className="text-xs text-bambu-gray mt-1">
-                    {t('backup.tokenHint')}
+                    {t(PROVIDER_TOKEN_HINT_I18N_KEY[provider])}
                   </p>
                 </div>
 
@@ -951,6 +982,18 @@ export function GitHubBackupSettings() {
                           {testLoading ? <Loader2 className="w-4 h-4 animate-spin" /> : <RefreshCw className="w-4 h-4" />}
                           {t('backup.test')}
                         </Button>
+                        {/* Restore from the backup repo (#2656) */}
+                        {canRestoreFromGit && (
+                          <Button
+                            variant="secondary"
+                            size="sm"
+                            onClick={() => setShowGitRestore(true)}
+                            disabled={status.restore_running}
+                          >
+                            <RotateCcw className="w-4 h-4" />
+                            {t('backup.restoreFromGit.button')}
+                          </Button>
+                        )}
                       </>
                     )}
                   </>
@@ -993,7 +1036,7 @@ export function GitHubBackupSettings() {
                 <Button
                   variant="ghost"
                   size="sm"
-                  onClick={() => clearLogsMutation.mutate()}
+                  onClick={() => setShowClearLogsConfirm(true)}
                   disabled={clearLogsMutation.isPending}
                 >
                   <Trash2 className="w-4 h-4" />
@@ -1007,6 +1050,7 @@ export function GitHubBackupSettings() {
                   <thead>
                     <tr className="text-bambu-gray border-b border-bambu-dark-tertiary">
                       <th className="text-left py-2 px-2">{t('backup.date')}</th>
+                      <th className="text-left py-2 px-2">{t('backup.trigger')}</th>
                       <th className="text-left py-2 px-2">{t('backup.status')}</th>
                       <th className="text-left py-2 px-2">{t('backup.commit')}</th>
                     </tr>
@@ -1015,6 +1059,12 @@ export function GitHubBackupSettings() {
                     {logs.slice(0, 10).map((log) => (
                       <tr key={log.id} className="border-b border-bambu-dark-tertiary/50 hover:bg-bambu-dark-secondary">
                         <td className="py-2 px-2 text-white">{formatDateTime(log.started_at)}</td>
+                        {/* A restore writes a log row too, and without this it
+                            was indistinguishable from a backup: a successful
+                            run dated now, while Last backup said otherwise. */}
+                        <td className="py-2 px-2 text-bambu-gray">
+                          {t(`backup.triggers.${log.trigger}`, { defaultValue: log.trigger })}
+                        </td>
                         <td className="py-2 px-2"><StatusBadge status={log.status} /></td>
                         <td className="py-2 px-2">
                           {log.commit_sha ? (
@@ -1062,11 +1112,13 @@ export function GitHubBackupSettings() {
                 <p className="text-sm text-bambu-gray">
                   {t('backup.completeBackupZip')}
                 </p>
+                {/* A full backup holds every password hash and 2FA secret. */}
+                {!isAdmin && <p className="text-xs text-bambu-gray mt-1">{t('settings.adminOnlySetting')}</p>}
               </div>
               <Button
                 variant="secondary"
                 size="sm"
-                disabled={isExporting || isRestoring}
+                disabled={isExporting || isRestoring || !isAdmin}
                 onClick={async () => {
                   setIsExporting(true);
                   setOperationStatus(t('backup.preparingBackup'));
@@ -1122,7 +1174,8 @@ export function GitHubBackupSettings() {
               <Button
                 variant="secondary"
                 size="sm"
-                disabled={isRestoring || isExporting}
+                disabled={isRestoring || isExporting || !isAdmin}
+                title={!isAdmin ? t('settings.adminOnlySetting') : undefined}
                 onClick={() => fileInputRef.current?.click()}
               >
                 <Upload className="w-4 h-4" />
@@ -1228,7 +1281,7 @@ export function GitHubBackupSettings() {
                       <input
                         type="time"
                         value={localBackupStatus?.time ?? '03:00'}
-                        className="w-full h-10 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none [color-scheme:dark]"
+                        className="w-full h-10 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
                         onChange={async (e) => {
                           try {
                             await api.updateSettings({ local_backup_time: e.target.value });
@@ -1246,14 +1299,12 @@ export function GitHubBackupSettings() {
                   )}
                   <div>
                     <label className="block text-sm text-bambu-gray mb-1">{t('backup.retention')}</label>
-                    <input
-                      type="number"
+                    <NumberInput
                       min={1}
                       max={100}
                       value={localBackupStatus?.retention ?? 5}
                       className="w-full h-10 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
-                      onChange={async (e) => {
-                        const val = Math.max(1, Math.min(100, parseInt(e.target.value) || 5));
+                      onChange={async (val) => {
                         try {
                           await api.updateSettings({ local_backup_retention: val });
                           showToast(t('backup.settingsSaved'));
@@ -1262,6 +1313,7 @@ export function GitHubBackupSettings() {
                         }
                         refetchLocalStatus();
                       }}
+                      fallback={5}
                     />
                     <p className="text-xs text-bambu-gray-light mt-1">{t('backup.retentionDescription')}</p>
                   </div>
@@ -1274,8 +1326,11 @@ export function GitHubBackupSettings() {
                     type="text"
                     value={localBackupPath}
                     onChange={(e) => setLocalBackupPath(e.target.value)}
-                    className="w-full h-10 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none"
+                    disabled={!isAdmin}
+                    title={!isAdmin ? t('settings.adminOnlySetting') : undefined}
+                    className="w-full h-10 px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white focus:border-bambu-green focus:outline-none disabled:opacity-50"
                     onBlur={async () => {
+                      if (!isAdmin) return;
                       try {
                         await api.updateSettings({ local_backup_path: localBackupPath });
                         showToast(t('backup.settingsSaved'));
@@ -1395,6 +1450,8 @@ export function GitHubBackupSettings() {
                             </span>
                           </div>
                           <div className="flex items-center gap-1 flex-shrink-0">
+                            {isAdmin && (
+                            <>
                             <button
                               className="text-bambu-gray hover:text-bambu-green p-1"
                               title={t('backup.download')}
@@ -1421,6 +1478,8 @@ export function GitHubBackupSettings() {
                             >
                               <RotateCcw className="w-3.5 h-3.5" />
                             </button>
+                            </>
+                            )}
                             <button
                               className="text-bambu-gray hover:text-red-600 dark:hover:text-red-400 p-1"
                               onClick={() => setDeleteConfirmFile(file.filename)}
@@ -1444,6 +1503,23 @@ export function GitHubBackupSettings() {
           </CardContent>
         </Card>
       </div>
+
+      {/* Restore from the Git backup repository (#2656) */}
+      {showGitRestore && <GitHubRestoreModal onClose={() => setShowGitRestore(false)} />}
+
+      {showClearLogsConfirm && (
+        <ConfirmModal
+          title={t('backup.clearHistoryConfirmTitle')}
+          message={t('backup.clearHistoryConfirmMessage')}
+          confirmText={t('backup.clear')}
+          variant="danger"
+          onConfirm={() => {
+            setShowClearLogsConfirm(false);
+            clearLogsMutation.mutate();
+          }}
+          onCancel={() => setShowClearLogsConfirm(false)}
+        />
+      )}
 
       {/* Delete Backup Confirmation Modal */}
       {deleteConfirmFile && (
@@ -1487,7 +1563,7 @@ export function GitHubBackupSettings() {
               if (result.success) {
                 showToast(t('backup.backupRestoredRestart'), 'success');
               } else {
-                showToast(result.message, 'error');
+                showToast(result.message || t('backup.failedToRestore'), 'error');
               }
             } catch (e) {
               const message = e instanceof Error ? e.message : t('backup.failedToRestore');

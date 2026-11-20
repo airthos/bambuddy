@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback, useMemo } from 'react';
+import { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { useOutletContext } from 'react-router-dom';
 import { useQuery } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
@@ -12,9 +12,30 @@ import {
   type LocalPreset,
   type SlicerSetting,
   type SpoolCatalogEntry,
+  type SpoolKProfileInput,
 } from '../../api/client';
 import { getCurrencySymbol } from '../../utils/currency';
-import { getSwatchStyle } from '../../utils/colors';
+import { getSwatchStyle, resolveSpoolColorName } from '../../utils/colors';
+import { spoolSwatchStyle } from '../../components/spoolbuddy/spoolPaint';
+import { useColorCatalogVersion } from '../../hooks/useColorCatalogVersion';
+
+/**
+ * The colour name to show for a spool, which is not the one it stores.
+ *
+ * A Bambu tag often carries no colour name, or an internal code, and Spoolman
+ * has no field for one at all — so `color_name` is regularly empty or the
+ * subtype standing in for it, and the catalog resolves the swatch's hex
+ * instead (#3090, #857). The edit form below deliberately does NOT go through
+ * here: what it offers for editing has to be what is stored, or the user saves
+ * a name we made up as though they had typed it.
+ */
+function displayColorName(spool: {
+  color_name: string | null;
+  rgba: string | null;
+  color_name_is_synthesized?: boolean;
+}): string | null {
+  return resolveSpoolColorName(spool.color_name, spool.rgba, spool.color_name_is_synthesized);
+}
 import { FilamentSection } from '../../components/spool-form/FilamentSection';
 import { ColorSection } from '../../components/spool-form/ColorSection';
 import { AdditionalSection } from '../../components/spool-form/AdditionalSection';
@@ -31,8 +52,12 @@ import {
   parsePresetName,
   saveRecentColor,
   withCurrentValue,
+  withProductDefaultKProfiles,
 } from '../../components/spool-form/utils';
 import { MATERIALS } from '../../components/spool-form/constants';
+import { NumberInput } from '../../components/NumberInput';
+import { useUiSettings } from '../../hooks/useUiSettings';
+import { useKioskDevice } from '../../hooks/useKioskDevice';
 
 type Tab = 'existing' | 'new' | 'replace';
 type WriteStatus = 'idle' | 'selected' | 'writing' | 'success' | 'error';
@@ -40,6 +65,9 @@ const SIMPLE_COMMON_MATERIALS = ['PLA', 'PETG', 'ABS', 'ASA', 'TPU', 'PA', 'PC',
 
 export function SpoolBuddyWriteTagPage() {
   const { t } = useTranslation();
+  // The search below resolves colour names through the catalog, so its memo
+  // has to recompute when the catalog finishes loading (#3090).
+  const colorCatalogVersion = useColorCatalogVersion();
   const { showToast } = useToast();
   const { sbState } = useOutletContext<SpoolBuddyOutletContext>();
 
@@ -78,26 +106,41 @@ export function SpoolBuddyWriteTagPage() {
     enabled: spoolmanModeReady,
   });
 
-  const { data: devices = [] } = useQuery({
-    queryKey: ['spoolbuddy-devices'],
-    queryFn: () => spoolbuddyApi.getDevices(),
-    refetchInterval: 5000,
-  });
+  // The write goes to this kiosk's device, not the first one registered,
+  // which may be an old reader long offline (#3504).
+  const { device, devices, chooseDevice } = useKioskDevice(5000);
 
-  const { data: settings } = useQuery({
-    queryKey: ['settings'],
-    queryFn: api.getSettings,
-  });
+  const { data: settings } = useUiSettings();
 
-  const device = devices[0];
+  // The layout's state follows the same device (useKioskDevice).
   const deviceOnline = sbState.deviceOnline;
+  // Only when there is a real choice: another device besides this one online.
+  const showDevicePicker = devices.length > 1 && devices.some((d) => d.online && d.device_id !== device?.device_id);
+  // Tag events from every reader reach every kiosk; only this device's count.
+  const deviceIdRef = useRef(device?.device_id);
+  useEffect(() => {
+    deviceIdRef.current = device?.device_id;
+  }, [device?.device_id]);
+  const fromOtherDevice = useCallback(
+    (detail: { device_id?: string } | null | undefined) =>
+      !!deviceIdRef.current && !!detail?.device_id && detail.device_id !== deviceIdRef.current,
+    [],
+  );
   const currencySymbol = getCurrencySymbol(settings?.currency || 'USD');
 
   // Filter spools based on tab
   const filteredSpools = useMemo(() => {
+    // Named here so the memo actually depends on it: the search below resolves
+    // colour names through the catalog, which `displayColorName` reads from
+    // module state the linter cannot follow. Without this the list keeps the
+    // names it resolved before the catalog finished loading (#3090).
+    void colorCatalogVersion;
     let list: InventorySpool[];
     if (activeTab === 'existing') {
-      list = spools.filter(s => !s.tag_uid && !s.archived_at);
+      // Not a spool linked by its AMS tray UUID either: that is its tag, and
+      // in Spoolman a sticker would replace it (SM-C5). The two tabs are
+      // each other's complement.
+      list = spools.filter(s => !s.tag_uid && !s.tray_uuid && !s.archived_at);
     } else if (activeTab === 'replace') {
       list = spools.filter(s => (s.tag_uid || s.tray_uuid) && !s.archived_at);
     } else {
@@ -108,6 +151,9 @@ export function SpoolBuddyWriteTagPage() {
       const q = searchQuery.toLowerCase();
       list = list.filter(s =>
         (s.material?.toLowerCase().includes(q)) ||
+        // Both: the resolved name is what the list shows, the stored one is
+        // what a user who knows Bambu's internal codes might type (#3090).
+        (displayColorName(s)?.toLowerCase().includes(q)) ||
         (s.color_name?.toLowerCase().includes(q)) ||
         (s.brand?.toLowerCase().includes(q)) ||
         (s.subtype?.toLowerCase().includes(q))
@@ -115,33 +161,42 @@ export function SpoolBuddyWriteTagPage() {
     }
 
     return list;
-  }, [spools, activeTab, searchQuery]);
+  }, [spools, activeTab, searchQuery, colorCatalogVersion]);
 
   // Listen for tag events
   const handleUnknownTag = useCallback((e: Event) => {
     const detail = (e as CustomEvent).detail;
-    const sak = detail.sak ?? detail.data?.sak;
+    if (fromOtherDevice(detail)) return;
+    const sak = detail.sak;
     if (sak === 0x00) {
       setTagOnReader(true);
-      setTagUid(detail.tag_uid ?? detail.data?.tag_uid ?? null);
+      setTagUid(detail.tag_uid ?? null);
     }
-  }, []);
+  }, [fromOtherDevice]);
+
+  // A tag seen on another device is not on this one's reader.
+  useEffect(() => {
+    setTagOnReader(false);
+    setTagUid(null);
+  }, [device?.device_id]);
 
   const handleTagMatched = useCallback((e: Event) => {
     const detail = (e as CustomEvent).detail;
+    if (fromOtherDevice(detail)) return;
     // Tag is on the reader — could be used for replace flow
     setTagOnReader(true);
-    setTagUid(detail.tag_uid ?? detail.data?.tag_uid ?? null);
-  }, []);
+    setTagUid(detail.tag_uid ?? null);
+  }, [fromOtherDevice]);
 
-  const handleTagRemoved = useCallback(() => {
+  const handleTagRemoved = useCallback((e: Event) => {
+    if (fromOtherDevice((e as CustomEvent).detail)) return;
     setTagOnReader(false);
     setTagUid(null);
-  }, []);
+  }, [fromOtherDevice]);
 
   const handleTagWritten = useCallback((e: Event) => {
     const detail = (e as CustomEvent).detail;
-    if (detail.spool_id === selectedSpool?.id || detail.data?.spool_id === selectedSpool?.id) {
+    if (detail.spool_id === selectedSpool?.id) {
       setWriteStatus('success');
       setWriteMessage(t('spoolbuddy.writeTag.writeSuccess', 'Tag written successfully!'));
       refetchSpools();
@@ -155,13 +210,30 @@ export function SpoolBuddyWriteTagPage() {
 
   const handleWriteFailed = useCallback((e: Event) => {
     const detail = (e as CustomEvent).detail;
-    if (detail.spool_id === selectedSpool?.id || detail.data?.spool_id === selectedSpool?.id) {
+    if (detail.spool_id === selectedSpool?.id) {
       setWriteStatus('error');
-      setWriteMessage(detail.message ?? detail.data?.message ?? t('spoolbuddy.writeTag.writeFailed', 'Write failed'));
+      setWriteMessage(detail.message ?? t('spoolbuddy.writeTag.writeFailed', 'Write failed'));
     }
   }, [selectedSpool, t]);
 
+  const handleLinkFailed = useCallback((e: Event) => {
+    const detail = (e as CustomEvent).detail;
+    if (detail.spool_id === selectedSpool?.id) {
+      const reason = detail.reason;
+      setWriteStatus('error');
+      setWriteMessage(
+        reason === 'spoolman_not_configured'
+          ? t('spoolbuddy.writeTag.linkFailedSpoolmanNotConfigured')
+          : reason === 'spool_not_found'
+            ? t('spoolbuddy.writeTag.linkFailedSpoolNotFound')
+            : t('spoolbuddy.writeTag.linkFailedSpoolman'),
+      );
+      refetchSpools();
+    }
+  }, [selectedSpool, t, refetchSpools]);
+
   useEffect(() => {
+    window.addEventListener('spoolbuddy-tag-link-failed', handleLinkFailed);
     window.addEventListener('spoolbuddy-unknown-tag', handleUnknownTag);
     window.addEventListener('spoolbuddy-tag-matched', handleTagMatched);
     window.addEventListener('spoolbuddy-tag-removed', handleTagRemoved);
@@ -173,8 +245,9 @@ export function SpoolBuddyWriteTagPage() {
       window.removeEventListener('spoolbuddy-tag-removed', handleTagRemoved);
       window.removeEventListener('spoolbuddy-tag-written', handleTagWritten);
       window.removeEventListener('spoolbuddy-tag-write-failed', handleWriteFailed);
+      window.removeEventListener('spoolbuddy-tag-link-failed', handleLinkFailed);
     };
-  }, [handleUnknownTag, handleTagMatched, handleTagRemoved, handleTagWritten, handleWriteFailed]);
+  }, [handleUnknownTag, handleTagMatched, handleTagRemoved, handleTagWritten, handleWriteFailed, handleLinkFailed]);
 
   // Clear selection when switching tabs
   useEffect(() => {
@@ -195,9 +268,17 @@ export function SpoolBuddyWriteTagPage() {
           showToast(w, 'warning');
         }
       }
-    } catch {
+    } catch (err) {
       setWriteStatus('error');
-      setWriteMessage(t('spoolbuddy.writeTag.queueFailed', 'Failed to queue write command'));
+      const status = (err as { status?: number } | null)?.status;
+      setWriteMessage(
+        status === 503
+          ? t('spoolbuddy.writeTag.spoolmanUnavailable')
+          : status === 409
+            // A Bambu spool linked by its tray ID in Spoolman (SM-C5).
+            ? t('spoolbuddy.writeTag.linkedToAms')
+            : t('spoolbuddy.writeTag.queueFailed', 'Failed to queue write command'),
+      );
     }
   };
 
@@ -332,6 +413,23 @@ export function SpoolBuddyWriteTagPage() {
 
         {/* Right panel — NFC status + write action */}
         <div className="w-[340px] flex flex-col items-center justify-center p-6 shrink-0">
+          {showDevicePicker && (
+            <label className="w-full mb-4 text-sm text-white/60">
+              {t('spoolbuddy.writeTag.writeWith')}
+              <select
+                value={device?.device_id ?? ''}
+                onChange={(e) => chooseDevice(e.target.value)}
+                disabled={writeStatus === 'writing'}
+                className="mt-1 w-full px-3 py-2 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg text-white"
+              >
+                {devices.map((d) => (
+                  <option key={d.device_id} value={d.device_id}>
+                    {d.online ? d.hostname : t('spoolbuddy.writeTag.deviceOfflineOption', { name: d.hostname })}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
           <NfcStatusPanel
             writeStatus={writeStatus}
             writeMessage={writeMessage}
@@ -382,7 +480,7 @@ function SpoolListItem({ spool, selected, showTag, onClick }: {
           a checkerboard instead of collapsing to solid black (#1545). */}
       <div
         className="w-8 h-8 rounded-full shrink-0 border border-white/10"
-        style={spool.rgba ? getSwatchStyle(spool.rgba) : { backgroundColor: '#666' }}
+        style={spoolSwatchStyle(spool) ?? (spool.rgba ? getSwatchStyle(spool.rgba) : { backgroundColor: '#666' })}
       />
 
       {/* Info */}
@@ -394,7 +492,7 @@ function SpoolListItem({ spool, selected, showTag, onClick }: {
           <span className="text-[10px] font-mono text-zinc-500 shrink-0">#{spool.id}</span>
         </div>
         <div className="flex items-center gap-2 text-xs text-zinc-400">
-          {spool.color_name && <span>{spool.color_name}</span>}
+          {displayColorName(spool) && <span>{displayColorName(spool)}</span>}
           <span>{remaining}g / {spool.label_weight}g ({pct}%)</span>
         </div>
         {showTag && spool.tag_uid && (
@@ -431,14 +529,15 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
     queryFn: () =>
       spoolmanMode ? api.getSpoolmanInventorySpools(true) : api.getSpools(true),
   });
-  const { data: settingsForForm } = useQuery({
-    queryKey: ['settings'],
-    queryFn: api.getSettings,
-  });
+  const { data: settingsForForm } = useUiSettings();
 
   const [viewMode, setViewMode] = useState<NewSpoolViewMode>('simple');
   const [activeSubTab, setActiveSubTab] = useState<NewSpoolSubTab>('filament');
   const [formData, setFormData] = useState<SpoolFormData>(defaultFormData);
+  // The empty spool weight picker is on screen in Spoolman mode too. Track
+  // whether the user reached for it, so an untouched form does not send its
+  // default (issue #2908).
+  const [coreWeightTouched, setCoreWeightTouched] = useState(false);
   const [errors, setErrors] = useState<Partial<Record<keyof SpoolFormData, string>>>({});
   const [quickAdd, setQuickAdd] = useState(false);
   const [quantity, setQuantity] = useState(1);
@@ -640,6 +739,9 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
 
   const updateField = <K extends keyof SpoolFormData>(key: K, value: SpoolFormData[K]) => {
     setFormData(prev => ({ ...prev, [key]: value }));
+    if (key === 'core_weight') {
+      setCoreWeightTouched(true);
+    }
     if (errors[key]) {
       setErrors(prev => ({ ...prev, [key]: undefined }));
     }
@@ -651,16 +753,12 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
 
   const saveKProfiles = async (spoolId: number) => {
     const save = spoolmanMode ? api.saveSpoolmanKProfiles : api.saveSpoolKProfiles;
-    if (selectedProfiles.size === 0) {
-      try {
-        await save(spoolId, []);
-      } catch {
-        // ignore
-      }
-      return;
-    }
+    // Only ever a spool just created: nothing picked leaves it with what the
+    // create gave it, the product's profile default (#1326). Saving the empty
+    // list would clear that.
+    if (selectedProfiles.size === 0) return;
 
-    const profiles = [];
+    let profiles: SpoolKProfileInput[] = [];
     for (const key of selectedProfiles) {
       const [printerIdStr, caliIdxStr, extruderStr] = key.split(':');
       const printerId = parseInt(printerIdStr);
@@ -669,7 +767,13 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
 
       const pc = printersWithCalibrations.find(p => p.printer.id === printerId);
       if (pc) {
-        const cal = pc.calibrations.find(c => c.cali_idx === caliIdx);
+        // Match the extruder too, not cali_idx alone: the printer numbers its
+        // calibration table PER NOZZLE, so on a dual-nozzle machine the same
+        // cali_idx exists on both hotends and means different things. Resolving
+        // by index alone could persist the other hotend's K value and diameter.
+        const cal = pc.calibrations.find(
+          c => c.cali_idx === caliIdx && (c.extruder_id ?? 0) === extruder,
+        );
         if (cal) {
           profiles.push({
             printer_id: printerId,
@@ -685,6 +789,9 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
     }
 
     if (profiles.length > 0) {
+      // The save replaces the spool's whole list, and this page never shows
+      // the product's profile default the create applied (#1326).
+      profiles = await withProductDefaultKProfiles(profiles, formData);
       await save(spoolId, profiles);
     }
   };
@@ -699,7 +806,7 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
     }
 
     const presetName = selectedPresetOption?.displayName || presetInputValue || null;
-    const payload = {
+    const payload: Record<string, unknown> = {
       material: formData.material,
       subtype: formData.subtype || null,
       brand: formData.brand || null,
@@ -708,8 +815,15 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
       extra_colors: formData.extra_colors || null,
       effect_type: formData.effect_type || null,
       label_weight: formData.label_weight,
-      core_weight: formData.core_weight,
-      core_weight_catalog_id: formData.core_weight_catalog_id,
+      // Only send a per-spool tare in Spoolman mode when the user actually set
+      // one here; otherwise let it keep inheriting from the filament type.
+      // The catalogue id has no field on the Spoolman side, so a catalogue
+      // selection does not round-trip there; only the weight does.
+      ...(spoolmanMode
+        ? coreWeightTouched
+          ? { core_weight: formData.core_weight }
+          : {}
+        : { core_weight: formData.core_weight, core_weight_catalog_id: formData.core_weight_catalog_id }),
       weight_used: formData.weight_used,
       slicer_filament: formData.slicer_filament || null,
       slicer_filament_name: presetName,
@@ -728,6 +842,7 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
       last_weighed_at: null,
       category: formData.category.trim() || null,
       low_stock_threshold_pct: formData.low_stock_threshold_pct,
+      material_number: formData.material_number.trim() || null,
     };
 
     setCreating(true);
@@ -737,8 +852,8 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
         // internal bulk returns InventorySpool[]. Mirrors SpoolFormModal's
         // duck-typed handling so partial failures surface as a warning toast.
         const raw = spoolmanMode
-          ? await api.bulkCreateSpoolmanInventorySpools(payload, quantity)
-          : await api.bulkCreateSpools(payload, quantity);
+          ? await api.bulkCreateSpoolmanInventorySpools(payload as Parameters<typeof api.bulkCreateSpoolmanInventorySpools>[0], quantity)
+          : await api.bulkCreateSpools(payload as Parameters<typeof api.bulkCreateSpools>[0], quantity);
         const created: InventorySpool[] =
           spoolmanMode && raw && typeof raw === 'object' && 'created' in raw
             ? (raw as { created: InventorySpool[] }).created
@@ -749,8 +864,8 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
         if (created.length > 0) onCreated(created[0]);
       } else {
         const created = spoolmanMode
-          ? await api.createSpoolmanInventorySpool(payload)
-          : await api.createSpool(payload);
+          ? await api.createSpoolmanInventorySpool(payload as Parameters<typeof api.createSpoolmanInventorySpool>[0])
+          : await api.createSpool(payload as Parameters<typeof api.createSpool>[0]);
         await saveKProfiles(created.id);
         onCreated(created);
       }
@@ -794,12 +909,14 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
           <div className="flex flex-col items-center justify-center h-full p-6 text-center bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg">
             <div
               className="w-12 h-12 rounded-full mb-4 border border-white/10"
-              style={selectedSpool.rgba ? getSwatchStyle(selectedSpool.rgba) : { backgroundColor: '#666' }}
+              style={spoolSwatchStyle(selectedSpool, 'preview') ?? (selectedSpool.rgba ? getSwatchStyle(selectedSpool.rgba) : { backgroundColor: '#666' })}
             />
             <p className="text-white font-medium">
               {selectedSpool.brand ? `${selectedSpool.brand} ` : ''}{selectedSpool.material}
             </p>
-            {selectedSpool.color_name && <p className="text-zinc-400 text-sm">{selectedSpool.color_name}</p>}
+            {displayColorName(selectedSpool) && (
+              <p className="text-zinc-400 text-sm">{displayColorName(selectedSpool)}</p>
+            )}
             <p className="text-zinc-500 text-xs mt-1">{selectedSpool.label_weight}g</p>
             <p className="text-bambu-green text-sm mt-4">{t('spoolbuddy.writeTag.spoolCreated', 'Spool created! Ready to write.')}</p>
           </div>
@@ -853,10 +970,10 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
 
             <div>
               <label className="block text-xs text-zinc-400 mb-1">{t('spoolbuddy.writeTag.weight', 'Weight (g)')}</label>
-              <input
-                type="number"
+              <NumberInput
                 value={formData.label_weight}
-                onChange={(e) => updateField('label_weight', parseInt(e.target.value) || 0)}
+                onChange={(v) => updateField('label_weight', v)}
+                fallback={0}
                 min={0}
                 max={10000}
                 className="w-full px-3 py-2 bg-bambu-dark-tertiary border border-bambu-dark-tertiary rounded text-sm text-white focus:outline-none focus:border-bambu-green"
@@ -947,13 +1064,16 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
               availableCategories={Array.from(new Set(
                 allSpoolsForForm.map((s) => s.category?.trim()).filter((c): c is string => !!c),
               )).sort((a, b) => a.localeCompare(b))}
+              availableMaterialNumbers={Array.from(new Set(
+                allSpoolsForForm.map((s) => s.material_number?.trim()).filter((n): n is string => !!n),
+              )).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))}
               globalLowStockThreshold={settingsForForm?.low_stock_threshold ?? 20}
+              spoolmanMode={spoolmanMode}
             />
           </div>
         ) : (
           <PAProfileSection
             formData={formData}
-            updateField={updateField}
             printersWithCalibrations={printersWithCalibrations}
             selectedProfiles={selectedProfiles}
             setSelectedProfiles={setSelectedProfiles}
@@ -985,12 +1105,14 @@ function NewSpoolTouchForm({ currencySymbol, onCreated, selectedSpool, spoolmanM
         <div className="flex flex-col items-center justify-center p-4 text-center bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-lg">
           <div
             className="w-12 h-12 rounded-full mb-4 border border-white/10"
-            style={selectedSpool.rgba ? getSwatchStyle(selectedSpool.rgba) : { backgroundColor: '#666' }}
+            style={spoolSwatchStyle(selectedSpool, 'preview') ?? (selectedSpool.rgba ? getSwatchStyle(selectedSpool.rgba) : { backgroundColor: '#666' })}
           />
           <p className="text-white font-medium">
             {selectedSpool.brand ? `${selectedSpool.brand} ` : ''}{selectedSpool.material}
           </p>
-          {selectedSpool.color_name && <p className="text-zinc-400 text-sm">{selectedSpool.color_name}</p>}
+          {displayColorName(selectedSpool) && (
+            <p className="text-zinc-400 text-sm">{displayColorName(selectedSpool)}</p>
+          )}
           <p className="text-zinc-500 text-xs mt-1">{selectedSpool.label_weight}g</p>
           <p className="text-bambu-green text-sm mt-4">{t('spoolbuddy.writeTag.spoolCreated', 'Spool created! Ready to write.')}</p>
         </div>
@@ -1030,7 +1152,8 @@ function NfcStatusPanel({ writeStatus, writeMessage, selectedSpool, tagOnReader,
         {selectedSpool && (
           <p className="text-zinc-400 text-sm">
             {selectedSpool.brand ? `${selectedSpool.brand} ` : ''}{selectedSpool.material}
-            {selectedSpool.color_name ? ` - ${selectedSpool.color_name}` : ''}
+            {selectedSpool.subtype ? ` ${selectedSpool.subtype}` : ''}
+            {displayColorName(selectedSpool) ? ` - ${displayColorName(selectedSpool)}` : ''}
           </p>
         )}
       </div>
@@ -1103,7 +1226,9 @@ function NfcStatusPanel({ writeStatus, writeMessage, selectedSpool, tagOnReader,
   // Spool selected — show summary + write button. Use getSwatchStyle so
   // transparent (Clear) spools render a checkerboard rather than collapsing
   // to solid black (#1545).
-  const spoolColorStyle = selectedSpool.rgba ? getSwatchStyle(selectedSpool.rgba) : { backgroundColor: '#666' };
+  const spoolColorStyle =
+    spoolSwatchStyle(selectedSpool, 'preview') ??
+    (selectedSpool.rgba ? getSwatchStyle(selectedSpool.rgba) : { backgroundColor: '#666' });
 
   return (
     <div className="flex flex-col items-center text-center space-y-4 w-full">
@@ -1143,7 +1268,9 @@ function NfcStatusPanel({ writeStatus, writeMessage, selectedSpool, tagOnReader,
             <p className="text-white text-sm font-medium truncate">
               {selectedSpool.brand ? `${selectedSpool.brand} ` : ''}{selectedSpool.material}
             </p>
-            {selectedSpool.color_name && <p className="text-zinc-400 text-xs">{selectedSpool.color_name}</p>}
+            {displayColorName(selectedSpool) && (
+              <p className="text-zinc-400 text-xs">{displayColorName(selectedSpool)}</p>
+            )}
           </div>
         </div>
         <div className="text-xs text-zinc-500">{selectedSpool.label_weight}g</div>

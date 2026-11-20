@@ -111,6 +111,28 @@ class TestAssignSpoolmanSlot:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_assign_drops_a_held_unlink_on_the_slot(
+        self, async_client: AsyncClient, slot_settings, test_printer, mock_client
+    ):
+        """#3186: a slot that read empty has its unlink held for a grace period.
+        Linking a spool to it is fresher evidence, so the old clock must not
+        carry over and delete the user's own link."""
+        from backend.app.services import slot_unlink_grace
+
+        hold_key = ("spoolman", 0, 0, 10)
+        slot_unlink_grace.removal_confirmed(test_printer.id, hold_key)
+        assert slot_unlink_grace.is_held(test_printer.id, hold_key)
+
+        response = await async_client.post(
+            "/api/v1/spoolman/inventory/slot-assignments",
+            json={"spoolman_spool_id": 10, "printer_id": test_printer.id, "ams_id": 0, "tray_id": 0},
+        )
+
+        assert response.status_code == 200
+        assert not slot_unlink_grace.is_held(test_printer.id, hold_key)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_assign_accepts_ams_ht_id(self, async_client: AsyncClient, slot_settings, test_printer, mock_client):
         """#1274: AMS-HT units report ams_id 128+. The pre-fix ck_ams_id_range
         only allowed 0-7 / 255, so the upsert blew up with `CHECK constraint
@@ -579,20 +601,21 @@ class TestCascadeDeletePrinter:
         assert post.scalars().all() == []
 
 
-class TestModeSwitchClearsAssignments:
-    """#1473 follow-up — the Spoolman mode toggle clears the other mode's
-    slot-assignment table so stale rows can't bleed across a mode switch."""
+class TestModeSwitchKeepsAssignments:
+    """#2812 — the mode toggle no longer deletes anything.
+
+    It used to empty the other mode's table on every switch, so opening the
+    settings page to see what Spoolman mode did destroyed the built-in slot
+    assignments, with no confirmation and no way back. Both tables are kept now
+    and the readers that could be confused by a row in the inactive one ask
+    which mode is active instead (``spoolman_owns_assignments``).
+    """
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_switch_to_internal_mode_clears_spoolman_slot_assignments(
+    async def test_switch_to_internal_mode_keeps_spoolman_slot_assignments(
         self, async_client: AsyncClient, db_session, test_printer
     ):
-        """Switching Spoolman OFF deletes spoolman_slot_assignments rows — the
-        symmetric counterpart of clearing legacy spool_assignment rows when
-        switching ON. Stale rows would otherwise wrongly count as 'assigned'
-        in mode-agnostic checks (e.g. the missing-spool-assignment notification,
-        which unions both tables)."""
         from backend.app.models.settings import Settings
         from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 
@@ -606,4 +629,30 @@ class TestModeSwitchClearsAssignments:
         rows = await db_session.execute(
             select(SpoolmanSlotAssignment).where(SpoolmanSlotAssignment.printer_id == test_printer.id)
         )
-        assert rows.scalars().all() == []
+        assert len(rows.scalars().all()) == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_switch_to_spoolman_mode_keeps_builtin_assignments(
+        self, async_client: AsyncClient, db_session, test_printer
+    ):
+        """The reported case: four toggles in 85 seconds took the reporter's
+        built-in assignments and never gave them back."""
+        from backend.app.models.settings import Settings
+        from backend.app.models.spool import Spool
+        from backend.app.models.spool_assignment import SpoolAssignment
+
+        db_session.add(Settings(key="spoolman_enabled", value="false"))
+        spool = Spool(material="PLA", rgba="000000FF")
+        db_session.add(spool)
+        await db_session.flush()
+        db_session.add(SpoolAssignment(printer_id=test_printer.id, ams_id=0, tray_id=0, spool_id=spool.id))
+        await db_session.commit()
+
+        on = await async_client.put("/api/v1/settings/spoolman", json={"spoolman_enabled": "true"})
+        assert on.status_code == 200
+        off = await async_client.put("/api/v1/settings/spoolman", json={"spoolman_enabled": "false"})
+        assert off.status_code == 200
+
+        rows = await db_session.execute(select(SpoolAssignment).where(SpoolAssignment.printer_id == test_printer.id))
+        assert len(rows.scalars().all()) == 1

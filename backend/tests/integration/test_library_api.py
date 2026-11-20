@@ -4,9 +4,20 @@ import io
 import tempfile
 import zipfile
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 from httpx import AsyncClient
+from sqlalchemy import select
+
+from backend.app.core.config import settings as app_settings
+from backend.app.models.print_queue import PrintQueueItem
+
+
+async def _read_queue_item(db_session, item_id: int) -> PrintQueueItem:
+    """Re-read a queue row the route just committed through its own session."""
+    db_session.expire_all()
+    return (await db_session.execute(select(PrintQueueItem).where(PrintQueueItem.id == item_id))).scalar_one()
 
 
 class TestLibraryFoldersAPI:
@@ -150,6 +161,68 @@ class TestLibraryFoldersAPI:
         assert response.status_code == 200
         result = response.json()
         assert result["name"] == "New Name"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_move_folder_into_another_folder(self, async_client: AsyncClient, folder_factory, db_session):
+        """A folder moves under another folder with parent_id (#3305)."""
+        projects = await folder_factory(name="Projects")
+        archive = await folder_factory(name="Archive")
+        response = await async_client.put(f"/api/v1/library/folders/{archive.id}", json={"parent_id": projects.id})
+        assert response.status_code == 200
+        assert response.json()["parent_id"] == projects.id
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_move_folder_to_root(self, async_client: AsyncClient, folder_factory, db_session):
+        """parent_id 0 lifts a nested folder to the top level (#3305)."""
+        projects = await folder_factory(name="Projects")
+        nested = await folder_factory(name="Nested", parent_id=projects.id)
+        response = await async_client.put(f"/api/v1/library/folders/{nested.id}", json={"parent_id": 0})
+        assert response.status_code == 200
+        assert response.json()["parent_id"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_move_folder_into_missing_parent_is_404(self, async_client: AsyncClient, folder_factory, db_session):
+        """A parent_id that does not exist is refused before anything changes (#3305)."""
+        folder = await folder_factory(name="Projects")
+        response = await async_client.put(f"/api/v1/library/folders/{folder.id}", json={"parent_id": 9999})
+        assert response.status_code == 404
+        assert response.json()["detail"] == "Parent folder not found"
+        await db_session.refresh(folder)
+        assert folder.parent_id is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_move_external_folder_is_refused(self, async_client: AsyncClient, folder_factory, db_session):
+        """An external folder mirrors a path on disk and cannot be moved (#3305)."""
+        target = await folder_factory(name="Projects")
+        external = await folder_factory(name="Mount", is_external=True, external_path="/data/mount")
+        for parent_id in (target.id, 0):
+            response = await async_client.put(f"/api/v1/library/folders/{external.id}", json={"parent_id": parent_id})
+            if parent_id == 0:
+                # Already at the root: not a move, so it goes through.
+                assert response.status_code == 200
+            else:
+                assert response.status_code == 400
+                assert response.json()["detail"] == "External folders cannot be moved"
+        await db_session.refresh(external)
+        assert external.parent_id is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_move_folder_into_external_folder_is_refused(
+        self, async_client: AsyncClient, folder_factory, db_session
+    ):
+        """Nothing can be moved into an external folder (#3305)."""
+        external = await folder_factory(name="Mount", is_external=True, external_path="/data/mount")
+        folder = await folder_factory(name="Projects")
+        response = await async_client.put(f"/api/v1/library/folders/{folder.id}", json={"parent_id": external.id})
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Cannot move a folder into an external folder"
+        await db_session.refresh(folder)
+        assert folder.parent_id is None
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -297,6 +370,60 @@ class TestLibraryFilesAPI:
         result = response.json()
         assert len(result) == 1
         assert result[0]["id"] == other_file.id
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize("direction", ["into", "out of"])
+    async def test_an_edit_does_not_move_a_file_across_the_external_boundary(
+        self, async_client: AsyncClient, folder_factory, file_factory, db_session, direction
+    ):
+        """F8: the edit route only changed folder_id -- no byte move, no
+        read-only check -- so the file showed in a folder its bytes are not
+        in. Such a move goes through POST /library/files/move."""
+        internal = await folder_factory(name="Mine")
+        nas = await folder_factory(name="NAS", is_external=True, external_path="/mnt/nas")
+        if direction == "into":
+            file = await file_factory(folder_id=internal.id, filename="a.3mf", is_external=False)
+            target = nas.id
+        else:
+            file = await file_factory(folder_id=nas.id, filename="a.3mf", is_external=True)
+            target = internal.id
+
+        response = await async_client.put(f"/api/v1/library/files/{file.id}", json={"folder_id": target})
+
+        assert response.status_code == 400
+        assert "/library/files/move" in response.json()["detail"]
+        await db_session.refresh(file)
+        assert file.folder_id != target
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_an_external_file_sent_with_its_own_folder_is_no_move(
+        self, async_client: AsyncClient, folder_factory, file_factory
+    ):
+        nas = await folder_factory(name="NAS", is_external=True, external_path="/mnt/nas")
+        file = await file_factory(folder_id=nas.id, filename="a.3mf", is_external=True)
+
+        response = await async_client.put(
+            f"/api/v1/library/files/{file.id}", json={"folder_id": nas.id, "notes": "kept"}
+        )
+
+        assert response.status_code == 200
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_an_edit_still_moves_a_file_between_its_own_folders(
+        self, async_client: AsyncClient, folder_factory, file_factory, db_session
+    ):
+        first = await folder_factory(name="One")
+        second = await folder_factory(name="Two")
+        file = await file_factory(folder_id=first.id, filename="a.3mf", is_external=False)
+
+        response = await async_client.put(f"/api/v1/library/files/{file.id}", json={"folder_id": second.id})
+
+        assert response.status_code == 200
+        await db_session.refresh(file)
+        assert file.folder_id == second.id
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -679,19 +806,45 @@ class TestLibraryAddToQueueAPI:
 
         return _create_library_file
 
+    @pytest.fixture
+    async def on_disk_file_factory(self, library_file_factory):
+        """A library file whose bytes exist, so the route gets past its disk check."""
+        written: list[Path] = []
+
+        async def _create(**kwargs):
+            # A unique name: this is the checkout's real library folder, shared by
+            # every xdist worker, and a sibling's teardown deleted a same-named
+            # probe this test still needed ("File not found on disk").
+            rel_path = kwargs.pop("file_path", f"archive/library/files/queue_probe_{uuid4().hex}.gcode.3mf")
+            abs_path = Path(app_settings.base_dir) / rel_path
+            abs_path.parent.mkdir(parents=True, exist_ok=True)
+            abs_path.write_bytes(b"probe")
+            written.append(abs_path)
+            kwargs.setdefault("filename", Path(rel_path).name)
+            return await library_file_factory(file_path=rel_path, **kwargs)
+
+        yield _create
+
+        for path in written:
+            path.unlink(missing_ok=True)
+
     @pytest.mark.asyncio
     @pytest.mark.integration
     async def test_add_to_queue_file_not_found(self, async_client: AsyncClient, printer_factory, db_session):
-        """Verify error for non-existent file."""
+        """Nothing queued is not a success (#3112).
+
+        This used to assert 200: the caller got an OK for a call that created
+        nothing, with the reason in a body it had no cause to read. The reason
+        is still reported, now where a failed call puts it.
+        """
         await printer_factory()
 
         data = {"file_ids": [9999]}
         response = await async_client.post("/api/v1/library/files/add-to-queue", json=data)
-        assert response.status_code == 200
-        result = response.json()
-        assert len(result["added"]) == 0
-        assert len(result["errors"]) == 1
-        assert result["errors"][0]["file_id"] == 9999
+        assert response.status_code == 400
+        errors = response.json()["detail"]["errors"]
+        assert len(errors) == 1
+        assert errors[0]["file_id"] == 9999
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -708,11 +861,172 @@ class TestLibraryAddToQueueAPI:
 
         data = {"file_ids": [lib_file.id]}
         response = await async_client.post("/api/v1/library/files/add-to-queue", json=data)
+        assert response.status_code == 400
+        errors = response.json()["detail"]["errors"]
+        assert len(errors) == 1
+        assert "sliced" in errors[0]["error"].lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_partial_success_still_returns_200(
+        self, async_client: AsyncClient, printer_factory, library_file_factory, on_disk_file_factory, db_session
+    ):
+        """Items really were created, so the call succeeded (#3112).
+
+        The per-file errors ride along with them, which is the whole point of a
+        bulk endpoint. Only a call that produced nothing is a failed call.
+        """
+        await printer_factory()
+        good = await on_disk_file_factory()
+        bad = await library_file_factory(filename="model.stl", file_path="/test/path/model.stl", file_type="stl")
+
+        response = await async_client.post("/api/v1/library/files/add-to-queue", json={"file_ids": [good.id, bad.id]})
         assert response.status_code == 200
         result = response.json()
-        assert len(result["added"]) == 0
-        assert len(result["errors"]) == 1
-        assert "sliced" in result["errors"][0]["error"].lower()
+        assert [a["file_id"] for a in result["added"]] == [good.id]
+        assert [e["file_id"] for e in result["errors"]] == [bad.id]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_target_model_is_inferred_so_the_item_can_be_dispatched(
+        self, async_client: AsyncClient, printer_factory, on_disk_file_factory, db_session
+    ):
+        """#3112: an item with no printer and no target model is inert.
+
+        The scheduler dispatches on `item.printer_id` or on
+        `item.target_model or item.variants`; a row with neither matches no
+        branch and waits forever. With an active X1C present, a file that says
+        it was sliced for one is aimed at it.
+        """
+        await printer_factory(model="X1C")
+        lib_file = await on_disk_file_factory(file_metadata={"sliced_for_model": "X1C"})
+
+        response = await async_client.post("/api/v1/library/files/add-to-queue", json={"file_ids": [lib_file.id]})
+        assert response.status_code == 200
+        item = await _read_queue_item(db_session, response.json()["added"][0]["queue_item_id"])
+        assert item.printer_id is None
+        assert item.target_model == "X1C"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_no_printer_of_that_model_leaves_the_item_unassigned(
+        self, async_client: AsyncClient, printer_factory, on_disk_file_factory, db_session
+    ):
+        """Aiming an item at hardware nobody owns would only look like progress.
+
+        Having no H2D is the user's situation, not their mistake, so the file
+        is still queued -- as the unassigned row it has always been.
+        """
+        await printer_factory(model="X1C")
+        lib_file = await on_disk_file_factory(file_metadata={"sliced_for_model": "H2D"})
+
+        response = await async_client.post("/api/v1/library/files/add-to-queue", json={"file_ids": [lib_file.id]})
+        assert response.status_code == 200
+        item = await _read_queue_item(db_session, response.json()["added"][0]["queue_item_id"])
+        assert item.printer_id is None
+        assert item.target_model is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_explicit_printer_wins_over_the_files_own_model(
+        self, async_client: AsyncClient, printer_factory, on_disk_file_factory, db_session
+    ):
+        printer = await printer_factory(model="X1C")
+        # Read before the queue row is re-read: that expires the session, and
+        # a lazy refresh of this row would then happen outside the greenlet.
+        printer_id = printer.id
+        lib_file = await on_disk_file_factory(file_metadata={"sliced_for_model": "X1C"})
+
+        response = await async_client.post(
+            "/api/v1/library/files/add-to-queue",
+            json={"file_ids": [lib_file.id], "printer_id": printer_id},
+        )
+        assert response.status_code == 200
+        item = await _read_queue_item(db_session, response.json()["added"][0]["queue_item_id"])
+        assert item.printer_id == printer_id
+        assert item.target_model is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_incompatible_target_model_is_refused_per_file(
+        self, async_client: AsyncClient, printer_factory, on_disk_file_factory, db_session
+    ):
+        """The same cross-model gate POST /queue/ applies (#2578).
+
+        The scheduler hands model-based items to hardware with no human in the
+        loop, so a file sliced for one model must not be aimed at another.
+        """
+        await printer_factory(model="A1")
+        lib_file = await on_disk_file_factory(file_metadata={"sliced_for_model": "X1C"})
+
+        response = await async_client.post(
+            "/api/v1/library/files/add-to-queue",
+            json={"file_ids": [lib_file.id], "target_model": "A1"},
+        )
+        assert response.status_code == 400
+        assert "cannot be dispatched" in response.json()["detail"]["errors"][0]["error"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_target_model_without_an_active_printer_is_refused(
+        self, async_client: AsyncClient, printer_factory, on_disk_file_factory, db_session
+    ):
+        await printer_factory(model="X1C")
+        lib_file = await on_disk_file_factory(file_metadata={"sliced_for_model": "H2D"})
+
+        response = await async_client.post(
+            "/api/v1/library/files/add-to-queue",
+            json={"file_ids": [lib_file.id], "target_model": "H2D"},
+        )
+        assert response.status_code == 400
+        assert "No active printers" in response.json()["detail"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_printer_and_target_model_together_are_refused(
+        self, async_client: AsyncClient, printer_factory, on_disk_file_factory, db_session
+    ):
+        printer = await printer_factory(model="X1C")
+        lib_file = await on_disk_file_factory()
+
+        response = await async_client.post(
+            "/api/v1/library/files/add-to-queue",
+            json={"file_ids": [lib_file.id], "printer_id": printer.id, "target_model": "X1C"},
+        )
+        assert response.status_code == 400
+        assert "both" in response.json()["detail"].lower()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_unknown_printer_is_refused(
+        self, async_client: AsyncClient, printer_factory, on_disk_file_factory, db_session
+    ):
+        await printer_factory(model="X1C")
+        lib_file = await on_disk_file_factory()
+
+        response = await async_client.post(
+            "/api/v1/library/files/add-to-queue",
+            json={"file_ids": [lib_file.id], "printer_id": 999999},
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Printer not found"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_filename_the_printer_cannot_store_is_refused(
+        self, async_client: AsyncClient, printer_factory, on_disk_file_factory, db_session
+    ):
+        """The Bambu SD card is FAT32; an illegal character 553s at upload.
+
+        POST /queue/ has rejected these at queue time since #1540. This route
+        did not, so the mistake surfaced as a print that failed later.
+        """
+        await printer_factory(model="X1C")
+        lib_file = await on_disk_file_factory(filename="bad:name?.gcode.3mf")
+
+        response = await async_client.post("/api/v1/library/files/add-to-queue", json={"file_ids": [lib_file.id]})
+        assert response.status_code == 400
+        assert response.json()["detail"]["errors"][0]["file_id"] == lib_file.id
 
 
 class TestLibraryZipExtractAPI:
@@ -994,6 +1308,31 @@ endsolid cube"""
         assert result["file_type"] == "stl"
         # No thumbnail should be generated when disabled
         assert result["thumbnail_path"] is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_upload_image_stores_a_thumbnail(self, async_client: AsyncClient, db_session):
+        """An uploaded image gets its own grid thumbnail, so PNGs are not blank cards (#2976)."""
+        from PIL import Image
+
+        buffer = io.BytesIO()
+        Image.new("RGB", (640, 480), (0, 174, 66)).save(buffer, format="PNG")
+
+        files = {"file": ("photo.png", buffer.getvalue(), "image/png")}
+        response = await async_client.post("/api/v1/library/files", files=files)
+
+        assert response.status_code == 200
+        result = response.json()
+        assert result["file_type"] == "png"
+        assert result["thumbnail_path"]
+
+        from backend.app.api.routes.library import to_absolute_path
+
+        thumb = to_absolute_path(result["thumbnail_path"])
+        assert thumb is not None and thumb.exists()
+        with Image.open(thumb) as thumbnail:
+            assert thumbnail.format == "PNG"
+            assert max(thumbnail.size) <= 256
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -1629,6 +1968,73 @@ class TestPrintFileUploadValidation:
         assert b"G28" in response.content
         # The whole point of #1709: must NOT be ZIP bytes shoved at the viewer.
         assert not response.content.startswith(b"PK")
+
+    async def _multi_plate_file(self, db_session):
+        """A two-plate `.gcode.3mf` written plate 2 first, as Bambu Studio does.
+
+        The member order is copied from the file this was reported on — taking
+        the first `.gcode` in the zip opened plate 2.
+        """
+        from backend.app.models.library import LibraryFile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("Metadata/plate_2.gcode", "; plate two\nG28\n")
+            zf.writestr("Metadata/plate_1.gcode", "; plate one\nG28\n")
+        with tempfile.NamedTemporaryFile(suffix=".gcode.3mf", delete=False) as tmp:
+            tmp.write(buf.getvalue())
+            tmp_path = tmp.name
+
+        lib_file = LibraryFile(
+            filename="two-plates.gcode.3mf",
+            file_path=tmp_path,
+            file_type="gcode.3mf",
+            file_size=Path(tmp_path).stat().st_size,
+        )
+        db_session.add(lib_file)
+        await db_session.commit()
+        await db_session.refresh(lib_file)
+        return lib_file
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_library_gcode_serves_the_requested_plate(self, async_client: AsyncClient, db_session):
+        """The viewer has always sent ``?plate=``; this route took no such
+        parameter, and FastAPI drops unknown query parameters without a word —
+        so picking a plate did nothing at all."""
+        lib_file = await self._multi_plate_file(db_session)
+
+        first = await async_client.get(f"/api/v1/library/files/{lib_file.id}/gcode?plate=1")
+        second = await async_client.get(f"/api/v1/library/files/{lib_file.id}/gcode?plate=2")
+
+        assert first.status_code == 200
+        assert b"plate one" in first.content
+        assert second.status_code == 200
+        assert b"plate two" in second.content
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_library_gcode_without_a_plate_serves_the_first_plate(self, async_client: AsyncClient, db_session):
+        """Not the first member in the zip — that is plate 2 in this file, and
+        opening a multi-plate file from the File Manager passes no plate."""
+        lib_file = await self._multi_plate_file(db_session)
+
+        response = await async_client.get(f"/api/v1/library/files/{lib_file.id}/gcode")
+
+        assert response.status_code == 200
+        assert b"plate one" in response.content
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_library_gcode_rejects_a_plate_the_file_does_not_hold(self, async_client: AsyncClient, db_session):
+        """404 rather than quietly rendering some other plate."""
+        lib_file = await self._multi_plate_file(db_session)
+
+        missing = await async_client.get(f"/api/v1/library/files/{lib_file.id}/gcode?plate=3")
+        zeroth = await async_client.get(f"/api/v1/library/files/{lib_file.id}/gcode?plate=0")
+
+        assert missing.status_code == 404
+        assert zeroth.status_code == 400
 
     @pytest.mark.asyncio
     @pytest.mark.integration

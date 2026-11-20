@@ -8,6 +8,7 @@ import { Card, CardContent } from './Card';
 import { Button } from './Button';
 import { ConfirmModal } from './ConfirmModal';
 import { useToast } from '../contexts/ToastContext';
+import { NumberInput } from './NumberInput';
 
 interface SmartPlugCardProps {
   plug: SmartPlug;
@@ -143,9 +144,9 @@ export function SmartPlugCard({ plug, onEdit }: SmartPlugCardProps) {
                 <h3 className="font-medium text-white truncate">{plug.name}</h3>
                 <p
                   className="text-sm text-bambu-gray truncate"
-                  title={plug.plug_type === 'mqtt' ? plug.mqtt_topic ?? undefined : plug.plug_type === 'homeassistant' ? plug.ha_entity_id ?? undefined : plug.plug_type === 'rest' ? plug.rest_on_url ?? plug.rest_off_url ?? undefined : plug.ip_address ?? undefined}
+                  title={plug.plug_type === 'mqtt' ? plug.mqtt_topic ?? undefined : plug.plug_type === 'homeassistant' ? plug.ha_entity_id ?? undefined : plug.plug_type === 'rest' ? plug.rest_on_url || plug.rest_off_url || 'REST' : plug.ip_address ?? undefined}
                 >
-                  {plug.plug_type === 'mqtt' ? plug.mqtt_topic : plug.plug_type === 'homeassistant' ? plug.ha_entity_id : plug.plug_type === 'rest' ? (plug.rest_on_url || plug.rest_off_url) : plug.ip_address}
+                  {plug.plug_type === 'mqtt' ? plug.mqtt_topic : plug.plug_type === 'homeassistant' ? plug.ha_entity_id : plug.plug_type === 'rest' ? (plug.rest_on_url || plug.rest_off_url || 'REST') : plug.ip_address}
                 </p>
               </div>
             </div>
@@ -447,24 +448,24 @@ export function SmartPlugCard({ plug, onEdit }: SmartPlugCardProps) {
                   {plug.off_delay_mode === 'time' ? (
                     <div>
                       <label className="block text-xs text-bambu-gray mb-1">{t('smartPlugs.delayMinutes')}</label>
-                      <input
-                        type="number"
-                        min="1"
-                        max="60"
+                      <NumberInput
+                        min={1}
+                        max={60}
                         value={plug.off_delay_minutes}
-                        onChange={(e) => updateMutation.mutate({ off_delay_minutes: parseInt(e.target.value) || 5 })}
+                        onChange={(v) => updateMutation.mutate({ off_delay_minutes: v })}
+                        fallback={5}
                         className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:border-bambu-green focus:outline-none"
                       />
                     </div>
                   ) : (
                     <div>
                       <label className="block text-xs text-bambu-gray mb-1">{t('smartPlugs.tempThreshold')}</label>
-                      <input
-                        type="number"
-                        min="30"
-                        max="100"
+                      <NumberInput
+                        min={30}
+                        max={100}
                         value={plug.off_temp_threshold}
-                        onChange={(e) => updateMutation.mutate({ off_temp_threshold: parseInt(e.target.value) || 70 })}
+                        onChange={(v) => updateMutation.mutate({ off_temp_threshold: v })}
+                        fallback={70}
                         className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:border-bambu-green focus:outline-none"
                       />
                       <p className="text-xs text-bambu-gray mt-1">{t('smartPlugs.tempThresholdDescription')}</p>
@@ -498,12 +499,12 @@ export function SmartPlugCard({ plug, onEdit }: SmartPlugCardProps) {
               {plug.auto_off_after_drying && (
                 <div className="pl-4 border-l-2 border-bambu-dark-tertiary">
                   <label className="block text-xs text-bambu-gray mb-1">{t('smartPlugs.delayAfterDryingMinutes')}</label>
-                  <input
-                    type="number"
-                    min="0"
-                    max="120"
+                  <NumberInput
+                    min={0}
+                    max={120}
                     value={plug.off_delay_after_drying_minutes}
-                    onChange={(e) => updateMutation.mutate({ off_delay_after_drying_minutes: parseInt(e.target.value) || 10 })}
+                    onChange={(v) => updateMutation.mutate({ off_delay_after_drying_minutes: v })}
+                    fallback={10}
                     className="w-full px-3 py-2 bg-bambu-dark border border-bambu-dark-tertiary rounded-lg text-white text-sm focus:border-bambu-green focus:outline-none"
                   />
                 </div>

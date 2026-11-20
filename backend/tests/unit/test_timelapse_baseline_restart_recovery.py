@@ -19,6 +19,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from backend.app.main import _timelapse_baselines
+from backend.app.services.bambu_ftp import FileListResult
 
 
 @pytest.fixture(autouse=True)
@@ -59,8 +60,8 @@ async def test_running_observed_captures_baseline_on_restart_recovery():
     with (
         patch("backend.app.main.async_session") as mock_session_maker,
         patch(
-            "backend.app.main._list_timelapse_videos",
-            new=AsyncMock(return_value=(existing_videos, "/timelapse")),
+            "backend.app.services.bambu_ftp.list_files_result_async",
+            new=AsyncMock(return_value=FileListResult(existing_videos, True)),
         ),
     ):
         mock_session_maker.return_value = mock_session
@@ -98,12 +99,13 @@ async def test_running_observed_skips_when_baseline_already_present():
     """If on_print_start already ran in this Bambuddy process for the same
     printer (the realistic same-session race), a second capture would
     overwrite the correct pre-print baseline with one taken later — which
-    could include the in-flight MP4. Skip when a baseline exists."""
+    could include the in-flight MP4. The archive lookup still has to run so
+    restart recovery can restore durable print ownership for the kill switch."""
     _timelapse_baselines[1] = {"pre_existing_a.mp4", "pre_existing_b.mp4"}
 
     with (
         patch("backend.app.main.async_session") as mock_session_maker,
-        patch("backend.app.main._list_timelapse_videos", new=AsyncMock()) as mock_list,
+        patch("backend.app.main._read_timelapse_baseline", new=AsyncMock()) as mock_list,
     ):
         from backend.app.main import on_print_running_observed
 
@@ -118,8 +120,9 @@ async def test_running_observed_skips_when_baseline_already_present():
             },
         )
 
-        # Neither the DB lookup nor the FTP scan should have run.
-        mock_session_maker.assert_not_called()
+        # Ownership reconciliation still consults the DB, but the expensive
+        # timelapse scan remains one-shot.
+        mock_session_maker.assert_called_once()
         mock_list.assert_not_called()
 
     # Original baseline preserved.
@@ -137,7 +140,7 @@ async def test_running_observed_skips_when_printer_row_missing():
 
     with (
         patch("backend.app.main.async_session") as mock_session_maker,
-        patch("backend.app.main._list_timelapse_videos", new=AsyncMock()) as mock_list,
+        patch("backend.app.main._read_timelapse_baseline", new=AsyncMock()) as mock_list,
     ):
         mock_session_maker.return_value = mock_session
 

@@ -2,6 +2,8 @@ from datetime import datetime
 
 from pydantic import BaseModel, field_validator
 
+from backend.app.schemas.not_null import IgnoresNullForRequiredColumns
+
 
 def _validate_project_url(value: str | None) -> str | None:
     """Reject anything that isn't an http(s) URL — the URL is rendered as a
@@ -41,8 +43,10 @@ class ProjectCreate(BaseModel):
         return _validate_project_url(v)
 
 
-class ProjectUpdate(BaseModel):
+class ProjectUpdate(IgnoresNullForRequiredColumns):
     """Schema for updating a project."""
+
+    __orm_table__ = "projects"
 
     name: str | None = None
     description: str | None = None
@@ -82,6 +86,7 @@ class ProjectStats(BaseModel):
     estimated_cost: float = 0.0  # Based on filament cost
     total_energy_kwh: float = 0.0
     total_energy_cost: float = 0.0
+    total_wear_cost: float = 0.0  # Printer wear (#694)
     remaining_prints: int | None = None  # target_count - total_archives
     remaining_parts: int | None = None  # target_parts_count - completed_prints
     # BOM stats (Phase 7)
@@ -91,13 +96,24 @@ class ProjectStats(BaseModel):
 
 
 class ProjectChildPreview(BaseModel):
-    """Minimal project data for child preview."""
+    """A sub-project as listed on its parent's page.
+
+    The figures cover the child's *own* subtree, not just its own prints, so
+    the listed rows add up to the parent's roll-up minus the parent's own
+    prints (#1264).
+    """
 
     id: int
     name: str
     color: str | None
     status: str
     progress_percent: float | None = None
+    descendant_count: int = 0  # Sub-projects nested under this one, at any depth
+    total_archives: int = 0
+    completed_prints: int = 0
+    total_print_time_hours: float = 0.0
+    total_filament_grams: float = 0.0
+    total_cost: float = 0.0  # Filament + energy + BOM, matching the parent's cost card
 
 
 class ProjectResponse(BaseModel):
@@ -122,9 +138,13 @@ class ProjectResponse(BaseModel):
     parent_id: int | None = None
     parent_name: str | None = None  # For display
     children: list[ProjectChildPreview] = []
+    descendant_count: int = 0  # Sub-projects at any depth beneath this one (#1264)
     created_at: datetime
     updated_at: datetime
     stats: ProjectStats | None = None
+    # This project's numbers combined with every sub-project's. Null when there
+    # are none, since it would only repeat ``stats`` (#1264).
+    rollup_stats: ProjectStats | None = None
     url: str | None = None
     cover_image_filename: str | None = None
 
@@ -177,6 +197,10 @@ class ProjectListResponse(BaseModel):
     failed_count: int = 0  # Sum of quantities for failed prints
     queue_count: int = 0
     progress_percent: float | None = None
+    # Nesting (#1264) — the grid needs both to tell a sub-project apart from a
+    # top-level one without fetching every project's detail.
+    parent_id: int | None = None
+    child_count: int = 0  # Direct sub-projects only
     # Preview of archives (up to 5)
     archives: list[ArchivePreview] = []
     # #1155: card-level metadata
@@ -212,8 +236,10 @@ class BOMItemCreate(BaseModel):
     remarks: str | None = None
 
 
-class BOMItemUpdate(BaseModel):
+class BOMItemUpdate(IgnoresNullForRequiredColumns):
     """Schema for updating a BOM item."""
+
+    __orm_table__ = "project_bom_items"
 
     name: str | None = None
     quantity_needed: int | None = None
@@ -276,25 +302,6 @@ class LinkedFolderExport(BaseModel):
     """Schema for exporting a linked library folder."""
 
     name: str
-
-
-class ProjectExport(BaseModel):
-    """Schema for exporting a project."""
-
-    name: str
-    description: str | None
-    color: str | None
-    status: str
-    target_count: int | None
-    target_parts_count: int | None
-    target_sets: int | None = None
-    notes: str | None
-    tags: str | None
-    due_date: datetime | None
-    priority: str
-    budget: float | None
-    bom_items: list[BOMItemExport] = []
-    linked_folders: list[LinkedFolderExport] = []
 
 
 class ProjectImport(BaseModel):

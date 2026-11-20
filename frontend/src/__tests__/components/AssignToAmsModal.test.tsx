@@ -4,7 +4,7 @@
  */
 
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { fireEvent, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { render } from '../utils';
 
@@ -12,9 +12,11 @@ vi.mock('../../api/client', () => ({
   api: {
     getPrinterStatus: vi.fn(),
     getPrinter: vi.fn(),
+    getPrinters: vi.fn(),
     getSettings: vi.fn().mockResolvedValue({}),
     assignSpool: vi.fn(),
     assignSpoolmanSlot: vi.fn(),
+    updateSpool: vi.fn(),
     getAuthStatus: vi.fn().mockResolvedValue({ auth_enabled: false }),
     getAssignments: vi.fn().mockResolvedValue([]),
     getSpoolmanSlotAssignments: vi.fn().mockResolvedValue([]),
@@ -23,6 +25,7 @@ vi.mock('../../api/client', () => ({
 
 import { AssignToAmsModal } from '../../components/spoolbuddy/AssignToAmsModal';
 import { api } from '../../api/client';
+import { __resetColorCatalogForTests, setColorCatalog } from '../../utils/colors';
 
 const SPOOL = {
   id: 42,
@@ -88,10 +91,15 @@ const PRINTER_STATUS_ONLINE = {
 describe('AssignToAmsModal', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    __resetColorCatalogForTests();
     vi.mocked(api.getPrinterStatus).mockResolvedValue(PRINTER_STATUS_ONLINE as never);
     vi.mocked(api.getPrinter).mockResolvedValue({ id: 1, name: 'Test Printer' } as never);
+    vi.mocked(api.getPrinters).mockResolvedValue([
+      { id: 7, name: 'Farm Printer 7', is_active: true },
+    ] as never);
     vi.mocked(api.assignSpool).mockResolvedValue({} as never);
     vi.mocked(api.assignSpoolmanSlot).mockResolvedValue({} as never);
+    vi.mocked(api.updateSpool).mockResolvedValue({} as never);
   });
 
   it('renders modal when open', async () => {
@@ -110,6 +118,45 @@ describe('AssignToAmsModal', () => {
     });
   });
 
+  it('moves focus into the dialog and traps Tab navigation', async () => {
+    render(
+      <>
+        <button data-testid="outside-control">Outside</button>
+        <AssignToAmsModal
+          isOpen={true}
+          onClose={vi.fn()}
+          spool={SPOOL as never}
+          printerId={1}
+          variant="dialog"
+          spoolmanMode={false}
+        />
+      </>
+    );
+
+    const dialog = await screen.findByRole('dialog');
+    await waitFor(() => expect(dialog).toContainElement(document.activeElement as HTMLElement));
+
+    const focusable = Array.from(dialog.querySelectorAll<HTMLElement>(
+      'button:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    ));
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    expect(first).toBeTruthy();
+    expect(last).toBeTruthy();
+
+    last.focus();
+    fireEvent.keyDown(document, { key: 'Tab' });
+    expect(document.activeElement).toBe(first);
+
+    first.focus();
+    fireEvent.keyDown(document, { key: 'Tab', shiftKey: true });
+    expect(document.activeElement).toBe(last);
+
+    screen.getByTestId('outside-control').focus();
+    fireEvent.keyDown(document, { key: 'Tab' });
+    expect(document.activeElement).toBe(first);
+  });
+
   it('renders nothing when closed', () => {
     render(
       <AssignToAmsModal
@@ -122,6 +169,202 @@ describe('AssignToAmsModal', () => {
     );
 
     expect(screen.queryByText(/Assign.*to AMS/i)).not.toBeInTheDocument();
+  });
+
+  it('selects a printer and requires explicit slot confirmation in the inventory flow (#2978)', async () => {
+    const user = userEvent.setup();
+    render(
+      <AssignToAmsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        spool={SPOOL as never}
+        printerId={null}
+        spoolmanMode={false}
+      />
+    );
+
+    const printerSelect = await screen.findByLabelText(/select printer/i);
+    await screen.findByRole('option', { name: 'Farm Printer 7' });
+    await user.selectOptions(printerSelect, '7');
+
+    await waitFor(() => {
+      expect(screen.queryAllByTestId('ams-slot').length).toBeGreaterThan(0);
+    });
+
+    const slotButtons = screen.queryAllByTestId('ams-slot');
+    expect(slotButtons[0]).toHaveAccessibleName('AMS A Slot 1');
+    await user.click(slotButtons[0]);
+    expect(api.assignSpool).not.toHaveBeenCalled();
+
+    await user.click(screen.getByRole('button', { name: /assign spool/i }));
+    await waitFor(() => {
+      expect(api.assignSpool).toHaveBeenCalledWith(
+        expect.objectContaining({ spool_id: 42, printer_id: 7, ams_id: 0, tray_id: 0 })
+      );
+    });
+  });
+
+  it.each([
+    {
+      caseName: 'missing colour name resolved from the catalog',
+      spool: { color_name: null, rgba: '00AE42FF' },
+      catalog: { '00ae42': 'Bambu Green' },
+    },
+    {
+      caseName: 'stored Bambu colour code',
+      spool: { color_name: 'A1-B2', rgba: 'FF00AAFF' },
+      catalog: {},
+    },
+  ])('does not rewrite $caseName when assigning without a colour edit', async ({ spool, catalog }) => {
+    const user = userEvent.setup();
+    setColorCatalog(catalog);
+
+    render(
+      <AssignToAmsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        spool={{ ...SPOOL, ...spool } as never}
+        printerId={null}
+        spoolmanMode={false}
+      />
+    );
+
+    const printerSelect = await screen.findByLabelText(/select printer/i);
+    await screen.findByRole('option', { name: 'Farm Printer 7' });
+    await user.selectOptions(printerSelect, '7');
+    await waitFor(() => {
+      expect(screen.queryAllByTestId('ams-slot').length).toBeGreaterThan(0);
+    });
+
+    await user.click(screen.queryAllByTestId('ams-slot')[0]);
+    await user.click(screen.getByRole('button', { name: /assign spool/i }));
+
+    await waitFor(() => expect(api.assignSpool).toHaveBeenCalled());
+    expect(api.updateSpool).not.toHaveBeenCalled();
+  });
+
+  it('keeps the kiosk layout full-screen while selecting a printer', async () => {
+    render(
+      <AssignToAmsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        spool={SPOOL as never}
+        printerId={null}
+        variant="kiosk"
+        spoolmanMode={false}
+      />
+    );
+
+    const dialog = await screen.findByRole('dialog');
+    expect(dialog).toHaveClass('w-full', 'h-full');
+    expect(dialog).not.toHaveClass('max-w-3xl', 'max-w-5xl');
+    expect(await screen.findByLabelText(/select printer/i)).toBeInTheDocument();
+    expect(screen.queryByLabelText(/color name/i)).not.toBeInTheDocument();
+  });
+
+  it('names the spool by Bambuddy\'s catalog-resolved colour in the header (#3090)', async () => {
+    setColorCatalog({ d02727: 'Candy Red' });
+
+    render(
+      <AssignToAmsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        spool={{
+          ...SPOOL,
+          color_name: 'Silk+',
+          color_name_is_synthesized: true,
+          rgba: 'D02727FF',
+        } as never}
+        printerId={null}
+        spoolmanMode={false}
+      />
+    );
+
+    expect((await screen.findAllByText(/Candy Red/)).length).toBeGreaterThan(0);
+    expect(screen.queryByText(/Silk\+/)).toBeNull();
+  });
+
+  it('labels and assigns the left external slot correctly on dual-nozzle printers', async () => {
+    const user = userEvent.setup();
+    vi.mocked(api.getPrinter).mockResolvedValue({
+      id: 7,
+      name: 'Farm Printer 7',
+      nozzle_count: 2,
+    } as never);
+    vi.mocked(api.getPrinterStatus).mockResolvedValue({
+      ...PRINTER_STATUS_ONLINE,
+      ams: [],
+      vt_tray: [
+        { id: 254, ...BLANK_TRAY },
+        { id: 255, ...BLANK_TRAY },
+      ],
+    } as never);
+
+    render(
+      <AssignToAmsModal
+        isOpen={true}
+        onClose={vi.fn()}
+        spool={SPOOL as never}
+        printerId={null}
+        spoolmanMode={false}
+      />
+    );
+
+    const printerSelect = await screen.findByLabelText(/select printer/i);
+    await screen.findByRole('option', { name: 'Farm Printer 7' });
+    await user.selectOptions(printerSelect, '7');
+
+    const leftExternalSlot = await screen.findByTitle('Ext-L');
+    await user.click(leftExternalSlot);
+    expect(screen.getAllByText('Ext-L').length).toBeGreaterThan(0);
+
+    await user.click(screen.getByRole('button', { name: /assign spool/i }));
+    await waitFor(() => {
+      expect(api.assignSpool).toHaveBeenCalledWith(
+        expect.objectContaining({ printer_id: 7, ams_id: 255, tray_id: 0 })
+      );
+    });
+  });
+
+  describe('fill levels by inventory mode (#3430)', () => {
+    const loaded = {
+      ...PRINTER_STATUS_ONLINE,
+      ams: [
+        {
+          ...PRINTER_STATUS_ONLINE.ams[0],
+          tray: [
+            { id: 0, ...BLANK_TRAY, tray_type: 'PLA', tray_color: 'FF0000FF', remain: 100 },
+            { id: 1, ...BLANK_TRAY },
+            { id: 2, ...BLANK_TRAY },
+            { id: 3, ...BLANK_TRAY },
+          ],
+        },
+      ],
+    };
+    // A built-in row for slot 0 at 10 % left; the AMS itself reports 100 %.
+    const keptRow = [
+      { id: 1, spool_id: 42, printer_id: 1, ams_id: 0, tray_id: 0, spool: { label_weight: 1000, weight_used: 900 } },
+    ];
+
+    async function fillWidths(spoolmanMode: boolean) {
+      vi.mocked(api.getPrinterStatus).mockResolvedValue(loaded as never);
+      vi.mocked(api.getAssignments).mockResolvedValue(keptRow as never);
+      const { container } = render(
+        <AssignToAmsModal isOpen onClose={() => {}} spool={SPOOL as never} printerId={1} spoolmanMode={spoolmanMode} />,
+      );
+      await waitFor(() => expect(container.querySelector('[style*="width"]')).not.toBeNull());
+      await waitFor(() => expect(api.getAssignments).toHaveBeenCalled());
+      await new Promise((r) => setTimeout(r, 20));
+      return [...container.querySelectorAll<HTMLElement>('[style*="width"]')].map((el) => el.style.width);
+    }
+
+    it('Spoolman mode ignores a kept built-in row', async () => {
+      expect(await fillWidths(true)).toContain('100%');
+    });
+
+    it('built-in mode uses it', async () => {
+      expect(await fillWidths(false)).toContain('10%');
+    });
   });
 
   describe('API routing based on spoolmanMode', () => {
@@ -138,11 +381,11 @@ describe('AssignToAmsModal', () => {
       );
 
       await waitFor(() => {
-        expect(screen.queryAllByTitle(/AMS Slot/i).length).toBeGreaterThan(0);
+        expect(screen.queryAllByTestId('ams-slot').length).toBeGreaterThan(0);
       });
 
       // Click first available slot button
-      const slotButtons = screen.queryAllByTitle(/AMS Slot/i);
+      const slotButtons = screen.queryAllByTestId('ams-slot');
       await user.click(slotButtons[0]);
       await waitFor(() => {
         expect(api.assignSpool).toHaveBeenCalledWith(
@@ -165,10 +408,10 @@ describe('AssignToAmsModal', () => {
       );
 
       await waitFor(() => {
-        expect(screen.queryAllByTitle(/AMS Slot/i).length).toBeGreaterThan(0);
+        expect(screen.queryAllByTestId('ams-slot').length).toBeGreaterThan(0);
       });
 
-      const slotButtons = screen.queryAllByTitle(/AMS Slot/i);
+      const slotButtons = screen.queryAllByTestId('ams-slot');
       await user.click(slotButtons[0]);
       await waitFor(() => {
         expect(api.assignSpoolmanSlot).toHaveBeenCalledWith(
@@ -195,10 +438,10 @@ describe('AssignToAmsModal', () => {
       );
 
       await waitFor(() => {
-        expect(screen.queryAllByTitle(/AMS Slot/i).length).toBeGreaterThan(0);
+        expect(screen.queryAllByTestId('ams-slot').length).toBeGreaterThan(0);
       });
 
-      const slotButtons = screen.queryAllByTitle(/AMS Slot/i);
+      const slotButtons = screen.queryAllByTestId('ams-slot');
       await user.click(slotButtons[0]);
       await waitFor(() => {
         expect(api.assignSpoolmanSlot).toHaveBeenCalledWith(
@@ -245,6 +488,52 @@ describe('AssignToAmsModal', () => {
 
       await waitFor(() => {
         expect(container.querySelector('.ring-bambu-green')).toBeInTheDocument();
+      });
+    });
+  });
+
+  describe('on the H3C (AMS 3H unit 32, nine per-hotend external inputs)', () => {
+    const H3C_STATUS = {
+      ...PRINTER_STATUS_ONLINE,
+      ams: [{
+        ...PRINTER_STATUS_ONLINE.ams[0],
+        id: 32,
+        ams_type: 6,
+        module_type: 'n10a',
+        tray: Array.from({ length: 9 }, (_, k) => ({ id: k, ...BLANK_TRAY })),
+      }],
+      vt_tray: Array.from({ length: 9 }, (_, k) => ({ id: 247 + k, ...BLANK_TRAY })),
+      ams_extruder_map: {},
+    };
+
+    beforeEach(() => {
+      vi.mocked(api.getPrinterStatus).mockResolvedValue(H3C_STATUS as never);
+    });
+
+    it('assigns to an AMS 3H slot by its unit 32 and slot', async () => {
+      const user = userEvent.setup();
+      render(<AssignToAmsModal isOpen={true} onClose={vi.fn()} spool={SPOOL as never} printerId={1} spoolmanMode={false} />);
+
+      await waitFor(() => expect(screen.queryAllByTestId('ams-slot')).toHaveLength(9));
+      await user.click(screen.getByRole('button', { name: 'AMS 3H Slot 9' }));
+
+      await waitFor(() => {
+        expect(api.assignSpool).toHaveBeenCalledWith(expect.objectContaining({ printer_id: 1, ams_id: 32, tray_id: 8 }));
+      });
+    });
+
+    it('names the external inputs Ext-1..Ext-9 and stores them under ams_id 255', async () => {
+      const user = userEvent.setup();
+      render(<AssignToAmsModal isOpen={true} onClose={vi.fn()} spool={SPOOL as never} printerId={1} spoolmanMode={false} />);
+
+      // Input 250 feeds hotend 5: "Ext-6", stored as (255, 5).
+      const ext6 = await screen.findByTitle('Ext-6');
+      for (let n = 1; n <= 9; n++) expect(screen.getByTitle(`Ext-${n}`)).toBeInTheDocument();
+      expect(screen.queryByText('Ext-L')).not.toBeInTheDocument();
+      await user.click(ext6);
+
+      await waitFor(() => {
+        expect(api.assignSpool).toHaveBeenCalledWith(expect.objectContaining({ printer_id: 1, ams_id: 255, tray_id: 5 }));
       });
     });
   });

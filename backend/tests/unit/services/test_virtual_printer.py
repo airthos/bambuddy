@@ -5,8 +5,10 @@ Tests the virtual printer manager, FTP server, and SSDP server components.
 
 import asyncio
 import json
+import shutil
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -38,6 +40,12 @@ def _write_3mf_with_filaments(file_path: Path, filaments: list[dict], plate_inde
 
 class TestVirtualPrinterInstance:
     """Tests for VirtualPrinterInstance class."""
+
+    @pytest.fixture(autouse=True)
+    def _no_queue_announcement(self):
+        """Its own query would take a result the session mocks hold for the test."""
+        with patch("backend.app.services.queue_announcements.announce_queue_jobs_added", AsyncMock()):
+            yield
 
     @pytest.fixture
     def instance(self, tmp_path):
@@ -143,6 +151,18 @@ class TestVirtualPrinterInstance:
         status = instance.get_status()
         assert status["running"] is False
         assert status["pending_files"] == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("handler", ["_archive_file", "_queue_file", "_add_to_print_queue"])
+    async def test_a_file_that_cannot_be_handled_leaves_the_pending_count(self, instance, handler):
+        """Without a database the file is dropped, and the status stops counting it."""
+        file_path = Path("/tmp/test.3mf")  # nosec B108
+        instance._session_factory = None
+        instance._pending_files = {file_path.name: file_path}
+
+        await getattr(instance, handler)(file_path, "192.168.1.100")
+
+        assert instance.get_status()["pending_files"] == 0
 
     # ========================================================================
     # Tests for file handling
@@ -1736,6 +1756,8 @@ class TestVirtualPrinterInstance:
         mock_session_factory.return_value = mock_session_ctx
 
         inst = VirtualPrinterInstance(
+            # The slicer's nozzle positions are kept only for a VP bound to one printer.
+            target_printer_id=7,
             vp_id=42,
             name="H2CRack",
             mode="queue",
@@ -2300,6 +2322,8 @@ class TestVirtualPrinterInstance:
         mock_session_factory.return_value = mock_session_ctx
 
         inst = VirtualPrinterInstance(
+            # The slicer's nozzle positions are kept only for a VP bound to one printer.
+            target_printer_id=7,
             vp_id=44,
             name="H2CMultiPlate",
             mode="queue",
@@ -2379,7 +2403,7 @@ class TestVirtualPrinterInstance:
         position_max_result = MagicMock()
         position_max_result.scalar = MagicMock(return_value=None)
         select_pending_result = MagicMock()
-        select_pending_result.all = MagicMock(return_value=[(101,)])
+        select_pending_result.all = MagicMock(return_value=[(101, None, None)])
         update_result = MagicMock()
         mock_db.execute = AsyncMock(side_effect=[position_max_result, select_pending_result, update_result])
 
@@ -2390,6 +2414,8 @@ class TestVirtualPrinterInstance:
         mock_session_factory.return_value = mock_session_ctx
 
         inst = VirtualPrinterInstance(
+            # The slicer's nozzle positions are kept only for a VP bound to one printer.
+            target_printer_id=7,
             vp_id=99,
             name="LateMQTT",
             mode="queue",
@@ -2490,7 +2516,7 @@ class TestVirtualPrinterInstance:
         position_max_result.scalar = MagicMock(return_value=None)
         select_pending_result = MagicMock()
         # (queue_item_id, archive_id) — matches the id set by db.add above.
-        select_pending_result.all = MagicMock(return_value=[(101, 55)])
+        select_pending_result.all = MagicMock(return_value=[(101, 55, None)])
         update_result = MagicMock()
         select_archives_result = MagicMock()
         select_archives_result.scalars = MagicMock(
@@ -2589,7 +2615,7 @@ class TestVirtualPrinterInstance:
         position_max_result = MagicMock()
         position_max_result.scalar = MagicMock(return_value=None)
         select_pending_result = MagicMock()
-        select_pending_result.all = MagicMock(return_value=[(201, 65)])
+        select_pending_result.all = MagicMock(return_value=[(201, 65, None)])
         update_result = MagicMock()
         # No 4th execute() expected — the archive patch must be skipped
         # entirely, so only 3 calls should ever happen.
@@ -2685,7 +2711,7 @@ class TestVirtualPrinterInstance:
         position_max_result = MagicMock()
         position_max_result.scalar = MagicMock(return_value=None)
         select_pending_result = MagicMock()
-        select_pending_result.all = MagicMock(return_value=[(301, 75)])
+        select_pending_result.all = MagicMock(return_value=[(301, 75, None)])
         update_result = MagicMock()
         select_archives_result = MagicMock()
         select_archives_result.scalars = MagicMock(
@@ -2780,7 +2806,7 @@ class TestVirtualPrinterInstance:
         position_max_result = MagicMock()
         position_max_result.scalar = MagicMock(return_value=None)
         select_pending_result = MagicMock()
-        select_pending_result.all = MagicMock(return_value=[(401, 85)])
+        select_pending_result.all = MagicMock(return_value=[(401, 85, None)])
         update_result = MagicMock()
         # No 4th execute(): with nothing to save there is no archive SELECT.
         mock_db.execute = AsyncMock(side_effect=[position_max_result, select_pending_result, update_result])
@@ -2867,7 +2893,7 @@ class TestVirtualPrinterInstance:
         position_max_result = MagicMock()
         position_max_result.scalar = MagicMock(return_value=None)
         select_pending_result = MagicMock()
-        select_pending_result.all = MagicMock(return_value=[(301,)])
+        select_pending_result.all = MagicMock(return_value=[(301, None, None)])
         update_result = MagicMock()
         mock_db.execute = AsyncMock(side_effect=[position_max_result, select_pending_result, update_result])
 
@@ -2878,6 +2904,8 @@ class TestVirtualPrinterInstance:
         mock_session_factory.return_value = mock_session_ctx
 
         inst = VirtualPrinterInstance(
+            # The slicer's nozzle positions are kept only for a VP bound to one printer.
+            target_printer_id=7,
             vp_id=96,
             name="RaceCommitYield",
             mode="queue",
@@ -2970,6 +2998,8 @@ class TestVirtualPrinterInstance:
         mock_session_factory.return_value = mock_session_ctx
 
         inst = VirtualPrinterInstance(
+            # The slicer's nozzle positions are kept only for a VP bound to one printer.
+            target_printer_id=7,
             vp_id=98,
             name="LateMQTTDispatched",
             mode="queue",
@@ -3162,27 +3192,6 @@ class TestVirtualPrinterManager:
         assert status["model"] == "C11"
         assert status["model_name"] == "P1P"
         assert status["pending_files"] == 1
-
-    def test_manager_get_all_status(self, manager, tmp_path):
-        """Verify get_all_status returns status for all instances."""
-        from backend.app.services.virtual_printer.manager import VirtualPrinterInstance
-
-        for i in range(1, 3):
-            inst = VirtualPrinterInstance(
-                vp_id=i,
-                name=f"VP{i}",
-                mode="archive",
-                model="C11",
-                access_code="12345678",
-                serial_suffix=f"39180000{i}",
-                base_dir=tmp_path,
-            )
-            manager._instances[i] = inst
-
-        statuses = manager.get_all_status()
-        assert len(statuses) == 2
-        assert statuses[0]["name"] == "VP1"
-        assert statuses[1]["name"] == "VP2"
 
     @pytest.mark.asyncio
     async def test_manager_stop_all(self, manager, tmp_path):
@@ -3413,7 +3422,6 @@ class TestVirtualPrinterManager:
             model="C11",
             access_code="12345678",
             serial_suffix="391800001",
-            tailscale_disabled=False,
             base_dir=tmp_path,
         )
         inst.stop_server = AsyncMock()
@@ -3452,6 +3460,134 @@ class TestVirtualPrinterManager:
         manager._instances[1] = inst
 
         db_vp = self._make_db_vp(gcode_injection=False)
+        self._setup_sync_mocks(manager, [db_vp], tmp_path)
+
+        with patch.object(manager, "remove_instance", new_callable=AsyncMock) as mock_remove:
+            with patch("backend.app.services.virtual_printer.manager.VirtualPrinterInstance") as MockInst:
+                mock_new = MagicMock()
+                mock_new.start_server = AsyncMock()
+                MockInst.return_value = mock_new
+
+                await manager.sync_from_db()
+
+            mock_remove.assert_called_once_with(1)
+
+    def _setup_proxy_sync_mocks(
+        self, manager, enabled_vps, tmp_path, printer_ip="192.168.1.50", serial="0948AB012345678"
+    ):
+        """Like _setup_sync_mocks, but the target printer lookup returns a real IP and serial."""
+        vps_result = MagicMock()
+        vps_result.scalars.return_value.all.return_value = enabled_vps
+        printer_result = MagicMock()
+        printer_result.scalar_one_or_none.return_value = SimpleNamespace(ip_address=printer_ip, serial_number=serial)
+
+        async def execute(stmt):
+            entity = stmt.column_descriptions[0]["entity"]
+            return printer_result if entity.__name__ == "Printer" else vps_result
+
+        mock_db = AsyncMock()
+        mock_db.execute = AsyncMock(side_effect=execute)
+        mock_db.__aenter__ = AsyncMock(return_value=mock_db)
+        mock_db.__aexit__ = AsyncMock(return_value=False)
+
+        manager._session_factory = MagicMock(return_value=mock_db)
+        manager._base_dir = tmp_path
+
+    @pytest.mark.asyncio
+    async def test_sync_from_db_leaves_a_running_proxy_vp_alone(self, manager, tmp_path):
+        """A proxy VP that sync started must survive the next sync unchanged.
+
+        The proxy branch built its instance without the row's target printer
+        id, so every later sync saw a change and restarted every proxy VP,
+        dropping the slicer's connection, whenever any VP or printer was saved.
+        The queue-mode toggles are set away from their defaults, as on a VP
+        switched from queue mode to proxy, which keeps them in its row.
+        """
+        from backend.app.services.virtual_printer.manager import VirtualPrinterInstance
+
+        db_vp = self._make_db_vp(
+            mode="proxy",
+            model="O1D",
+            target_printer_id=7,
+            bind_ip="10.0.0.5",
+            auto_dispatch=False,
+            queue_force_color_match=True,
+            save_ams_mapping=True,
+            gcode_injection=True,
+        )
+        self._setup_proxy_sync_mocks(manager, [db_vp], tmp_path)
+
+        with (
+            patch.object(VirtualPrinterInstance, "start_proxy", new_callable=AsyncMock) as mock_start,
+            patch.object(VirtualPrinterInstance, "stop_proxy", new_callable=AsyncMock) as mock_stop,
+        ):
+            await manager.sync_from_db()
+            assert mock_start.await_count == 1
+            assert manager._instances[1].target_printer_id == 7
+
+            await manager.sync_from_db()
+
+        assert mock_start.await_count == 1
+        mock_stop.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_sync_from_db_restarts_a_proxy_vp_on_target_ip_change(self, manager, tmp_path):
+        from backend.app.services.virtual_printer.manager import VirtualPrinterInstance
+
+        db_vp = self._make_db_vp(mode="proxy", model="O1D", target_printer_id=7, bind_ip="10.0.0.5")
+        self._setup_proxy_sync_mocks(manager, [db_vp], tmp_path)
+
+        with (
+            patch.object(VirtualPrinterInstance, "start_proxy", new_callable=AsyncMock) as mock_start,
+            patch.object(VirtualPrinterInstance, "stop_proxy", new_callable=AsyncMock) as mock_stop,
+        ):
+            await manager.sync_from_db()
+            self._setup_proxy_sync_mocks(manager, [db_vp], tmp_path, printer_ip="192.168.1.77")
+            await manager.sync_from_db()
+
+        mock_stop.assert_awaited_once()
+        assert mock_start.await_count == 2
+        assert manager._instances[1].target_printer_ip == "192.168.1.77"
+
+    @pytest.mark.asyncio
+    async def test_sync_from_db_restarts_a_proxy_vp_on_rename(self, manager, tmp_path):
+        """The name is advertised to the slicer (SSDP, bind), so a rename only
+        reaches the slicer through a restart."""
+        from backend.app.services.virtual_printer.manager import VirtualPrinterInstance
+
+        db_vp = self._make_db_vp(mode="proxy", model="O1D", target_printer_id=7, bind_ip="10.0.0.5")
+        self._setup_proxy_sync_mocks(manager, [db_vp], tmp_path)
+
+        with (
+            patch.object(VirtualPrinterInstance, "start_proxy", new_callable=AsyncMock) as mock_start,
+            patch.object(VirtualPrinterInstance, "stop_proxy", new_callable=AsyncMock) as mock_stop,
+        ):
+            await manager.sync_from_db()
+            db_vp.name = "Workshop H2D"
+            await manager.sync_from_db()
+
+        mock_stop.assert_awaited_once()
+        assert mock_start.await_count == 2
+        assert manager._instances[1].name == "Workshop H2D"
+
+    @pytest.mark.asyncio
+    async def test_sync_from_db_restarts_on_rename(self, manager, tmp_path):
+        """Same for a server-mode VP: the running SSDP and bind servers keep
+        advertising the old name until the instance restarts."""
+        from backend.app.services.virtual_printer.manager import VirtualPrinterInstance
+
+        inst = VirtualPrinterInstance(
+            vp_id=1,
+            name="TestVP",
+            mode="archive",
+            model="C11",
+            access_code="12345678",
+            serial_suffix="391800001",
+            base_dir=tmp_path,
+        )
+        manager._instances[1] = inst
+
+        db_vp = self._make_db_vp(name="Renamed VP")
         self._setup_sync_mocks(manager, [db_vp], tmp_path)
 
         with patch.object(manager, "remove_instance", new_callable=AsyncMock) as mock_remove:
@@ -3741,38 +3877,129 @@ class TestCertificateService:
         key_content = key_path.read_text()
         assert "BEGIN" in key_content and "KEY" in key_content
 
-    def test_certificates_reused_if_exist(self, cert_service):
-        """Verify existing certificates are reused."""
-        # First generation
-        cert_path1, key_path1 = cert_service.generate_certificates()
-        mtime1 = cert_path1.stat().st_mtime
+    # --- CA identity (#3014) ------------------------------------------------
+    #
+    # A slicer trust store is a flat list of certificates, and OpenSSL resolves
+    # an issuer by Subject DN: the first CA whose DN matches is the only one
+    # tried. While every Bambuddy install signed as plain "Virtual Printer CA",
+    # importing the CAs of two instances broke whichever landed second in the
+    # file — with the same generic connection error an unimported CA produces.
 
-        # Second call should reuse (via ensure_certificates)
-        cert_path2, key_path2 = cert_service.ensure_certificates()
-        mtime2 = cert_path2.stat().st_mtime
+    @staticmethod
+    def _install(base, serial):
+        """Build a CertificateService laid out the way the manager lays one out."""
+        from backend.app.services.virtual_printer.certificate import CertificateService
 
-        assert mtime1 == mtime2  # File wasn't regenerated
+        return CertificateService(cert_dir=base / "0", serial=serial, shared_ca_dir=base)
 
-    def test_delete_certificates(self, cert_service):
-        """Verify certificates can be deleted."""
-        cert_service.generate_certificates()
+    @staticmethod
+    def _plant_legacy_ca(ca_dir):
+        """Write a pre-#3014 CA: plain common name, no SubjectKeyIdentifier."""
+        from datetime import datetime, timedelta, timezone
 
-        assert cert_service.cert_path.exists()
-        assert cert_service.key_path.exists()
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID
 
-        cert_service.delete_certificates()
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Virtual Printer CA")])
+        now = datetime.now(timezone.utc)
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now)
+            .not_valid_after(now + timedelta(days=7300))
+            .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+            .sign(key, hashes.SHA256())
+        )
+        ca_dir.mkdir(parents=True, exist_ok=True)
+        (ca_dir / "bbl_ca.key").write_bytes(
+            key.private_bytes(
+                encoding=serialization.Encoding.PEM,
+                format=serialization.PrivateFormat.TraditionalOpenSSL,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        )
+        (ca_dir / "bbl_ca.crt").write_bytes(cert.public_bytes(serialization.Encoding.PEM))
+        return cert
 
-        assert not cert_service.cert_path.exists()
-        assert not cert_service.key_path.exists()
+    def test_ca_common_name_is_unique_per_install(self, tmp_path):
+        """Two installs must not produce CAs that share a Subject DN."""
+        from cryptography import x509
 
-    def test_ensure_creates_if_not_exist(self, cert_service):
-        """Verify ensure_certificates generates if not existing."""
-        assert not cert_service.cert_path.exists()
+        from backend.app.services.virtual_printer.certificate import CA_COMMON_NAME_PREFIX
 
-        cert_path, key_path = cert_service.ensure_certificates()
+        cas = []
+        for name in ("a", "b"):
+            service = self._install(tmp_path / name, "TEST123")
+            service.generate_certificates()
+            cas.append(x509.load_pem_x509_certificate(service.ca_cert_path.read_bytes()))
 
-        assert cert_path.exists()
-        assert key_path.exists()
+        subjects = [ca.subject.rfc4514_string() for ca in cas]
+        assert all(s.startswith(f"CN={CA_COMMON_NAME_PREFIX} ") for s in subjects)
+        assert subjects[0] != subjects[1]
+
+    def test_ca_key_identifier_is_carried_into_the_printer_certificate(self, cert_service):
+        """The CA advertises a key id and the leaf names it as its authority."""
+        from cryptography import x509
+
+        cert_path, _ = cert_service.generate_certificates()
+        leaf = x509.load_pem_x509_certificate(cert_path.read_bytes())
+        ca = x509.load_pem_x509_certificate(cert_service.ca_cert_path.read_bytes())
+
+        ca_skid = ca.extensions.get_extension_for_class(x509.SubjectKeyIdentifier).value
+        leaf_akid = leaf.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier).value
+        assert leaf_akid.key_identifier == ca_skid.digest
+
+    def test_existing_ca_is_reused_and_its_certificate_shape_is_unchanged(self, tmp_path):
+        """An install that already has a CA keeps it — nothing to re-import.
+
+        Its printer certificate also stays exactly as it was: no authority key
+        identifier, because the CA it was signed by advertises none.
+        """
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+
+        planted = self._plant_legacy_ca(tmp_path)
+        service = self._install(tmp_path, "TEST123")
+        cert_path, _ = service.generate_certificates()
+
+        ca = x509.load_pem_x509_certificate(service.ca_cert_path.read_bytes())
+        assert ca.fingerprint(hashes.SHA256()) == planted.fingerprint(hashes.SHA256())
+        assert ca.subject.rfc4514_string() == "CN=Virtual Printer CA"
+
+        leaf = x509.load_pem_x509_certificate(cert_path.read_bytes())
+        with pytest.raises(x509.ExtensionNotFound):
+            leaf.extensions.get_extension_for_class(x509.AuthorityKeyIdentifier)
+
+    @pytest.mark.skipif(shutil.which("openssl") is None, reason="needs the openssl binary")
+    def test_two_installs_verify_from_a_single_trust_store(self, tmp_path):
+        """The reported symptom: both CAs imported, both chains must verify."""
+        import subprocess
+
+        leaves = []
+        bundle = b""
+        for name, serial in (("a", "00M09A391800001"), ("b", "01P00A391800002")):
+            service = self._install(tmp_path / name, serial)
+            cert_path, _ = service.generate_certificates()
+            # The per-VP file is a chain (leaf + CA); OpenSSL reads the leaf first.
+            leaves.append(cert_path)
+            bundle += service.ca_cert_path.read_bytes()
+
+        bundle_path = tmp_path / "trust_store.pem"
+        bundle_path.write_bytes(bundle)
+
+        for leaf in leaves:
+            result = subprocess.run(
+                ["openssl", "verify", "-CAfile", str(bundle_path), str(leaf)],
+                capture_output=True,
+                text=True,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
 
 
 class TestBindServer:
@@ -3986,21 +4213,20 @@ class TestSlicerProxyManager:
         )
 
         # Mock asyncio.create_task and asyncio.gather to prevent actual
-        # server start. Close every coroutine handed to gather — otherwise
-        # the ~110 run_with_logging() coros built inside start() are
-        # garbage-collected unfinalized and surface later as
-        # PytestUnraisableExceptionWarning at random in other tests.
-        async def _close_pending(*coros, **_):
-            for c in coros:
-                if asyncio.iscoroutine(c):
-                    c.close()
+        # server start. Close every coroutine handed to create_task (gather
+        # only sees the stand-in tasks) — otherwise the ~110
+        # run_with_logging() coros built inside start() are garbage-collected
+        # unfinalized and surface later as PytestUnraisableExceptionWarning at
+        # random in other tests.
+        def _close_and_stand_in(coro, **_):
+            coro.close()
+            return MagicMock()
 
         with (
-            patch("asyncio.create_task") as mock_create_task,
-            patch("asyncio.gather", side_effect=_close_pending),
+            patch("asyncio.create_task", side_effect=_close_and_stand_in),
+            patch("asyncio.gather", new=AsyncMock()),
             patch.object(SlicerProxyManager, "_log_activity"),
         ):
-            mock_create_task.return_value = MagicMock()
             await mgr.start()
 
         # FTP, FileTransfer, RTSP should be TCPProxy (transparent)

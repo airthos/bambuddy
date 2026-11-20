@@ -28,8 +28,11 @@ class MappedSpoolFields(TypedDict):
     color_name: str | None
     color_name_is_synthesized: bool
     rgba: str | None
+    extra_colors: str | None
+    effect_type: None
     label_weight: int | None
     core_weight: int | None
+    core_weight_is_inherited: bool
     core_weight_catalog_id: None
     weight_used: float | None
     weight_used_baseline: float | None
@@ -43,6 +46,10 @@ class MappedSpoolFields(TypedDict):
     note: str | None
     added_full: None
     last_used: str | None
+    # Last drying (#2863), stored under the bambu_last_dried_* extra keys.
+    last_dried_at: str | None
+    last_dried_temp: int | None
+    last_dried_hours: float | None
     encode_time: str | None
     tag_uid: str | None
     tray_uuid: str | None
@@ -52,6 +59,14 @@ class MappedSpoolFields(TypedDict):
     created_at: str | None  # None when Spoolman spool has no registered timestamp
     updated_at: str | None
     cost_per_kg: float | None
+    # What prints are charged per kg: the spool's own price, else its
+    # filament's catalogue price (SM-C8). Display only; the form edits
+    # cost_per_kg, so the catalogue price is never written onto the spool.
+    effective_cost_per_kg: float | None
+    # Spoolman's native filament.article_number, surfaced as the internal
+    # material number (#2870). Read-only in Spoolman mode — the number is
+    # filament-level there and maintained in Spoolman itself.
+    material_number: str | None
     storage_location: str | None
     location_id: int | None
     k_profiles: list[Any]
@@ -91,7 +106,10 @@ def assert_safe_spoolman_url(url: str) -> None:
     assert_safe_lan_service_url(url, label="Spoolman URL")
 
 
-_COLOR_HEX_RE = re.compile(r"^[0-9A-Fa-f]{6}$")
+# Six characters, or eight when the filament carries an alpha byte. The write
+# side stores eight only for genuinely translucent spools (#2912); rejecting
+# them here turned every clear spool into neutral grey on read.
+_COLOR_HEX_RE = re.compile(r"^[0-9A-Fa-f]{6}(?:[0-9A-Fa-f]{2})?$")
 _TAG_HEX_RE = re.compile(r"^[0-9A-F]+$")
 
 
@@ -134,6 +152,107 @@ def _safe_optional_float(value: object) -> float | None:
     return None
 
 
+# Used only when Spoolman has no empty-spool weight at any level.
+SPOOLMAN_FALLBACK_TARE = 250.0
+
+
+def spoolman_tare(spool: dict) -> tuple[float, str]:
+    """The empty-spool weight of a Spoolman spool, and where it came from.
+
+    Spoolman resolves the tare as the spool's own ``spool_weight``, then the
+    filament's ``spool_weight``, then the vendor's ``empty_spool_weight``, and
+    its own ``/measure`` endpoint follows that order. Skipping the vendor
+    level made a spool whose tare lives only on its vendor weigh against
+    250 g instead (#3195). Every Spoolman-mode tare in Bambuddy goes through
+    here so the weigh endpoints and the displayed core weight cannot drift
+    apart again.
+
+    Returns ``(grams, source)`` with source one of ``"spool"``,
+    ``"filament"``, ``"vendor"`` or ``"fallback"``. 0 is a real tare, not a
+    missing one; a value that is not a finite number counts as missing.
+    """
+    filament = spool.get("filament") or {}
+    vendor = filament.get("vendor") or {}
+    for source, raw in (
+        ("spool", spool.get("spool_weight")),
+        ("filament", filament.get("spool_weight")),
+        ("vendor", vendor.get("empty_spool_weight")),
+    ):
+        value = _safe_optional_float(raw)
+        if value is not None:
+            return value, source
+    return SPOOLMAN_FALLBACK_TARE, "fallback"
+
+
+def spoolman_net_weight(spool: dict) -> float | None:
+    """The net filament weight of a full Spoolman spool (its label weight).
+
+    Spoolman keeps it on the spool as ``initial_weight`` and falls back to the
+    filament's catalogue ``weight``, so one filament can have spools of
+    different sizes. Reading only the filament made a 250 g spool of a 1000 g
+    filament look four times its size (#3194). Like Spoolman, an
+    ``initial_weight`` of 0 counts as unset.
+
+    Returns None when neither level has a finite number (a bool is not
+    one); the filament's value is otherwise returned as stored, 0 included,
+    so callers keep their own handling of a filament without a weight.
+    """
+    initial = _weight_or_none(spool.get("initial_weight"))
+    if initial is not None and initial > 0:
+        return initial
+    filament = spool.get("filament")
+    return _weight_or_none(filament.get("weight")) if isinstance(filament, dict) else None
+
+
+def _weight_or_none(value: object) -> float | None:
+    # A bool is an int in Python; True must not read as a 1 g spool.
+    return None if isinstance(value, bool) else _safe_optional_float(value)
+
+
+def spoolman_price_to_cost_per_kg(price: object, net_weight: float) -> float | None:
+    """A Spoolman spool price as a price per kilogram.
+
+    Spoolman's ``price`` on a spool is what that spool cost, not a rate; the
+    spool form edits a rate, so the two are converted at the spool's net
+    weight. They agree only for 1000 g spools (#3194). Rounded to 4 places so
+    a round trip through the form doesn't drift by float noise.
+    """
+    value = _safe_optional_float(price)
+    if value is None or net_weight <= 0:
+        return None
+    return round(value * 1000.0 / net_weight, 4)
+
+
+def cost_per_kg_to_spoolman_price(cost_per_kg: float, net_weight: float) -> float:
+    """Inverse of spoolman_price_to_cost_per_kg: the price of a spool of ``net_weight`` grams."""
+    return round(cost_per_kg * net_weight / 1000.0, 4)
+
+
+def spoolman_price_weight(spool: dict) -> float:
+    """The weight a Spoolman spool's price is converted at.
+
+    The spool's exact net weight, not the whole-gram label weight, so a
+    250.7 g spool is not re-priced by a no-op edit. A spool with no usable
+    weight keeps the old 1:1 reading of its price as a per-kg rate.
+    """
+    net = spoolman_net_weight(spool)
+    return net if net is not None and net > 0 else 1000.0
+
+
+def spoolman_cost_per_kg(spool: dict) -> float | None:
+    """The spool form's cost per kg for a Spoolman spool (#3194)."""
+    return spoolman_price_to_cost_per_kg(spool.get("price"), spoolman_price_weight(spool))
+
+
+def _charged_cost_per_kg(spool: dict) -> float | None:
+    """The per-kg rate a print off this spool is charged at, from the same
+    function the charge uses, so the Inventory shows what prints cost."""
+    from backend.app.services.spoolman_tracking import _spool_cost_per_gram
+
+    per_gram = _spool_cost_per_gram(spool)
+    return round(per_gram * 1000.0, 4) if per_gram is not None else None
+
+
 def _extract_extra_str(extra: dict, key: str) -> str:
     """Extract a JSON-encoded string from a Spoolman extra dict.
 
@@ -151,6 +270,88 @@ def _extract_extra_str(extra: dict, key: str) -> str:
         # Tolerate bare-string values written without JSON encoding.
         return raw
     return decoded if isinstance(decoded, str) else ""
+
+
+# Spool.extra key holding the consumed-counter baseline: the value Spoolman's
+# used_weight had when the user last pressed "Reset usage to 0". Displayed
+# consumed is used_weight minus this, which is what internal mode has always
+# done with its own weight_used_baseline column (#1644). See #2906.
+BAMBU_WEIGHT_USED_BASELINE_KEY = "bambu_weight_used_baseline"
+
+
+# Spool.extra keys holding when the spool was last dried, the target °C and the
+# hours the cycle ran (#2863). Written by services/spool_drying.py and the
+# spool update route; an empty string means unknown or cleared.
+BAMBU_LAST_DRIED_AT_KEY = "bambu_last_dried_at"
+BAMBU_LAST_DRIED_TEMP_KEY = "bambu_last_dried_temp"
+BAMBU_LAST_DRIED_HOURS_KEY = "bambu_last_dried_hours"
+
+
+def _extract_extra_float(extra: dict, key: str) -> float | None:
+    """Extract a JSON-encoded number from a Spoolman extra dict.
+
+    Same storage convention as :func:`_extract_extra_str` — Spoolman keeps
+    extra values as JSON text, so 250.0 is stored as ``"250.0"``. Returns
+    ``None`` for missing keys, non-finite values, or anything that does not
+    decode to a number, so the caller can tell "no baseline recorded" from
+    "a baseline of zero".
+    """
+    raw = extra.get(key)
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+        value = float(raw)
+    elif isinstance(raw, str):
+        try:
+            decoded = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return None
+        if isinstance(decoded, str):
+            # Spoolman's extra fields default to field_type "text", which only
+            # accepts values that decode to a str, so numbers written through
+            # it arrive as '"263.0"' rather than '263.0'. Both spellings have
+            # to read back the same, or a baseline written by the reset would
+            # be invisible to the code that subtracts it.
+            try:
+                value = float(decoded)
+            except ValueError:
+                return None
+        elif isinstance(decoded, (int, float)) and not isinstance(decoded, bool):
+            value = float(decoded)
+        else:
+            return None
+    else:
+        return None
+    return value if math.isfinite(value) else None
+
+
+def parse_spoolman_multi_colors(filament: dict) -> list[str]:
+    """Spoolman's ``multi_color_hexes`` as a list of bare 6/8-char hex tokens.
+
+    Spoolman stores the extra stops of a gradient / dual / multi-colour
+    filament here, and writes the field as a comma-separated string in some
+    releases and a list in others -- both shapes are accepted. Tokens keep the
+    case they arrived in and lose any leading ``#``, which is the form
+    ``Spool.extra_colors`` stores and ``parseStops`` on the client expects.
+
+    Shared with the label renderer rather than parsed twice: the two read the
+    same field for the same purpose, and a swatch on a printer card that
+    disagreed with the swatch on the printed label would be worse than either
+    being wrong on its own.
+    """
+    raw = filament.get("multi_color_hexes")
+    if isinstance(raw, str):
+        tokens = raw.split(",")
+    elif isinstance(raw, list):
+        tokens = [str(token) for token in raw]
+    else:
+        return []
+    return [cleaned for token in tokens if (cleaned := token.strip().lstrip("#"))]
+
+
+def _last_dried_temp(extra: dict) -> int | None:
+    value = _extract_extra_float(extra, BAMBU_LAST_DRIED_TEMP_KEY)
+    return int(round(value)) if value is not None and value > 0 else None
 
 
 def _map_spoolman_spool(spool: dict) -> MappedSpoolFields:
@@ -188,6 +389,16 @@ def _map_spoolman_spool(spool: dict) -> MappedSpoolFields:
     _raw_is_hex = bool(_TAG_HEX_RE.match(raw_tag))
     tag_uid = raw_tag if _raw_is_hex and 8 <= len(raw_tag) <= 30 else None
     tray_uuid = raw_tag if _raw_is_hex and len(raw_tag) == 32 else None
+    # Spoolman 0.27+ native tags fill whichever of the two extra.tag left empty,
+    # so a spool linked there shows as tagged here as well.
+    for native in spool.get("tags") or []:
+        uid = str(native.get("uid") or "").upper()
+        if not _TAG_HEX_RE.match(uid):
+            continue
+        if len(uid) == 32:
+            tray_uuid = tray_uuid or uid
+        elif 8 <= len(uid) <= 30:
+            tag_uid = tag_uid or uid
 
     # Subtype = filament name with material prefix stripped
     material: str = (filament.get("material") or "").strip()
@@ -197,12 +408,21 @@ def _map_spoolman_spool(spool: dict) -> MappedSpoolFields:
     else:
         subtype = filament_name or None
 
-    # Colour: validate as 6-char hex; fall back to neutral grey for invalid values
+    # Colour: validate as 6- or 8-char hex; fall back to neutral grey for invalid
+    # values. An 8-char value already carries its alpha, so appending the opaque
+    # byte would push it to ten and lose the translucency it was stored to keep.
     raw_color = (filament.get("color_hex") or "").upper().removeprefix("#")
     color_hex: str = raw_color if _COLOR_HEX_RE.match(raw_color) else "808080"
-    rgba: str = color_hex + "FF"
+    rgba: str = color_hex if len(color_hex) == 8 else color_hex + "FF"
+    # Spoolman carries the extra stops but has no concept of a surface effect
+    # -- its only neighbouring field is `multi_color_direction`, which says how
+    # the stops are laid out, not that the filament is silk or glitter. So a
+    # Spoolman spool can render its gradient and never an effect overlay, and
+    # `effect_type` is pinned to None rather than guessed at.
+    extra_stops = parse_spoolman_multi_colors(filament)
+    extra_colors: str | None = ",".join(extra_stops) if extra_stops else None
 
-    label_weight: int = _safe_int(filament.get("weight"), 1000)
+    label_weight: int = _safe_int(spoolman_net_weight(spool), 1000)
     real_used_weight: float = _safe_float(spool.get("used_weight"), 0.0)
     # Parity with internal mode (#1390): the InventorySpool shape lets the
     # frontend compute `remaining = label_weight - weight_used` and
@@ -213,14 +433,37 @@ def _map_spoolman_spool(spool: dict) -> MappedSpoolFields:
     # When remaining_weight is unset (legacy spools, or filament linked but
     # never primed), fall back to the old behaviour: weight_used =
     # used_weight, baseline = 0.
+    #
+    # A "Reset usage to 0" records the then-current used_weight under
+    # BAMBU_WEIGHT_USED_BASELINE_KEY in spool.extra and touches nothing else,
+    # so displayed consumed is used_weight minus that. It is folded into the
+    # baseline here because the frontend's arithmetic is fixed: it always shows
+    # `weight_used - weight_used_baseline`. The reset used to PATCH Spoolman's
+    # used_weight to 0 instead, and Spoolman recomputes remaining from initial
+    # minus used, so the spool jumped back to full (#2906).
+    # `or 0.0` would collapse None and 0.0, which is the one distinction
+    # _extract_extra_float exists to preserve; spell the absent case out.
+    # Clamp the low end too: the write side already refuses a negative
+    # baseline, and without the same rule here a negative value stored by hand
+    # would be subtracted, inflating the displayed counter. min() below only
+    # bounds the other end.
+    stored = _extract_extra_float(extra, BAMBU_WEIGHT_USED_BASELINE_KEY)
+    stored_baseline = 0.0 if stored is None else max(0.0, stored)
     remaining_raw = spool.get("remaining_weight")
     if remaining_raw is not None:
         remaining_weight: float = _safe_float(remaining_raw, 0.0)
         used_weight: float = max(0.0, float(label_weight) - remaining_weight)
-        weight_used_baseline: float = max(0.0, used_weight - real_used_weight)
+        weight_used_baseline: float = max(0.0, used_weight - real_used_weight + stored_baseline)
     else:
         used_weight = real_used_weight
-        weight_used_baseline = 0.0
+        weight_used_baseline = stored_baseline  # already clamped to >= 0 above
+    # Never let the displayed counter read negative. used_weight can fall below
+    # the baseline after a reset without anyone touching it: the AMS sync
+    # writes remaining_weight from the tray percentage, and Spoolman derives
+    # used_weight from that. The counter then reads 0 until consumption climbs
+    # past the baseline again. Internal mode behaves the same way, and it is
+    # far better than before #2906, when the next sync undid the reset outright.
+    weight_used_baseline = min(weight_used_baseline, used_weight)
 
     # Archived state – Spoolman uses a boolean ``archived`` field
     archived: bool = spool.get("archived", False)
@@ -265,11 +508,16 @@ def _map_spoolman_spool(spool: dict) -> MappedSpoolFields:
         "color_name": color_name,
         "color_name_is_synthesized": color_name_is_synthesized,
         "rgba": rgba,
+        "extra_colors": extra_colors,
+        "effect_type": None,
         "brand": vendor.get("name") or None,
         "label_weight": label_weight,
-        "core_weight": _safe_int(
-            spool.get("spool_weight") if spool.get("spool_weight") is not None else filament.get("spool_weight"), 250
-        ),
+        "core_weight": _safe_int(spoolman_tare(spool)[0], 250),
+        # True when the spool has no spool_weight of its own and core_weight is
+        # the filament type's, the vendor's or the 250 g fallback. The spool form needs it
+        # to copy a spool without dropping an own tare or stamping an
+        # inherited one (#2908).
+        "core_weight_is_inherited": spool.get("spool_weight") is None,
         "core_weight_catalog_id": None,
         "weight_used": used_weight,
         "weight_used_baseline": weight_used_baseline,
@@ -288,6 +536,12 @@ def _map_spoolman_spool(spool: dict) -> MappedSpoolFields:
         "note": spool.get("comment") or None,
         "added_full": None,
         "last_used": spool.get("last_used"),
+        # When the spool was first printed with; the stock forecast spreads
+        # its consumption from here (#3407).
+        "first_used": spool.get("first_used"),
+        "last_dried_at": _extract_extra_str(extra, BAMBU_LAST_DRIED_AT_KEY) or None,
+        "last_dried_temp": _last_dried_temp(extra),
+        "last_dried_hours": _extract_extra_float(extra, BAMBU_LAST_DRIED_HOURS_KEY),
         # encode_time semantics differ: local records NFC write time; Spoolman first_used
         # records first print use — different events; using first_used as best available proxy.
         "encode_time": spool.get("first_used"),
@@ -299,7 +553,15 @@ def _map_spoolman_spool(spool: dict) -> MappedSpoolFields:
         "created_at": created_at,
         # Spoolman has no updated_at field; use registered timestamp as best available proxy
         "updated_at": created_at,
-        "cost_per_kg": _safe_optional_float(spool.get("price")),
+        # Spoolman's spool price is what the whole spool cost (#3194).
+        "cost_per_kg": spoolman_cost_per_kg(spool),
+        "effective_cost_per_kg": _charged_cost_per_kg(spool),
+        # Spoolman's filament.article_number maps 1:1 onto the internal
+        # material number (#2870): both identify the purchasable product.
+        # Trimmed for the same reason the schema validator trims the internal
+        # one — the filter chip builds its options from trimmed values and
+        # matches exactly, so a padded number would list and match nothing.
+        "material_number": ((filament.get("article_number") or "").strip() or None),
         "storage_location": spool.get("location") or None,
         "location_id": None,
         "k_profiles": [],

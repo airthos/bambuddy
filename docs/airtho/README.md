@@ -15,6 +15,7 @@ summary and working conventions. This folder is the depth behind that summary.
 | [`printers.md`](printers.md) | Printer inventory, P1S delta-MQTT quirk |
 | [`features.md`](features.md) | Every custom feature added in this fork, with design rationale |
 | [`fixes.md`](fixes.md) | Every bug fix, root cause, and commit hash |
+| [`upstream-sync.md`](upstream-sync.md) | Upstream merge history, and a full inventory of where the fork differs from upstream |
 | [`known-issues.md`](known-issues.md) | Structural gaps that are known and deliberately not (yet) fixed |
 | [`print-quality-mqtt-calibration.md`](print-quality-mqtt-calibration.md) | Research on MQTT calibration flags vs. purge-line failures |
 | [`ideas-not-implemented.md`](ideas-not-implemented.md) | Ideas discussed/considered but not built, and why |

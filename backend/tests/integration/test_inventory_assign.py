@@ -5,7 +5,7 @@ custom presets) takes priority, with slot reuse and generic fallback as
 lower-priority fallbacks.
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import AsyncClient
@@ -334,6 +334,113 @@ class TestAssignSpoolTrayInfoIdx:
             # Slot's specific preset is reused when spool has no own preset
             assert call_kwargs.kwargs["tray_info_idx"] == "GFA05"
 
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize("slot_generic", ["GFL96", "GFL95"])
+    async def test_no_preset_keeps_a_silk_or_high_speed_generic_on_the_slot(
+        self, async_client: AsyncClient, printer_factory, spool_factory, slot_generic
+    ):
+        """PLA Silk and PLA High Speed joined the generic table (#3273), but the
+        reuse check kept its old set: a slot set to one of them still keeps it
+        for a preset-less PLA spool rather than dropping to Generic PLA."""
+        printer = await printer_factory(name="X1C")
+        spool = await spool_factory(slicer_filament=None, material="PLA")
+
+        mock_client = MagicMock()
+        mock_client.ams_set_filament_setting.return_value = True
+        mock_client.extrusion_cali_sel.return_value = True
+
+        status = _make_mock_status(
+            ams_data=[{"id": 0, "tray": [{"id": 0, "tray_info_idx": slot_generic, "tray_type": "PLA"}]}]
+        )
+
+        with patch("backend.app.services.printer_manager.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = status
+
+            response = await async_client.post(
+                "/api/v1/inventory/assignments",
+                json={"spool_id": spool.id, "printer_id": printer.id, "ams_id": 0, "tray_id": 0},
+            )
+
+            assert response.status_code == 200
+            call_kwargs = mock_client.ams_set_filament_setting.call_args
+            assert call_kwargs.kwargs["tray_info_idx"] == slot_generic
+
+
+class TestSlotReuseRespectsTheSubtype:
+    """A preset-less spool reuses the slot's Bambu filament id when the bare
+    type matches, to keep a calibrated preset. A Silk spool must not inherit a
+    slot that the printer describes as Matte, though."""
+
+    async def _sent_id(self, async_client, printer_factory, spool_factory, subtype, slot_sub_brands):
+        printer = await printer_factory(name="X1C")
+        spool = await spool_factory(slicer_filament=None, material="PLA", subtype=subtype)
+        mock_client = MagicMock()
+        mock_client.ams_set_filament_setting.return_value = True
+        mock_client.extrusion_cali_sel.return_value = True
+        tray = {"id": 0, "tray_info_idx": "GFA01", "tray_type": "PLA", "tray_sub_brands": slot_sub_brands}
+        status = _make_mock_status(ams_data=[{"id": 0, "tray": [tray]}])
+
+        with patch("backend.app.services.printer_manager.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = status
+            response = await async_client.post(
+                "/api/v1/inventory/assignments",
+                json={"spool_id": spool.id, "printer_id": printer.id, "ams_id": 0, "tray_id": 0},
+            )
+
+        assert response.status_code == 200
+        return mock_client.ams_set_filament_setting.call_args.kwargs["tray_info_idx"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_silk_spool_does_not_take_a_matte_slot(self, async_client, printer_factory, spool_factory):
+        sent = await self._sent_id(async_client, printer_factory, spool_factory, "Silk", "PLA Matte")
+
+        assert sent == "GFL96"  # Generic PLA Silk, the spool's own subtype
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_silk_plus_spool_gets_generic_pla_silk(self, async_client, printer_factory, spool_factory):
+        assert await self._sent_id(async_client, printer_factory, spool_factory, "Silk+", "PLA Matte") == "GFL96"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_finish_in_the_material_column_counts(self, async_client, printer_factory, spool_factory):
+        printer = await printer_factory(name="X1C")
+        spool = await spool_factory(slicer_filament=None, material="PLA Silk", subtype=None)
+        mock_client = MagicMock()
+        mock_client.ams_set_filament_setting.return_value = True
+        mock_client.extrusion_cali_sel.return_value = True
+        tray = {"id": 0, "tray_info_idx": "GFA01", "tray_type": "PLA", "tray_sub_brands": "PLA Matte"}
+        status = _make_mock_status(ams_data=[{"id": 0, "tray": [tray]}])
+
+        with patch("backend.app.services.printer_manager.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = status
+            await async_client.post(
+                "/api/v1/inventory/assignments",
+                json={"spool_id": spool.id, "printer_id": printer.id, "ams_id": 0, "tray_id": 0},
+            )
+
+        assert mock_client.ams_set_filament_setting.call_args.kwargs["tray_info_idx"] == "GFL96"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_the_same_subtype_still_reuses_the_slot(self, async_client, printer_factory, spool_factory):
+        assert await self._sent_id(async_client, printer_factory, spool_factory, "Matte", "PLA Matte") == "GFA01"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    @pytest.mark.parametrize(("subtype", "slot_sub_brands"), [(None, "PLA Matte"), ("Silk", ""), ("Silk", "Sunlu PLA")])
+    async def test_without_two_known_subtypes_it_still_reuses(
+        self, async_client, printer_factory, spool_factory, subtype, slot_sub_brands
+    ):
+        sent = await self._sent_id(async_client, printer_factory, spool_factory, subtype, slot_sub_brands)
+
+        assert sent == "GFA01"
+
 
 class TestAssignSpoolPresetMapping:
     """Tests that assign_spool saves the slot preset mapping for correct UI display."""
@@ -379,6 +486,9 @@ class TestAssignSpoolPresetMapping:
         # Must use slicer_filament_name, NOT "PLA Silk" from material+subtype
         assert presets["1"]["preset_name"] == "Bambu PLA Silk"
         assert presets["1"]["preset_id"] == "GFSA05"
+        # The filament id the slot was given goes with it, so the slot card can
+        # tell a later re-configuration from elsewhere (#3216).
+        assert presets["1"]["tray_info_idx"] == "GFA05"
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -398,6 +508,7 @@ class TestAssignSpoolPresetMapping:
             preset_id="GFSA01",
             preset_name="Bambu PLA Matte",
             preset_source="cloud",
+            tray_info_idx="GFA01",
         )
         db_session.add(old_mapping)
         await db_session.commit()
@@ -435,6 +546,8 @@ class TestAssignSpoolPresetMapping:
         # Old "Bambu PLA Matte" must be overwritten
         assert presets["2"]["preset_name"] == "Generic PLA Silk"
         assert presets["2"]["preset_id"] == "GFSL96"
+        # ...and so must the filament id recorded with it (#3216).
+        assert presets["2"]["tray_info_idx"] == "GFL96"
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -759,6 +872,62 @@ class TestAssignSpoolEmptySlotPreConfig:
         await db_session.refresh(pre_assignment)
         assert pre_assignment.fingerprint_type == "PLA"
         assert pre_assignment.fingerprint_color == "FF0000FF"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_the_replay_passes_the_slots_finish(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        """A preset-less Silk spool loaded into a slot reporting Bambu Matte."""
+        from unittest.mock import AsyncMock
+
+        from backend.app.main import on_ams_change
+        from backend.app.models.spool_assignment import SpoolAssignment
+
+        printer = await printer_factory(name="H2D")
+        spool = await spool_factory(slicer_filament=None, material="PLA", subtype="Silk")
+        db_session.add(
+            SpoolAssignment(
+                spool_id=spool.id,
+                printer_id=printer.id,
+                ams_id=2,
+                tray_id=3,
+                fingerprint_color=None,
+                fingerprint_type=None,
+            )
+        )
+        await db_session.commit()
+        tray = {
+            "id": 3,
+            "tray_type": "PLA",
+            "tray_color": "FF0000FF",
+            "state": 11,
+            "tray_info_idx": "GFA01",
+            "tray_sub_brands": "PLA Matte",
+        }
+        ams_data = [{"id": 2, "tray": [tray]}]
+        mock_client = MagicMock()
+        status = _make_mock_status(ams_data=ams_data)
+
+        with (
+            patch("backend.app.main.printer_manager") as mock_pm_main,
+            patch("backend.app.services.printer_manager.printer_manager") as mock_pm_inv,
+            patch("backend.app.main.mqtt_relay") as mock_relay,
+            patch("backend.app.main.ws_manager") as mock_ws,
+        ):
+            mock_pm_main.get_printer.return_value = MagicMock(name="H2D", serial_number="0948BB540200427")
+            mock_pm_main.get_status.return_value = status
+            mock_pm_main.get_client.return_value = mock_client
+            mock_pm_main.get_model.return_value = "H2D"
+            mock_pm_inv.get_client.return_value = mock_client
+            mock_pm_inv.get_status.return_value = status
+            mock_relay.on_ams_change = AsyncMock()
+            mock_ws.send_printer_status = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+
+            await on_ams_change(printer.id, ams_data)
+
+        assert mock_client.ams_set_filament_setting.call_args.kwargs["tray_info_idx"] == "GFL96"
 
     @pytest.mark.asyncio
     @pytest.mark.integration
@@ -1226,6 +1395,221 @@ class TestAssignSpoolEmptyDetection:
         assert body["configured"] is True
 
 
+class TestAssignSpoolPresenceBit:
+    """#3084: the slot the firmware says is full, and the cache says is empty.
+
+    ``apply_tray_exist_bits`` stamps ``state = 9`` on every slot whose
+    ``tray_exist_bits`` bit is 0 and annotates ``exists`` on every slot it
+    looks at — but when the bit comes back it only refreshes ``exists`` and
+    leaves the 9 where it was. Swap a Bambu spool for a non-RFID one and the
+    slot sits at ``exists=True, state=9`` until something configures it.
+
+    Reported on an H2D/H2C AMS-HT: remove the Bambu spool (bits ``f``), insert
+    a third-party one 9 seconds later (bits ``1000f``), then Assign Spool 28
+    seconds after that — and no ``ams_filament_setting`` was published at all.
+    Configure worked, because it publishes unconditionally.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_the_bit_overrules_a_stale_empty_state(
+        self, async_client: AsyncClient, printer_factory, spool_factory
+    ):
+        """exists=True with a leftover state=9 — MQTT must fire."""
+        printer = await printer_factory(name="H2D")
+        spool = await spool_factory(slicer_filament="GFL05", material="PLA")
+
+        mock_client = MagicMock()
+        mock_client.ams_set_filament_setting.return_value = True
+        mock_client.extrusion_cali_sel.return_value = True
+
+        tray_data = {"id": 0, "state": 9, "exists": True, "tray_type": "", "tray_color": "", "tray_info_idx": ""}
+        status = _make_mock_status(ams_data=[{"id": 128, "tray": [tray_data]}])
+
+        with patch("backend.app.services.printer_manager.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = status
+
+            response = await async_client.post(
+                "/api/v1/inventory/assignments",
+                json={"spool_id": spool.id, "printer_id": printer.id, "ams_id": 128, "tray_id": 0},
+            )
+
+        assert response.status_code == 200
+        mock_client.ams_set_filament_setting.assert_called_once()
+        body = response.json()
+        assert body["configured"] is True
+        assert body["pending_config"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_an_empty_bit_does_not_start_suppressing_pushes(
+        self, async_client: AsyncClient, printer_factory, spool_factory
+    ):
+        """The bit overrules the 9 and nothing else.
+
+        Reading it the other way too would be tidier — skip the push firmware
+        is going to drop — but it also means a slot that silently stops
+        configuring on whichever AMS variant we compute the bit position
+        wrong for. The saving is one MQTT message; the failure is the bug
+        this commit is fixing, inverted. So a state that does not say "empty"
+        still publishes, exactly as it did before.
+        """
+        printer = await printer_factory(name="H2D")
+        spool = await spool_factory(slicer_filament="GFL05", material="PLA")
+
+        mock_client = MagicMock()
+        mock_client.ams_set_filament_setting.return_value = True
+        mock_client.extrusion_cali_sel.return_value = True
+
+        tray_data = {"id": 3, "state": 11, "exists": False, "tray_type": "", "tray_color": ""}
+        status = _make_mock_status(ams_data=[{"id": 2, "tray": [tray_data]}])
+
+        with patch("backend.app.services.printer_manager.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = status
+
+            response = await async_client.post(
+                "/api/v1/inventory/assignments",
+                json={"spool_id": spool.id, "printer_id": printer.id, "ams_id": 2, "tray_id": 3},
+            )
+
+        assert response.status_code == 200
+        mock_client.ams_set_filament_setting.assert_called_once()
+        assert response.json()["pending_config"] is False
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_the_pre_assign_workflow_still_skips_a_genuinely_empty_slot(
+        self, async_client: AsyncClient, printer_factory, spool_factory
+    ):
+        """SpoolBuddy weighs a spool and assigns it before it goes in. Bit
+        clear and state 9 agree that the slot is empty, so the push is still
+        deferred to the replay — unchanged."""
+        printer = await printer_factory(name="H2D")
+        spool = await spool_factory(slicer_filament="GFL05", material="PLA")
+
+        mock_client = MagicMock()
+        mock_client.ams_set_filament_setting.return_value = True
+
+        tray_data = {"id": 3, "state": 9, "exists": False, "tray_type": "", "tray_color": ""}
+        status = _make_mock_status(ams_data=[{"id": 2, "tray": [tray_data]}])
+
+        with patch("backend.app.services.printer_manager.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = status
+
+            response = await async_client.post(
+                "/api/v1/inventory/assignments",
+                json={"spool_id": spool.id, "printer_id": printer.id, "ams_id": 2, "tray_id": 3},
+            )
+
+        assert response.status_code == 200
+        mock_client.ams_set_filament_setting.assert_not_called()
+        body = response.json()
+        assert body["configured"] is False
+        assert body["pending_config"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_an_unannotated_tray_still_reads_the_state(
+        self, async_client: AsyncClient, printer_factory, spool_factory
+    ):
+        """No presence bit in the payload → the 9/10 heuristic still decides.
+
+        The external spool's ``vt_tray`` has no bit in the mask, and neither do
+        the hand-built payloads every other test in this file uses.
+        """
+        printer = await printer_factory(name="H2D")
+        spool = await spool_factory(slicer_filament="GFL05", material="PLA")
+
+        mock_client = MagicMock()
+        mock_client.ams_set_filament_setting.return_value = True
+
+        status = _make_mock_status(ams_data=[{"id": 2, "tray": [{"id": 3, "state": 9, "tray_type": ""}]}])
+
+        with patch("backend.app.services.printer_manager.printer_manager") as mock_pm:
+            mock_pm.get_client.return_value = mock_client
+            mock_pm.get_status.return_value = status
+
+            response = await async_client.post(
+                "/api/v1/inventory/assignments",
+                json={"spool_id": spool.id, "printer_id": printer.id, "ams_id": 2, "tray_id": 3},
+            )
+
+        assert response.status_code == 200
+        mock_client.ams_set_filament_setting.assert_not_called()
+        assert response.json()["pending_config"] is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_deferred_config_fires_for_a_spool_the_ams_cannot_name(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        """The pre-assign workflow's half of the same bug.
+
+        A non-RFID spool inserted into a pre-assigned slot brings no
+        ``tray_type`` with it, and the stale 9 kept the replay's "loaded" test
+        false, so the deferred configuration never fired for it either. The
+        presence bit is the only thing in the payload that changed.
+        """
+        from unittest.mock import AsyncMock
+
+        from backend.app.main import on_ams_change
+        from backend.app.models.spool_assignment import SpoolAssignment
+
+        printer = await printer_factory(name="H2D")
+        spool = await spool_factory(slicer_filament="GFL05", material="PLA")
+
+        pre_assignment = SpoolAssignment(
+            spool_id=spool.id,
+            printer_id=printer.id,
+            ams_id=2,
+            tray_id=3,
+            fingerprint_color=None,
+            fingerprint_type=None,
+        )
+        db_session.add(pre_assignment)
+        await db_session.commit()
+
+        ams_data = [{"id": 2, "tray": [{"id": 3, "state": 9, "exists": True, "tray_type": "", "tray_color": ""}]}]
+
+        mock_client = MagicMock()
+        mock_client.ams_set_filament_setting.return_value = True
+        mock_client.extrusion_cali_sel.return_value = True
+
+        status = _make_mock_status(ams_data=ams_data)
+
+        with (
+            patch("backend.app.main.printer_manager") as mock_pm_main,
+            patch("backend.app.services.printer_manager.printer_manager") as mock_pm_inv,
+            patch("backend.app.main.mqtt_relay") as mock_relay,
+            patch("backend.app.main.ws_manager") as mock_ws,
+        ):
+            mock_pm_main.get_printer.return_value = MagicMock(name="H2D", serial_number="0948BB540200427")
+            mock_pm_main.get_status.return_value = status
+            mock_pm_main.get_client.return_value = mock_client
+            mock_pm_main.get_model.return_value = "H2D"
+            mock_pm_inv.get_client.return_value = mock_client
+            mock_pm_inv.get_status.return_value = status
+            mock_relay.on_ams_change = AsyncMock()
+            mock_ws.send_printer_status = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+
+            await on_ams_change(printer.id, ams_data)
+
+        mock_client.ams_set_filament_setting.assert_called_once()
+        call_kwargs = mock_client.ams_set_filament_setting.call_args.kwargs
+        assert call_kwargs["ams_id"] == 2
+        assert call_kwargs["tray_id"] == 3
+        assert call_kwargs["tray_info_idx"] == "GFL05"
+
+        # The assignment is still there — the pass that fires the config is the
+        # same pass that deletes stale ones (#3100).
+        db_session.expunge_all()
+        assert await db_session.get(SpoolAssignment, pre_assignment.id) is not None
+
+
 class TestAssignSpoolPfcnCloudPreset:
     """Assign path for PFCN-prefix cloud presets (#1648).
 
@@ -1358,3 +1742,829 @@ class TestAssignSpoolPfcnCloudPreset:
             # original PFCN (which the slicer needs separately).
             assert call_kwargs.kwargs["tray_info_idx"] == "GFL05"
             assert call_kwargs.kwargs["setting_id"] == "PFCN80e80c1f79db85"
+
+
+def _make_printing_status(ams_data, state="RUNNING"):
+    """Printer status carrying an explicit gcode state for the runout guard."""
+    status = _make_mock_status(ams_data=ams_data)
+    status.state = state
+    return status
+
+
+class TestAutoUnlinkDuringRunout:
+    """A slot that reports empty mid-print is a filament runout, not a spool
+    swap — the spool is still in the AMS, just consumed.
+
+    Unlinking there erased the only record of which spool fed the print, so the
+    completion path had nothing to charge the runout segment to. With AMS
+    filament backup that is the normal course of events, not an edge case.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_cleared_tray_data_keeps_the_assignment_while_printing(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        from unittest.mock import AsyncMock
+
+        from backend.app.main import on_ams_change
+        from backend.app.models.spool_assignment import SpoolAssignment
+
+        printer = await printer_factory(name="H2D")
+        spool = await spool_factory(material="ABS", rgba="616777FF")
+
+        assignment = SpoolAssignment(
+            spool_id=spool.id,
+            printer_id=printer.id,
+            ams_id=0,
+            tray_id=2,
+            fingerprint_color="616777FF",
+            fingerprint_type="ABS",
+        )
+        db_session.add(assignment)
+        await db_session.commit()
+
+        # The firmware clears colour and type when it unloads a spool it just
+        # emptied (state 26 = "not loaded").
+        ams_data = [{"id": 0, "tray": [{"id": 2, "tray_type": "", "tray_color": "", "state": 26}]}]
+
+        with (
+            patch("backend.app.main.printer_manager") as mock_pm_main,
+            patch("backend.app.main.mqtt_relay") as mock_relay,
+            patch("backend.app.main.ws_manager") as mock_ws,
+        ):
+            mock_pm_main.get_printer.return_value = MagicMock(name="H2D", serial_number="0948BB540200427")
+            mock_pm_main.get_status.return_value = _make_printing_status(ams_data)
+            mock_pm_main.get_model.return_value = "H2D"
+            mock_relay.on_ams_change = AsyncMock()
+            mock_ws.send_printer_status = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+
+            await on_ams_change(printer.id, ams_data)
+
+        # on_ams_change committed through its own session — drop this one's
+        # identity map so the assertion reads the database, not a cached row.
+        db_session.expunge_all()
+        remaining = await db_session.get(SpoolAssignment, assignment.id)
+        assert remaining is not None, "runout must not unlink the spool that fed the print"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_cleared_tray_data_still_unlinks_when_idle(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        """Off the print, an emptied slot really does mean the spool is gone --
+        once it has stayed empty for the grace period (#3186)."""
+        from unittest.mock import AsyncMock
+
+        from backend.app.main import on_ams_change
+        from backend.app.models.spool_assignment import SpoolAssignment
+        from backend.app.services import slot_unlink_grace
+
+        printer = await printer_factory(name="H2D")
+        spool = await spool_factory(material="ABS", rgba="616777FF")
+
+        assignment = SpoolAssignment(
+            spool_id=spool.id,
+            printer_id=printer.id,
+            ams_id=0,
+            tray_id=2,
+            fingerprint_color="616777FF",
+            fingerprint_type="ABS",
+        )
+        db_session.add(assignment)
+        await db_session.commit()
+        assignment_id = assignment.id
+
+        ams_data = [{"id": 0, "tray": [{"id": 2, "tray_type": "", "tray_color": "", "state": 26}]}]
+
+        with (
+            patch("backend.app.main.printer_manager") as mock_pm_main,
+            patch("backend.app.main.mqtt_relay") as mock_relay,
+            patch("backend.app.main.ws_manager") as mock_ws,
+        ):
+            mock_pm_main.get_printer.return_value = MagicMock(name="H2D", serial_number="0948BB540200427")
+            mock_pm_main.get_status.return_value = _make_printing_status(ams_data, state="IDLE")
+            mock_pm_main.get_model.return_value = "H2D"
+            mock_relay.on_ams_change = AsyncMock()
+            mock_ws.send_printer_status = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+
+            clock = [1000.0]
+            with patch.object(slot_unlink_grace, "_now", lambda: clock[0]):
+                await on_ams_change(printer.id, ams_data)
+                db_session.expunge_all()
+                assert await db_session.get(SpoolAssignment, assignment_id) is not None
+
+                clock[0] += slot_unlink_grace.GRACE_SECONDS
+                await on_ams_change(printer.id, ams_data)
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolAssignment, assignment_id) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_genuinely_different_filament_still_unlinks_while_printing(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        """The guard is for blank tray data only — a real swap must still
+        reconcile, or the wrong spool gets charged."""
+        from unittest.mock import AsyncMock
+
+        from backend.app.main import on_ams_change
+        from backend.app.models.spool_assignment import SpoolAssignment
+
+        printer = await printer_factory(name="H2D")
+        spool = await spool_factory(material="ABS", rgba="616777FF")
+
+        assignment = SpoolAssignment(
+            spool_id=spool.id,
+            printer_id=printer.id,
+            ams_id=0,
+            tray_id=2,
+            fingerprint_color="616777FF",
+            fingerprint_type="ABS",
+        )
+        db_session.add(assignment)
+        await db_session.commit()
+        assignment_id = assignment.id
+
+        ams_data = [{"id": 0, "tray": [{"id": 2, "tray_type": "PETG", "tray_color": "6EE53CFF", "state": 11}]}]
+
+        with (
+            patch("backend.app.main.printer_manager") as mock_pm_main,
+            patch("backend.app.main.mqtt_relay") as mock_relay,
+            patch("backend.app.main.ws_manager") as mock_ws,
+        ):
+            mock_pm_main.get_printer.return_value = MagicMock(name="H2D", serial_number="0948BB540200427")
+            mock_pm_main.get_status.return_value = _make_printing_status(ams_data)
+            mock_pm_main.get_model.return_value = "H2D"
+            mock_relay.on_ams_change = AsyncMock()
+            mock_ws.send_printer_status = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+
+            await on_ams_change(printer.id, ams_data)
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolAssignment, assignment_id) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_slot_missing_from_ams_data_keeps_the_assignment_while_printing(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        from unittest.mock import AsyncMock
+
+        from backend.app.main import on_ams_change
+        from backend.app.models.spool_assignment import SpoolAssignment
+
+        printer = await printer_factory(name="H2D")
+        spool = await spool_factory(material="ABS", rgba="616777FF")
+
+        assignment = SpoolAssignment(
+            spool_id=spool.id,
+            printer_id=printer.id,
+            ams_id=0,
+            tray_id=2,
+            fingerprint_color="616777FF",
+            fingerprint_type="ABS",
+        )
+        db_session.add(assignment)
+        await db_session.commit()
+        assignment_id = assignment.id
+
+        # Tray 2 dropped out of the payload entirely.
+        ams_data = [{"id": 0, "tray": [{"id": 0, "tray_type": "ABS", "tray_color": "FFFFFFFF", "state": 11}]}]
+
+        with (
+            patch("backend.app.main.printer_manager") as mock_pm_main,
+            patch("backend.app.main.mqtt_relay") as mock_relay,
+            patch("backend.app.main.ws_manager") as mock_ws,
+        ):
+            mock_pm_main.get_printer.return_value = MagicMock(name="H2D", serial_number="0948BB540200427")
+            mock_pm_main.get_status.return_value = _make_printing_status(ams_data)
+            mock_pm_main.get_model.return_value = "H2D"
+            mock_relay.on_ams_change = AsyncMock()
+            mock_ws.send_printer_status = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+
+            await on_ams_change(printer.id, ams_data)
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolAssignment, assignment_id) is not None
+
+
+class TestAutoUnlinkOccupiedSlot:
+    """#3100: six saved assignments deleted across three X1 Carbons.
+
+    Each one had an explicit earlier assignment and then an ``Auto-unlink ...
+    fingerprint mismatch``, and the reporter recovered the mappings from logs
+    because they were gone from the inventory API, not merely hidden. Two
+    shapes, one cause: a slot the presence bit calls occupied while the tray
+    reports nothing about what is in it.
+
+    ``cur=/ fp=BCBCBCFF/PLA spool=8A8F92FF/PLA`` — an established assignment,
+    a blank idle report, and the row deleted. The spool never went anywhere;
+    the AMS simply had nothing to say about a filament it cannot read.
+    """
+
+    @staticmethod
+    async def _run(printer_id, ams_data, status):
+        from unittest.mock import AsyncMock
+
+        from backend.app.main import on_ams_change
+
+        with (
+            patch("backend.app.main.printer_manager") as mock_pm_main,
+            patch("backend.app.main.mqtt_relay") as mock_relay,
+            patch("backend.app.main.ws_manager") as mock_ws,
+        ):
+            mock_pm_main.get_printer.return_value = MagicMock(name="X1C", serial_number="0948BB540200427")
+            mock_pm_main.get_status.return_value = status
+            mock_pm_main.get_model.return_value = "X1C"
+            mock_pm_main.get_client.return_value = None
+            mock_relay.on_ams_change = AsyncMock()
+            mock_ws.send_printer_status = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+
+            await on_ams_change(printer_id, ams_data)
+
+    @staticmethod
+    async def _assignment(db_session, printer, spool):
+        from backend.app.models.spool_assignment import SpoolAssignment
+
+        assignment = SpoolAssignment(
+            spool_id=spool.id,
+            printer_id=printer.id,
+            ams_id=1,
+            tray_id=1,
+            fingerprint_color="BCBCBCFF",
+            fingerprint_type="PLA",
+        )
+        db_session.add(assignment)
+        await db_session.commit()
+        return assignment.id
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_blank_report_from_an_occupied_slot_keeps_the_assignment(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        from backend.app.models.spool_assignment import SpoolAssignment
+
+        printer = await printer_factory(name="X1C")
+        spool = await spool_factory(material="PLA", rgba="8A8F92FF")
+        assignment_id = await self._assignment(db_session, printer, spool)
+
+        ams_data = [{"id": 1, "tray": [{"id": 1, "exists": True, "tray_type": "", "tray_color": "", "state": 9}]}]
+        await self._run(printer.id, ams_data, _make_printing_status(ams_data, state="IDLE"))
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolAssignment, assignment_id) is not None, (
+            "a spool the AMS cannot identify is not a spool that was removed"
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_blank_report_from_an_empty_slot_still_unlinks(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        """The guard reads the bit, not the blankness — take the spool out and
+        the assignment still goes, which is what makes the test above a
+        distinction rather than a blanket reprieve."""
+        from backend.app.models.spool_assignment import SpoolAssignment
+        from backend.app.services import slot_unlink_grace
+
+        printer = await printer_factory(name="X1C")
+        spool = await spool_factory(material="PLA", rgba="8A8F92FF")
+        assignment_id = await self._assignment(db_session, printer, spool)
+
+        ams_data = [{"id": 1, "tray": [{"id": 1, "exists": False, "tray_type": "", "tray_color": "", "state": 9}]}]
+        clock = [1000.0]
+        with patch.object(slot_unlink_grace, "_now", lambda: clock[0]):
+            await self._run(printer.id, ams_data, _make_printing_status(ams_data, state="IDLE"))
+            clock[0] += slot_unlink_grace.GRACE_SECONDS
+            await self._run(printer.id, ams_data, _make_printing_status(ams_data, state="IDLE"))
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolAssignment, assignment_id) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_genuinely_different_filament_in_an_occupied_slot_still_unlinks(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        """The guard is for a blank report only. A slot that names a filament
+        which is not the assigned spool is a swap, bit set or not."""
+        from backend.app.models.spool_assignment import SpoolAssignment
+
+        printer = await printer_factory(name="X1C")
+        spool = await spool_factory(material="PLA", rgba="8A8F92FF")
+        assignment_id = await self._assignment(db_session, printer, spool)
+
+        ams_data = [
+            {"id": 1, "tray": [{"id": 1, "exists": True, "tray_type": "PETG", "tray_color": "00FF00FF", "state": 11}]}
+        ]
+        await self._run(printer.id, ams_data, _make_printing_status(ams_data, state="IDLE"))
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolAssignment, assignment_id) is None
+
+
+class TestAutoUnlinkHeldForGrace:
+    """#3186: one push is not proof a spool was taken out.
+
+    An idle X1 Carbon on X1Plus sent a push that cleared a whole AMS unit --
+    presence bits off, colour and type blank -- and four saved assignments were
+    deleted in the same instant (``Auto-unlinked 4 stale spool assignments``).
+    The spools never moved. A removal is now held for the grace period and
+    unlinked only if the slot is still empty then.
+    """
+
+    @staticmethod
+    async def _assign_unit(db_session, printer, spool):
+        from backend.app.models.spool_assignment import SpoolAssignment
+
+        ids = []
+        for tray_id in range(4):
+            a = SpoolAssignment(
+                spool_id=spool.id,
+                printer_id=printer.id,
+                ams_id=1,
+                tray_id=tray_id,
+                fingerprint_color="858585FF",
+                fingerprint_type="PLA",
+            )
+            db_session.add(a)
+            await db_session.commit()
+            ids.append(a.id)
+        return ids
+
+    @staticmethod
+    def _unit(blank: bool):
+        return [
+            {
+                "id": 1,
+                "tray": [
+                    {"id": t, "exists": False, "tray_type": "", "tray_color": "", "state": 9}
+                    if blank
+                    else {"id": t, "exists": True, "tray_type": "PLA", "tray_color": "858585FF", "state": 11}
+                    for t in range(4)
+                ],
+            }
+        ]
+
+    @staticmethod
+    async def _surviving(db_session, ids):
+        from backend.app.models.spool_assignment import SpoolAssignment
+
+        db_session.expunge_all()
+        return [i for i in ids if await db_session.get(SpoolAssignment, i) is not None]
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_whole_unit_blanking_for_one_push_keeps_every_assignment(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        from backend.app.services import slot_unlink_grace
+
+        printer = await printer_factory(name="X1C")
+        spool = await spool_factory(material="PLA", rgba="000000FF")
+        ids = await self._assign_unit(db_session, printer, spool)
+
+        clock = [1000.0]
+        with patch.object(slot_unlink_grace, "_now", lambda: clock[0]):
+            blank, back = self._unit(blank=True), self._unit(blank=False)
+            await TestAutoUnlinkOccupiedSlot._run(printer.id, blank, _make_printing_status(blank, state="IDLE"))
+            assert await self._surviving(db_session, ids) == ids
+
+            clock[0] += 30
+            await TestAutoUnlinkOccupiedSlot._run(printer.id, back, _make_printing_status(back, state="IDLE"))
+
+            # The recovery dropped the holds, so a blank long after the first
+            # one starts a fresh clock instead of confirming the old one.
+            clock[0] += slot_unlink_grace.GRACE_SECONDS
+            await TestAutoUnlinkOccupiedSlot._run(printer.id, blank, _make_printing_status(blank, state="IDLE"))
+
+        assert await self._surviving(db_session, ids) == ids
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_unit_missing_from_one_push_keeps_its_assignments(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        printer = await printer_factory(name="X1C")
+        spool = await spool_factory(material="PLA", rgba="000000FF")
+        ids = await self._assign_unit(db_session, printer, spool)
+
+        # AMS 1 dropped out of the payload entirely.
+        other_unit = [{"id": 0, "tray": [{"id": 0, "exists": True, "tray_type": "PLA", "tray_color": "FFFFFFFF"}]}]
+        await TestAutoUnlinkOccupiedSlot._run(printer.id, other_unit, _make_printing_status(other_unit, state="IDLE"))
+
+        assert await self._surviving(db_session, ids) == ids
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_slot_that_stays_empty_is_unlinked_by_the_recheck(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        """No second push has to arrive: a spool taken out and left out never
+        changes the AMS hash again, so the held removal re-checks itself."""
+        from backend.app.main import _recheck_held_unlinks
+        from backend.app.services import slot_unlink_grace
+
+        printer = await printer_factory(name="X1C")
+        spool = await spool_factory(material="PLA", rgba="000000FF")
+        ids = await self._assign_unit(db_session, printer, spool)
+        blank = self._unit(blank=True)
+
+        clock = [1000.0]
+        with patch.object(slot_unlink_grace, "_now", lambda: clock[0]):
+            await TestAutoUnlinkOccupiedSlot._run(printer.id, blank, _make_printing_status(blank, state="IDLE"))
+            assert printer.id in slot_unlink_grace._recheck_tasks, "a held removal must schedule its re-check"
+            assert await self._surviving(db_session, ids) == ids
+
+            clock[0] += slot_unlink_grace.GRACE_SECONDS
+            with (
+                patch("backend.app.main.printer_manager") as mock_pm_main,
+                patch("backend.app.main.ws_manager") as mock_ws,
+            ):
+                mock_pm_main.get_status.return_value = _make_printing_status(blank, state="IDLE")
+                mock_ws.broadcast = AsyncMock()
+                await _recheck_held_unlinks(printer.id)
+
+        assert await self._surviving(db_session, ids) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_the_recheck_leaves_a_slot_that_came_back(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        from backend.app.main import _recheck_held_unlinks
+        from backend.app.services import slot_unlink_grace
+
+        printer = await printer_factory(name="X1C")
+        spool = await spool_factory(material="PLA", rgba="000000FF")
+        ids = await self._assign_unit(db_session, printer, spool)
+        blank, back = self._unit(blank=True), self._unit(blank=False)
+
+        clock = [1000.0]
+        with patch.object(slot_unlink_grace, "_now", lambda: clock[0]):
+            await TestAutoUnlinkOccupiedSlot._run(printer.id, blank, _make_printing_status(blank, state="IDLE"))
+            clock[0] += slot_unlink_grace.GRACE_SECONDS
+            with (
+                patch("backend.app.main.printer_manager") as mock_pm_main,
+                patch("backend.app.main.ws_manager") as mock_ws,
+            ):
+                mock_pm_main.get_status.return_value = _make_printing_status(back, state="IDLE")
+                mock_ws.broadcast = AsyncMock()
+                await _recheck_held_unlinks(printer.id)
+
+        assert await self._surviving(db_session, ids) == ids
+
+
+class TestAutoUnlinkSwapDuringGrace:
+    """A non-RFID spool swapped out and another put in within the grace period.
+
+    The new spool reports occupied-but-blank, which on its own keeps an
+    assignment (#3100). After an *empty* report it means the spool changed,
+    so the held removal has to keep running rather than be cancelled -- or the
+    old spool would stay assigned to the new one indefinitely.
+    """
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_swap_still_unlinks_once_the_grace_runs_out(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        from backend.app.models.spool_assignment import SpoolAssignment
+        from backend.app.services import slot_unlink_grace
+
+        printer = await printer_factory(name="X1C")
+        spool = await spool_factory(material="PLA", rgba="8A8F92FF")
+        assignment_id = await TestAutoUnlinkOccupiedSlot._assignment(db_session, printer, spool)
+
+        taken_out = [{"id": 1, "tray": [{"id": 1, "exists": False, "tray_type": "", "tray_color": "", "state": 9}]}]
+        new_spool = [{"id": 1, "tray": [{"id": 1, "exists": True, "tray_type": "", "tray_color": "", "state": 9}]}]
+        clock = [1000.0]
+        with patch.object(slot_unlink_grace, "_now", lambda: clock[0]):
+            await TestAutoUnlinkOccupiedSlot._run(printer.id, taken_out, _make_printing_status(taken_out, state="IDLE"))
+            clock[0] += 20
+            await TestAutoUnlinkOccupiedSlot._run(printer.id, new_spool, _make_printing_status(new_spool, state="IDLE"))
+            db_session.expunge_all()
+            assert await db_session.get(SpoolAssignment, assignment_id) is not None
+
+            clock[0] += slot_unlink_grace.GRACE_SECONDS
+            await TestAutoUnlinkOccupiedSlot._run(printer.id, new_spool, _make_printing_status(new_spool, state="IDLE"))
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolAssignment, assignment_id) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_new_assignment_to_the_slot_starts_clean(
+        self, async_client: AsyncClient, printer_factory, spool_factory, db_session: AsyncSession
+    ):
+        """Assigning a spool to the slot after the swap -- even the same spool
+        again -- makes a new row, and the old clock does not carry over to it."""
+        from backend.app.models.spool_assignment import SpoolAssignment
+        from backend.app.services import slot_unlink_grace
+
+        printer = await printer_factory(name="X1C")
+        spool = await spool_factory(material="PLA", rgba="8A8F92FF")
+        old_id = await TestAutoUnlinkOccupiedSlot._assignment(db_session, printer, spool)
+
+        taken_out = [{"id": 1, "tray": [{"id": 1, "exists": False, "tray_type": "", "tray_color": "", "state": 9}]}]
+        back_in = [{"id": 1, "tray": [{"id": 1, "exists": True, "tray_type": "", "tray_color": "", "state": 9}]}]
+        clock = [1000.0]
+        with patch.object(slot_unlink_grace, "_now", lambda: clock[0]):
+            await TestAutoUnlinkOccupiedSlot._run(printer.id, taken_out, _make_printing_status(taken_out, state="IDLE"))
+
+            # The user puts the spool back and assigns it again through the
+            # endpoint, which replaces the row -- on SQLite quite possibly under
+            # the same id, so only dropping the hold keeps the old clock off it.
+            hold_key = ("inventory", 1, 1, spool.id)
+            assert slot_unlink_grace.is_held(printer.id, hold_key)
+            with patch("backend.app.services.printer_manager.printer_manager") as mock_pm:
+                mock_pm.get_client.return_value = None
+                mock_pm.get_status.return_value = _make_mock_status(ams_data=back_in)
+                response = await async_client.post(
+                    "/api/v1/inventory/assignments",
+                    json={"spool_id": spool.id, "printer_id": printer.id, "ams_id": 1, "tray_id": 1},
+                )
+            assert response.status_code == 200
+            assert not slot_unlink_grace.is_held(printer.id, hold_key), "an assignment must drop the old hold"
+            new_id = response.json()["id"]
+            assert await db_session.get(SpoolAssignment, old_id) is None or new_id == old_id
+
+            clock[0] += slot_unlink_grace.GRACE_SECONDS
+            await TestAutoUnlinkOccupiedSlot._run(printer.id, back_in, _make_printing_status(back_in, state="IDLE"))
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolAssignment, new_id) is not None
+
+
+class TestSpoolmanSlotUnlinkHeldForGrace:
+    """Spoolman mode's half of #3186: the slot row waits out the same grace."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_the_recheck_deletes_a_row_only_once_the_slot_stayed_empty(
+        self, async_client: AsyncClient, printer_factory, db_session: AsyncSession
+    ):
+        from backend.app.main import _expire_spoolman_empty_slots
+        from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
+        from backend.app.services import slot_unlink_grace
+
+        await TestSpoolmanSlotAssignmentDuringRunout()._enable_spoolman(db_session)
+        printer = await printer_factory(name="H2D")
+        row = SpoolmanSlotAssignment(printer_id=printer.id, ams_id=0, tray_id=2, spoolman_spool_id=41)
+        db_session.add(row)
+        await db_session.commit()
+        row_id = row.id
+
+        blank = [{"id": 0, "tray": [{"id": 2, "exists": False, "tray_type": "", "tray_color": "", "state": 9}]}]
+        clock = [1000.0]
+        with (
+            patch.object(slot_unlink_grace, "_now", lambda: clock[0]),
+            patch("backend.app.main.ws_manager") as mock_ws,
+        ):
+            mock_ws.broadcast = AsyncMock()
+            await _expire_spoolman_empty_slots(printer.id, blank, printing_now=False)
+            db_session.expunge_all()
+            assert await db_session.get(SpoolmanSlotAssignment, row_id) is not None
+
+            clock[0] += slot_unlink_grace.GRACE_SECONDS
+            await _expire_spoolman_empty_slots(printer.id, blank, printing_now=False)
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolmanSlotAssignment, row_id) is None
+        mock_ws.broadcast.assert_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_a_swap_to_an_unreadable_spool_still_expires_the_row(
+        self, async_client: AsyncClient, printer_factory, db_session: AsyncSession
+    ):
+        from backend.app.main import _expire_spoolman_empty_slots
+        from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
+        from backend.app.services import slot_unlink_grace
+
+        await TestSpoolmanSlotAssignmentDuringRunout()._enable_spoolman(db_session)
+        printer = await printer_factory(name="H2D")
+        row = SpoolmanSlotAssignment(printer_id=printer.id, ams_id=0, tray_id=2, spoolman_spool_id=41)
+        db_session.add(row)
+        await db_session.commit()
+        row_id = row.id
+
+        taken_out = [{"id": 0, "tray": [{"id": 2, "exists": False, "tray_type": "", "tray_color": "", "state": 9}]}]
+        new_spool = [{"id": 0, "tray": [{"id": 2, "exists": True, "tray_type": "", "tray_color": "", "state": 9}]}]
+        clock = [1000.0]
+        with (
+            patch.object(slot_unlink_grace, "_now", lambda: clock[0]),
+            patch("backend.app.main.ws_manager") as mock_ws,
+        ):
+            mock_ws.broadcast = AsyncMock()
+            await _expire_spoolman_empty_slots(printer.id, taken_out, printing_now=False)
+            clock[0] += 20
+            await _expire_spoolman_empty_slots(printer.id, new_spool, printing_now=False)
+            db_session.expunge_all()
+            assert await db_session.get(SpoolmanSlotAssignment, row_id) is not None
+
+            clock[0] += slot_unlink_grace.GRACE_SECONDS
+            await _expire_spoolman_empty_slots(printer.id, new_spool, printing_now=False)
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolmanSlotAssignment, row_id) is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_an_occupied_unreadable_slot_with_no_hold_keeps_its_row(
+        self, async_client: AsyncClient, printer_factory, db_session: AsyncSession
+    ):
+        """#3100 still holds for the re-check: never reported empty, never unlinked."""
+        from backend.app.main import _expire_spoolman_empty_slots
+        from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
+        from backend.app.services import slot_unlink_grace
+
+        await TestSpoolmanSlotAssignmentDuringRunout()._enable_spoolman(db_session)
+        printer = await printer_factory(name="H2D")
+        row = SpoolmanSlotAssignment(printer_id=printer.id, ams_id=0, tray_id=2, spoolman_spool_id=41)
+        db_session.add(row)
+        await db_session.commit()
+        row_id = row.id
+
+        unreadable = [{"id": 0, "tray": [{"id": 2, "exists": True, "tray_type": "", "tray_color": "", "state": 9}]}]
+        clock = [1000.0]
+        with (
+            patch.object(slot_unlink_grace, "_now", lambda: clock[0]),
+            patch("backend.app.main.ws_manager") as mock_ws,
+        ):
+            mock_ws.broadcast = AsyncMock()
+            for _ in range(3):
+                await _expire_spoolman_empty_slots(printer.id, unreadable, printing_now=False)
+                clock[0] += slot_unlink_grace.GRACE_SECONDS
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolmanSlotAssignment, row_id) is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_the_recheck_keeps_a_row_whose_slot_reads_again(
+        self, async_client: AsyncClient, printer_factory, db_session: AsyncSession
+    ):
+        from backend.app.main import _expire_spoolman_empty_slots
+        from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
+        from backend.app.services import slot_unlink_grace
+
+        await TestSpoolmanSlotAssignmentDuringRunout()._enable_spoolman(db_session)
+        printer = await printer_factory(name="H2D")
+        row = SpoolmanSlotAssignment(printer_id=printer.id, ams_id=0, tray_id=2, spoolman_spool_id=41)
+        db_session.add(row)
+        await db_session.commit()
+        row_id = row.id
+
+        blank = [{"id": 0, "tray": [{"id": 2, "exists": False, "tray_type": "", "tray_color": "", "state": 9}]}]
+        back = [{"id": 0, "tray": [{"id": 2, "exists": True, "tray_type": "PLA", "tray_color": "858585FF"}]}]
+        clock = [1000.0]
+        with (
+            patch.object(slot_unlink_grace, "_now", lambda: clock[0]),
+            patch("backend.app.main.ws_manager") as mock_ws,
+        ):
+            mock_ws.broadcast = AsyncMock()
+            await _expire_spoolman_empty_slots(printer.id, blank, printing_now=False)
+            clock[0] += 30
+            await _expire_spoolman_empty_slots(printer.id, back, printing_now=False)
+            clock[0] += slot_unlink_grace.GRACE_SECONDS
+            await _expire_spoolman_empty_slots(printer.id, blank, printing_now=False)
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolmanSlotAssignment, row_id) is not None
+
+
+class TestSpoolmanSlotAssignmentDuringRunout:
+    """`spoolman_slot_assignments` is how a tag-less spool assigned through the
+    Bambuddy UI is resolved at completion (#1459). Deleting the row when a slot
+    empties mid-print loses the runout segment's usage — the same failure the
+    internal inventory's auto-unlink had, so it needs the same guard."""
+
+    async def _enable_spoolman(self, db_session):
+        from backend.app.models.settings import Settings
+
+        for key, value in (
+            ("spoolman_enabled", "true"),
+            ("spoolman_sync_mode", "auto"),
+            ("spoolman_url", "http://spoolman.test"),
+        ):
+            db_session.add(Settings(key=key, value=value))
+        await db_session.commit()
+
+    async def _run(self, printer_id, state, tray=None):
+        from unittest.mock import AsyncMock
+
+        from backend.app.main import on_ams_change
+
+        # A tray the firmware has cleared: parse_ams_tray returns None, which
+        # is what marks the slot empty for the cleanup pass.
+        ams_data = [{"id": 0, "tray": [tray or {"id": 2, "tray_type": "", "tray_color": "", "state": 26}]}]
+
+        spoolman_client = MagicMock()
+        spoolman_client.health_check = AsyncMock(return_value=True)
+        spoolman_client.get_spools = AsyncMock(return_value=[])
+        spoolman_client.sync_ams_tray = AsyncMock(return_value=None)
+        # None is what marks the slot empty for the cleanup pass.
+        spoolman_client.parse_ams_tray.return_value = None
+
+        with (
+            patch("backend.app.main.printer_manager") as mock_pm_main,
+            patch("backend.app.main.mqtt_relay") as mock_relay,
+            patch("backend.app.main.ws_manager") as mock_ws,
+            patch("backend.app.main.get_spoolman_client", new=AsyncMock(return_value=spoolman_client)),
+        ):
+            mock_pm_main.get_printer.return_value = MagicMock(name="H2D", serial_number="0948BB540200427")
+            mock_pm_main.get_status.return_value = state
+            mock_pm_main.get_model.return_value = "H2D"
+            mock_relay.on_ams_change = AsyncMock()
+            mock_ws.send_printer_status = AsyncMock()
+            mock_ws.broadcast = AsyncMock()
+
+            await on_ams_change(printer_id, ams_data)
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_the_slot_row_survives_a_runout(
+        self, async_client: AsyncClient, printer_factory, db_session: AsyncSession
+    ):
+        from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
+
+        await self._enable_spoolman(db_session)
+        printer = await printer_factory(name="H2D")
+        row = SpoolmanSlotAssignment(printer_id=printer.id, ams_id=0, tray_id=2, spoolman_spool_id=41)
+        db_session.add(row)
+        await db_session.commit()
+        row_id = row.id
+
+        await self._run(printer.id, _make_printing_status(None))
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolmanSlotAssignment, row_id) is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_an_occupied_slot_the_ams_cannot_read_keeps_its_row(
+        self, async_client: AsyncClient, printer_factory, db_session: AsyncSession
+    ):
+        """Spoolman mode's half of #3100.
+
+        parse_ams_tray calls a tray with no type empty, and a tag-less spool
+        has none until something configures it — so the row assigned through
+        the UI was deleted by the first idle push after the spool went in.
+        Firmware's presence bit is the same answer the built-in inventory
+        uses, so the two modes stay in step.
+        """
+        from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
+
+        await self._enable_spoolman(db_session)
+        printer = await printer_factory(name="H2D")
+        row = SpoolmanSlotAssignment(printer_id=printer.id, ams_id=0, tray_id=2, spoolman_spool_id=41)
+        db_session.add(row)
+        await db_session.commit()
+        row_id = row.id
+
+        await self._run(
+            printer.id,
+            _make_printing_status(None, state="IDLE"),
+            tray={"id": 2, "exists": True, "tray_type": "", "tray_color": "", "state": 9},
+        )
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolmanSlotAssignment, row_id) is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_the_slot_row_is_still_cleaned_up_when_idle(
+        self, async_client: AsyncClient, printer_factory, db_session: AsyncSession
+    ):
+        """Proves the guard is what saved the row above, not an unreachable
+        code path -- once the slot has stayed empty for the grace period."""
+        from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
+        from backend.app.services import slot_unlink_grace
+
+        await self._enable_spoolman(db_session)
+        printer = await printer_factory(name="H2D")
+        row = SpoolmanSlotAssignment(printer_id=printer.id, ams_id=0, tray_id=2, spoolman_spool_id=41)
+        db_session.add(row)
+        await db_session.commit()
+        row_id = row.id
+
+        clock = [1000.0]
+        with patch.object(slot_unlink_grace, "_now", lambda: clock[0]):
+            await self._run(printer.id, _make_printing_status(None, state="IDLE"))
+            db_session.expunge_all()
+            assert await db_session.get(SpoolmanSlotAssignment, row_id) is not None
+
+            clock[0] += slot_unlink_grace.GRACE_SECONDS
+            await self._run(printer.id, _make_printing_status(None, state="IDLE"))
+
+        db_session.expunge_all()
+        assert await db_session.get(SpoolmanSlotAssignment, row_id) is None

@@ -6,6 +6,12 @@ fast as line numbers do._
 
 ## Fix 1: Queue items stuck in "printing" on FINISH (`71facf20`)
 
+> **Dropped 2026-11-20 (v1.3.1 sync).** Upstream's reconnect reconcile (#3310,
+> `1e30e3266`) now closes a print that ended during a restart as completed/failed by
+> matching the printer's `subtask_id`, and its completion gate covers pre-print failures
+> (#1111). Keeping Fix 1 on top would fire a second completion for the same stale FINISH.
+> `bambu_mqtt.py`'s completion gate is upstream's again; Fix 1's tests were removed.
+
 **File:** `backend/app/services/bambu_mqtt.py`
 **Problem:** `should_trigger_completion` required `_was_running=True`, which meant a
 completion was missed if the service restarted during an active print.
@@ -151,6 +157,11 @@ still-open issue.
 
 ## Fix 10: Repeated dispatch onto a not-ready printer after FTP-upload failure (`c963a894`)
 
+> **Superseded 2026-11-19 (v1.3.1 sync).** Upstream #3210/#3409 keeps the job queued on
+> any refused upload and backs the printer off (5 min, doubling, 1 h cap). The fork's
+> cooldown/retry code and `test_scheduler_ftp_failure_retry.py` were removed. Kept below
+> for the root-cause record. See [`upstream-sync.md`](upstream-sync.md).
+
 **Discovered 2026-07-14** from server logs — Airtho 3DP 2 (printer id 4) burned four
 queue items (1427, 1428, 1429, 1430) as `failed` in consecutive ~30 s cycles, each on an
 "FTP upload failed" error, until item 1431 finally succeeded. The printer's own
@@ -197,6 +208,13 @@ left in a dispatch hold.
 tightening `_is_printer_idle` against stale-FINISH is a separate hardening.
 
 ## Fix 11: Reconnect the printer to clear an FTP/SD upload wedge
+
+> **Re-implemented 2026-11-19 (v1.3.1 sync).** `UploadRejectedError`/`raise_on_reject`
+> are gone; the scheduler now reacts to upstream's `FtpFailureKind.NOT_FOUND` (550),
+> reconnects the printer and requeues via upstream's `_requeue_after_upload_refused`, for
+> at most `FTP_WEDGE_RECONNECT_ATTEMPTS` (3) refusals in a row, then fails the item as
+> upstream does. Tests: `test_scheduler_ftp_wedge_reconnect.py`. The description below is
+> the original implementation.
 
 **Discovered** from the same 2026-07-14 3DP 2 cluster as Fix 10, but a distinct root
 cause that Fix 10 did not resolve. Items 1427–1430 each failed on FTP upload; the failure

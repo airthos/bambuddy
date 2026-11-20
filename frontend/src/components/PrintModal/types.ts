@@ -1,6 +1,9 @@
 import type { PrintQueueItem, Printer, CalibrationMode, FarmScriptOptions } from '../../api/client';
+import type { VariantCandidate } from './VariantCandidates';
+import type { SeparateJobsProgress, SeparateJobsResume } from './separateJobs';
 
 export type { CalibrationMode };
+export type { VariantCandidate };
 
 /**
  * Mode of operation for the PrintModal.
@@ -29,6 +32,12 @@ export interface PrintModalProps {
   queueItem?: PrintQueueItem;
   /** Pre-select specific printers when opening the modal */
   initialSelectedPrinterIds?: number[];
+  /**
+   * Pre-select this plate when opening the modal (create mode): a reprint of
+   * an archive, or a re-queue, prints the plate that job printed, not plate 1.
+   * A plate the file no longer has falls back to the first plate.
+   */
+  preselectPlateId?: number | null;
   /** Handler for closing the modal */
   onClose: () => void;
   /** Handler for successful operation */
@@ -38,6 +47,43 @@ export interface PrintModalProps {
   /** Delete the LibraryFile after dispatch — used by the Printers-page Direct-Print flow
    *  so transient uploads don't linger in File Manager. Only applies to library-file prints. */
   cleanupLibraryAfterDispatch?: boolean;
+  /**
+   * Several sliced files to print at once, in the order given.
+   *
+   * Supplied by the File Manager when the user multi-selects sliced files, or
+   * when the clicked file belongs to a variant group. Two or more entries show
+   * the ordered candidate list, where each file's plate is chosen, and become
+   * one of two things:
+   * - Cross-model alternatives (#671): the same job sliced for several
+   *   printers, queued as ONE item that runs on whichever frees up first. The
+   *   printer picker is replaced by the list, and submit posts `variants`
+   *   instead of a single file. Without `separateJobsAllowed` this is the only
+   *   mode.
+   * - Separate jobs (#3462), only with `separateJobsAllowed`: one queue item
+   *   per file, in list order, and the printer picker stays.
+   * `libraryFileId` must still be the first candidate — the shared filament and
+   * plate preview reads from it.
+   */
+  variantFiles?: VariantCandidate[];
+  /**
+   * Let the user queue `variantFiles` as separate jobs instead (#3462): one
+   * queue item per file, in list order, on the printer or model picked as for
+   * a single file. Set only for files the user marked together in the File
+   * Manager, never for a version group (#2570): a group is by definition the
+   * same job sliced for different printers, which only alternatives express.
+   * Without it the modal offers the alternatives alone, as before.
+   */
+  separateJobsAllowed?: boolean;
+  /**
+   * The rest of a partly queued separate-jobs run, closed after a refusal and
+   * opened again on the files still to queue (#3471 review). Its pairs are
+   * skipped and its ASAP positions continued; the mode is not offered again,
+   * and a single remaining file still opens as that run's rest.
+   */
+  resumeSeparateJobs?: SeparateJobsResume;
+  /** Called after each refusal in separate jobs with what is in the queue so
+   *  far, so the opener can resume the run if the dialog is closed. */
+  onSeparateJobsProgress?: (progress: SeparateJobsProgress) => void;
 }
 
 /**
@@ -52,6 +98,8 @@ export interface PrintOptions {
   layer_inspect: boolean;
   timelapse: boolean;
   nozzle_offset_cali: CalibrationMode;
+  // Ask for a post-print outcome verdict when this job completes (#1898)
+  confirm_outcome: boolean;
   // Per-item preheat / heat-soak override (#1468). 'inherit' uses the global
   // Settings → Workflow toggle; 'on' / 'off' force the per-print decision.
   // chamber_target_override is non-null to bypass the per-filament-type
@@ -70,6 +118,7 @@ export const DEFAULT_PRINT_OPTIONS: PrintOptions = {
   layer_inspect: false,
   timelapse: false,
   nozzle_offset_cali: 'auto',
+  confirm_outcome: false,
   preheat_override: 'inherit',
   preheat_chamber_target_override: null,
 };
@@ -203,6 +252,14 @@ export interface PlateSelectorProps {
   onDeselectAll?: () => void;
   /** Whether multi-select (checkboxes) is enabled */
   multiSelect?: boolean;
+  /**
+   * How many runs of each plate to queue, keyed by plate index (#342). When
+   * provided, each selected plate gets its own quantity control and the
+   * modal's single global Quantity field is hidden — one number per plate is
+   * the whole point, and two controls for the same value would be ambiguous.
+   */
+  quantities?: Record<number, number>;
+  onQuantityChange?: (plateIndex: number, quantity: number) => void;
 }
 
 /**
@@ -220,7 +277,36 @@ export interface FilamentReqsData {
      *  = user custom). Used to resolve the "original" filament label in
      *  FilamentOverride against the builtin + cloud user-preset maps. #1718. */
     tray_info_idx?: string;
+    /** Which filament group this slot prints in, on a nozzle-rack machine
+     *  (#1784). The group is the slicer's logical nozzle, so it — not the slot
+     *  — is what a rack position is chosen for. Absent on every other model. */
+    group_id?: number;
+    /** What that group needs of a hotend. Only groups with `on_rack` get a
+     *  position picker; the rest are on the fixed carriage and have no choice
+     *  to make. */
+    group?: RackGroupInfo;
   }>;
+}
+
+/** A filament group's hotend requirements, from the 3MF (#1784). */
+export interface RackGroupInfo {
+  on_rack: boolean;
+  nozzle_diameter: string;
+  volume_type: string;
+  filament_color: string;
+}
+
+/** One position on the H2C's six-slot nozzle rack, as offered to the user. */
+export interface RackPositionOption {
+  /** 1-based, the way the printer card, BambuStudio and the operator count. */
+  position: number;
+  diameter: string;
+  nozzleType: string;
+  filamentColor: string;
+  /** False when the position is empty or holds the wrong nozzle for the group. */
+  eligible: boolean;
+  /** Why not, when `eligible` is false — shown as the option's title. */
+  reason?: string;
 }
 
 /**
@@ -232,6 +318,9 @@ export interface FilamentMappingProps {
   filamentReqs: FilamentReqsData | undefined;
   manualMappings: Record<number, number>;
   onManualMappingChange: (mappings: Record<number, number>) => void;
+  onEstimatedCostChange?: (estimatedCost: number | null) => void;
+  budgetAvailable?: number | null;
+  quantity?: number;
   currencySymbol: string;
   defaultCostPerKg: number;
   /** Per-slot force-color-match flags. The scheduler honors this flag in both
@@ -252,6 +341,13 @@ export interface FilamentMappingProps {
    *  auto-match. Undefined/omitted when the archive has no saved mapping —
    *  the toggle is hidden and behaviour is unchanged. */
   archiveAmsMapping?: number[];
+  /** The operator's rack-position pick per filament group (#1784), keyed by
+   *  group id. Only meaningful on a nozzle-rack model; omit elsewhere and no
+   *  picker is rendered. A group absent from the object is assigned a position
+   *  by the dispatcher against the rack as it stands at dispatch. */
+  nozzleRackChoice?: Record<number, number>;
+  /** Called when a rack position is picked for a group. */
+  onNozzleRackChoiceChange?: (choice: Record<number, number>) => void;
 }
 
 /**
@@ -288,4 +384,6 @@ export interface ScheduleOptionsProps {
   hasPostProcessScript?: boolean;
   /** Global farm_cooldown_temp setting, shown as the cooldown default */
   farmCooldownTemp?: number;
+  /** The user's jobs wait for someone to start them (#1620) */
+  needsReview?: boolean;
 }

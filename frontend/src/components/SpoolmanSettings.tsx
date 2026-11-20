@@ -1,9 +1,9 @@
 import { useState, useEffect } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
-import { Loader2, Check, X, RefreshCw, Link2, Link2Off, Database, ChevronDown, Info, AlertTriangle, Package, ExternalLink } from 'lucide-react';
+import { Loader2, Check, X, RefreshCw, Link2, Database, ChevronDown, Info, AlertTriangle, Package, ExternalLink, Tags } from 'lucide-react';
 import { api, ApiError } from '../api/client';
-import type { SpoolmanSyncResult, Printer } from '../api/client';
+import type { SpoolmanSyncResult, SpoolmanTagMigrationReport, Printer } from '../api/client';
 import { Card, CardContent, CardHeader } from './Card';
 import { Button } from './Button';
 import { ConfirmModal } from './ConfirmModal';
@@ -24,6 +24,7 @@ export function SpoolmanSettings() {
   const [showAllSkipped, setShowAllSkipped] = useState(false);
   const [showAmsSyncConfirm, setShowAmsSyncConfirm] = useState(false);
   const [showSpoolmanAmsSyncConfirm, setShowSpoolmanAmsSyncConfirm] = useState(false);
+  const [tagReport, setTagReport] = useState<SpoolmanTagMigrationReport | null>(null);
 
   // Fetch Spoolman settings
   const { data: settings, isLoading: settingsLoading } = useQuery({
@@ -114,17 +115,6 @@ export function SpoolmanSettings() {
     },
   });
 
-  // Disconnect mutation
-  const disconnectMutation = useMutation({
-    mutationFn: api.disconnectSpoolman,
-    onSuccess: () => {
-      refetchStatus();
-    },
-    onError: () => {
-      showToast(t('settings.toast.saveFailed'), 'error');
-    },
-  });
-
   // Sync all mutation
   const syncAllMutation = useMutation({
     mutationFn: api.syncAllPrintersAms,
@@ -163,6 +153,7 @@ export function SpoolmanSettings() {
       queryClient.invalidateQueries({ queryKey: ['spools'] });
       queryClient.invalidateQueries({ queryKey: ['inventory-spools'] });
       showToast(t('settings.amsSyncSuccess', { synced: data.synced, skipped: data.skipped }), 'success');
+      if (data.printing) showToast(t('settings.amsSyncSkippedPrinting', { count: data.printing }), 'info');
       setShowAmsSyncConfirm(false);
     },
     onError: () => {
@@ -177,6 +168,7 @@ export function SpoolmanSettings() {
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: ['spoolman-inventory-spools'] });
       showToast(t('settings.spoolmanAmsSyncSuccess', { synced: data.synced, skipped: data.skipped }), 'success');
+      if (data.printing) showToast(t('settings.amsSyncSkippedPrinting', { count: data.printing }), 'info');
       setShowSpoolmanAmsSyncConfirm(false);
     },
     onError: (error: Error) => {
@@ -188,6 +180,21 @@ export function SpoolmanSettings() {
         showToast(t('settings.spoolmanAmsSyncError'), 'error');
       }
       setShowSpoolmanAmsSyncConfirm(false);
+    },
+  });
+
+  // Native tag migration (Spoolman 0.27+): a dry run first, the move only from its report
+  const tagMigrationMutation = useMutation({
+    mutationFn: (dryRun: boolean) => api.migrateSpoolmanTags(dryRun),
+    onSuccess: (report) => {
+      setTagReport(report);
+      if (!report.dry_run) {
+        queryClient.invalidateQueries({ queryKey: ['spoolman-inventory-spools'] });
+        showToast(t('settings.nativeTagsMoved', { count: report.moved.length }), 'success');
+      }
+    },
+    onError: () => {
+      showToast(t('settings.nativeTagsError'), 'error');
     },
   });
 
@@ -461,22 +468,14 @@ export function SpoolmanSettings() {
                     </span>
                   )}
                 </div>
+                {/* Retry affordance only. Spoolman is a stateless HTTP API with
+                    no session to hold open, so there is nothing for a Disconnect
+                    button to disconnect: it closed this process's client object,
+                    which any other request rebuilt lazily moments later, and the
+                    status above silently flipped back. The enable toggle is what
+                    turns the integration off. */}
                 <div className="flex gap-2">
-                  {status?.connected ? (
-                    <Button
-                      variant="secondary"
-                      size="sm"
-                      onClick={() => disconnectMutation.mutate()}
-                      disabled={disconnectMutation.isPending}
-                    >
-                      {disconnectMutation.isPending ? (
-                        <Loader2 className="w-4 h-4 animate-spin" />
-                      ) : (
-                        <Link2Off className="w-4 h-4" />
-                      )}
-                      {t('settings.disconnect')}
-                    </Button>
-                  ) : (
+                  {!status?.connected && (
                     <Button
                       size="sm"
                       onClick={() => connectMutation.mutate()}
@@ -494,9 +493,9 @@ export function SpoolmanSettings() {
               </div>
 
               {/* Error display */}
-              {(connectMutation.isError || disconnectMutation.isError) && (
+              {connectMutation.isError && (
                 <div className="mb-3 p-2 bg-red-100 dark:bg-red-500/20 border border-red-300 dark:border-red-500/50 rounded text-sm text-red-700 dark:text-red-400">
-                  {((connectMutation.error || disconnectMutation.error) as Error).message}
+                  {(connectMutation.error as Error).message}
                 </div>
               )}
 
@@ -566,6 +565,86 @@ export function SpoolmanSettings() {
                       {spoolmanAmsSyncMutation.isPending ? t('settings.spoolmanAmsSyncing') : t('settings.spoolmanAmsSyncButton')}
                     </Button>
                   </div>
+                </div>
+              )}
+
+              {/* Native tags (Spoolman 0.27+) */}
+              {status?.connected && status.native_tags && (
+                <div className="mt-4 pt-4 border-t border-bambu-dark-tertiary space-y-3">
+                  <div className="flex items-center justify-between">
+                    <div className="pr-4">
+                      <p className="text-sm text-white">{t('settings.nativeTagsTitle')}</p>
+                      <p className="text-xs text-bambu-gray">{t('settings.nativeTagsDesc')}</p>
+                    </div>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => tagMigrationMutation.mutate(true)}
+                      disabled={tagMigrationMutation.isPending}
+                      className="flex-shrink-0 whitespace-nowrap"
+                    >
+                      {tagMigrationMutation.isPending && tagMigrationMutation.variables ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <Tags className="w-4 h-4" />
+                      )}
+                      {t('settings.nativeTagsCheck')}
+                    </Button>
+                  </div>
+
+                  {tagReport && (
+                    <div className="p-2 bg-bambu-dark border border-bambu-dark-tertiary rounded text-sm space-y-2">
+                      <dl className="grid grid-cols-[1fr_auto] gap-x-4 gap-y-0.5 text-xs">
+                        <dt className="text-bambu-gray">{t('settings.nativeTagsToMove')}</dt>
+                        <dd className="text-white text-right">{tagReport.dry_run ? tagReport.moved.length : 0}</dd>
+                        <dt className="text-bambu-gray">{t('settings.nativeTagsAlready')}</dt>
+                        <dd className="text-white text-right">
+                          {tagReport.already + (tagReport.dry_run ? 0 : tagReport.moved.length)}
+                        </dd>
+                        <dt className="text-bambu-gray">{t('settings.nativeTagsSlotIds')}</dt>
+                        <dd className="text-white text-right">{tagReport.slot_ids}</dd>
+                        <dt className="text-bambu-gray">{t('settings.nativeTagsConflicts')}</dt>
+                        <dd className="text-white text-right">{tagReport.conflicts.length}</dd>
+                      </dl>
+
+                      {tagReport.conflicts.length > 0 && (
+                        <ul className="p-2 bg-amber-50 dark:bg-amber-500/10 border border-amber-300 dark:border-amber-500/30 rounded text-xs text-amber-700 dark:text-amber-400 space-y-0.5">
+                          {tagReport.conflicts.map((c) => (
+                            <li key={`${c.spool_id}-${c.tag}`} className="flex items-start gap-1.5">
+                              <AlertTriangle className="w-3.5 h-3.5 flex-shrink-0 mt-px" />
+                              <span>
+                                {c.holder > 0
+                                  ? t('settings.nativeTagsConflictSpool', { spool: c.spool_id, tag: c.tag, holder: c.holder })
+                                  : t('settings.nativeTagsConflictElsewhere', { spool: c.spool_id, tag: c.tag })}
+                              </span>
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+
+                      {tagReport.dry_run && tagReport.moved.length > 0 ? (
+                        <Button
+                          size="sm"
+                          onClick={() => tagMigrationMutation.mutate(false)}
+                          disabled={tagMigrationMutation.isPending}
+                        >
+                          {tagMigrationMutation.isPending && !tagMigrationMutation.variables ? (
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                          ) : (
+                            <Tags className="w-4 h-4" />
+                          )}
+                          {t('settings.nativeTagsMove')}
+                        </Button>
+                      ) : (
+                        tagReport.conflicts.length === 0 && (
+                          <p className="flex items-center gap-1 text-xs text-green-600 dark:text-green-400">
+                            <Check className="w-3.5 h-3.5" />
+                            {t('settings.nativeTagsNothing')}
+                          </p>
+                        )
+                      )}
+                    </div>
+                  )}
                 </div>
               )}
 

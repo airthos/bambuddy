@@ -3,6 +3,8 @@
 // are chamber-temperature recommendations from BambuStudio's bundled filament
 // profiles; users can override the whole map via the Settings → Workflow card.
 
+import { MAX_CHAMBER_TEMP_C } from './printer';
+
 export const DEFAULT_PREHEAT_FILAMENT_TARGETS: Record<string, number> = {
   PLA: 0,
   PETG: 0,
@@ -44,7 +46,7 @@ export function parsePreheatFilamentTargets(raw: string): Record<string, number>
       for (const [key, value] of Object.entries(parsed)) {
         const num = typeof value === 'number' ? value : Number(value);
         if (Number.isFinite(num)) {
-          out[key] = Math.max(0, Math.min(60, Math.round(num)));
+          out[key] = Math.max(0, Math.min(MAX_CHAMBER_TEMP_C, Math.round(num)));
         }
       }
       if (out.default === undefined) out.default = DEFAULT_PREHEAT_FILAMENT_TARGETS.default;
@@ -69,28 +71,4 @@ export function serializePreheatFilamentTargets(map: Record<string, number>): st
     if (!(key in out)) out[key] = value;
   }
   return JSON.stringify(out);
-}
-
-// Normalize a printer-reported tray_type to a map key. Mirrors the backend
-// `_normalize_filament_type` — split on space, uppercase.
-export function normalizePreheatFilamentType(trayType: string): string {
-  if (!trayType) return '';
-  return trayType.split(/\s+/)[0].toUpperCase();
-}
-
-// Pick the max chamber target across a list of loaded tray types, falling
-// back to `default` when a type isn't in the map. Returns 0 when nothing
-// is loaded, which short-circuits the chamber phase at dispatch.
-export function deriveChamberTargetForTrays(
-  trayTypes: readonly string[],
-  map: Record<string, number>,
-): number {
-  let best = 0;
-  for (const raw of trayTypes) {
-    const normalized = normalizePreheatFilamentType(raw);
-    if (!normalized) continue;
-    const target = map[normalized] ?? map.default ?? 0;
-    if (target > best) best = target;
-  }
-  return best;
 }

@@ -14,34 +14,10 @@ from __future__ import annotations
 import pytest
 from httpx import AsyncClient
 
+from backend.app.core.printer_scope import ALL_PRINTERS
+from backend.tests.overlay_helpers import mint_token, setup_admin
+
 pytestmark = [pytest.mark.asyncio, pytest.mark.integration]
-
-
-async def _setup_admin(async_client: AsyncClient, *, suffix: str) -> str:
-    await async_client.post(
-        "/api/v1/auth/setup",
-        json={
-            "auth_enabled": True,
-            "admin_username": f"overlayadmin{suffix}",
-            "admin_password": "AdminPass1!",
-        },
-    )
-    login = await async_client.post(
-        "/api/v1/auth/login",
-        json={"username": f"overlayadmin{suffix}", "password": "AdminPass1!"},
-    )
-    return login.json()["access_token"]
-
-
-async def _mint(async_client: AsyncClient, jwt: str, *, scope: str, name: str = "obs") -> str:
-    response = await async_client.post(
-        "/api/v1/auth/tokens",
-        headers={"Authorization": f"Bearer {jwt}"},
-        json={"name": name, "expires_in_days": 30, "scope": scope},
-    )
-    assert response.status_code == 201, response.text
-    assert response.json()["scope"] == scope
-    return response.json()["token"]
 
 
 @pytest.fixture
@@ -67,12 +43,12 @@ async def printer_row(db_session):
 
 class TestOverlayFeedAuth:
     async def test_no_token_is_rejected(self, async_client: AsyncClient, printer_row):
-        await _setup_admin(async_client, suffix="_notoken")
+        await setup_admin(async_client, suffix="_notoken")
         response = await async_client.get(f"/api/v1/printers/{printer_row.id}/overlay-status")
         assert response.status_code == 401
 
     async def test_garbage_token_is_rejected(self, async_client: AsyncClient, printer_row):
-        await _setup_admin(async_client, suffix="_garbage")
+        await setup_admin(async_client, suffix="_garbage")
         response = await async_client.get(f"/api/v1/printers/{printer_row.id}/overlay-status?token=bblt_aaaaaaaa_nope")
         assert response.status_code == 401
 
@@ -81,8 +57,8 @@ class TestOverlayFeedAuth:
         acquire the live print status (and filename) just because a new feature
         shipped.
         """
-        jwt = await _setup_admin(async_client, suffix="_streamscope")
-        stream_token = await _mint(async_client, jwt, scope="camera_stream")
+        jwt = await setup_admin(async_client, suffix="_streamscope")
+        stream_token = await mint_token(async_client, jwt, scope="camera_stream")
 
         response = await async_client.get(f"/api/v1/printers/{printer_row.id}/overlay-status?token={stream_token}")
         assert response.status_code == 401
@@ -95,22 +71,22 @@ class TestOverlayFeedAuth:
         rejected here — otherwise every wall token silently gains filename
         visibility.
         """
-        jwt = await _setup_admin(async_client, suffix="_camwallscope")
-        camwall_token = await _mint(async_client, jwt, scope="camwall")
+        jwt = await setup_admin(async_client, suffix="_camwallscope")
+        camwall_token = await mint_token(async_client, jwt, scope="camwall")
 
         response = await async_client.get(f"/api/v1/printers/{printer_row.id}/overlay-status?token={camwall_token}")
         assert response.status_code == 401
 
     async def test_overlay_token_reaches_the_feed(self, async_client: AsyncClient, printer_row):
-        jwt = await _setup_admin(async_client, suffix="_rightscope")
-        overlay_token = await _mint(async_client, jwt, scope="overlay")
+        jwt = await setup_admin(async_client, suffix="_rightscope")
+        overlay_token = await mint_token(async_client, jwt, scope="overlay")
 
         response = await async_client.get(f"/api/v1/printers/{printer_row.id}/overlay-status?token={overlay_token}")
         assert response.status_code == 200, response.text
         assert response.json()["name"] == "Stream P1S"
 
     async def test_revoked_overlay_token_is_rejected(self, async_client: AsyncClient, printer_row):
-        jwt = await _setup_admin(async_client, suffix="_revoked")
+        jwt = await setup_admin(async_client, suffix="_revoked")
         created = await async_client.post(
             "/api/v1/auth/tokens",
             headers={"Authorization": f"Bearer {jwt}"},
@@ -132,8 +108,8 @@ class TestOverlayFeedPayload:
         that is what distinguishes the scope. Assert the exact key set so the
         payload can't silently grow to leak more than the overlay draws.
         """
-        jwt = await _setup_admin(async_client, suffix="_payload")
-        overlay_token = await _mint(async_client, jwt, scope="overlay")
+        jwt = await setup_admin(async_client, suffix="_payload")
+        overlay_token = await mint_token(async_client, jwt, scope="overlay")
 
         response = await async_client.get(f"/api/v1/printers/{printer_row.id}/overlay-status?token={overlay_token}")
         assert response.status_code == 200
@@ -146,6 +122,7 @@ class TestOverlayFeedPayload:
         assert set(entry) == {
             "id",
             "name",
+            "model",
             "camera_rotation",
             "connected",
             "state",
@@ -156,6 +133,7 @@ class TestOverlayFeedPayload:
             "layer_num",
             "total_layers",
             "stg_cur_name",
+            "temperatures",
             "time_format",
         }
 
@@ -163,21 +141,82 @@ class TestOverlayFeedPayload:
         """No MQTT client runs in tests, so the printer has no state — the
         overlay must render its offline state rather than erroring.
         """
-        jwt = await _setup_admin(async_client, suffix="_offline")
-        overlay_token = await _mint(async_client, jwt, scope="overlay")
+        jwt = await setup_admin(async_client, suffix="_offline")
+        overlay_token = await mint_token(async_client, jwt, scope="overlay")
 
         response = await async_client.get(f"/api/v1/printers/{printer_row.id}/overlay-status?token={overlay_token}")
         entry = response.json()
+        assert entry["model"] == "P1S"
         assert entry["connected"] is False
         assert entry["state"] is None
         assert entry["current_print"] is None
+        # Present but empty rather than absent (#1422): the overlay reads the
+        # key unconditionally, and an offline printer simply has no readings.
+        assert entry["temperatures"] == {}
+
+    async def test_temperatures_are_filtered_not_passed_through(
+        self, async_client: AsyncClient, printer_row, monkeypatch
+    ):
+        """#1422 — the overlay can draw nozzle/bed/chamber, so the feed carries
+        them. It sends only the readings it draws: `state.temperatures` is also
+        the MQTT client's working memory and holds private bookkeeping and
+        derived heater flags that an overlay token has no business seeing.
+        """
+        from backend.app.services import printer_manager as pm
+
+        class _FakeState:
+            connected = True
+            state = "RUNNING"
+            current_print = "bracket.3mf"
+            gcode_file = "/data/Metadata/plate_1.gcode"
+            progress = 42.0
+            remaining_time = 30
+            layer_num = 10
+            total_layers = 100
+            stg_cur = -1
+            temperatures = {
+                "nozzle": 219.7,
+                "nozzle_target": 220.0,
+                "bed": 60.0,
+                "bed_target": 60.0,
+                "chamber": 38.0,
+                "nozzle_heating": True,
+                "_nozzle_target_set_time": 1754300000.0,
+            }
+
+        monkeypatch.setattr(pm.printer_manager, "get_status", lambda _pid: _FakeState())
+
+        jwt = await setup_admin(async_client, suffix="_temps")
+        overlay_token = await mint_token(async_client, jwt, scope="overlay")
+
+        response = await async_client.get(f"/api/v1/printers/{printer_row.id}/overlay-status?token={overlay_token}")
+        assert response.json()["model"] == "P1S"
+        temps = response.json()["temperatures"]
+
+        assert temps["nozzle"] == 219.7
+        assert temps["nozzle_target"] == 220.0
+        assert temps["bed"] == 60.0
+        # The fixture printer is a P1S — no real chamber sensor, so the
+        # meaningless reading is dropped rather than drawn on a live stream.
+        assert "chamber" not in temps
+        assert "nozzle_heating" not in temps
+        assert "_nozzle_target_set_time" not in temps
+
+    async def test_unknown_model_is_null(self, async_client: AsyncClient, printer_row, db_session):
+        printer_row.model = None
+        await db_session.commit()
+        jwt = await setup_admin(async_client, suffix="_nomodel")
+        overlay_token = await mint_token(async_client, jwt, scope="overlay")
+        response = await async_client.get(f"/api/v1/printers/{printer_row.id}/overlay-status?token={overlay_token}")
+        assert response.status_code == 200
+        assert response.json()["model"] is None
 
     async def test_unknown_printer_is_404_not_401(self, async_client: AsyncClient):
         """A valid token for a printer id that doesn't exist is a 404 — the token
         passed the gate, the resource simply isn't there.
         """
-        jwt = await _setup_admin(async_client, suffix="_404")
-        overlay_token = await _mint(async_client, jwt, scope="overlay")
+        jwt = await setup_admin(async_client, suffix="_404")
+        overlay_token = await mint_token(async_client, jwt, scope="overlay")
 
         response = await async_client.get(f"/api/v1/printers/99999/overlay-status?token={overlay_token}")
         assert response.status_code == 404
@@ -191,26 +230,26 @@ class TestOverlayTokenReachesTheVideo:
     async def test_overlay_token_passes_the_camera_stream_gate(self, async_client: AsyncClient):
         from backend.app.core.auth import verify_camera_stream_token
 
-        jwt = await _setup_admin(async_client, suffix="_video")
-        overlay_token = await _mint(async_client, jwt, scope="overlay")
+        jwt = await setup_admin(async_client, suffix="_video")
+        overlay_token = await mint_token(async_client, jwt, scope="overlay")
 
-        assert await verify_camera_stream_token(overlay_token) is True
+        assert await verify_camera_stream_token(overlay_token) == ALL_PRINTERS  # admin-owned: every printer (#1727)
 
     async def test_overlay_gate_rejects_camera_stream_and_camwall(self, async_client: AsyncClient):
         from backend.app.core.auth import verify_overlay_token
 
-        jwt = await _setup_admin(async_client, suffix="_gate")
-        stream_token = await _mint(async_client, jwt, scope="camera_stream")
-        camwall_token = await _mint(async_client, jwt, scope="camwall", name="wall")
+        jwt = await setup_admin(async_client, suffix="_gate")
+        stream_token = await mint_token(async_client, jwt, scope="camera_stream")
+        camwall_token = await mint_token(async_client, jwt, scope="camwall", name="wall")
 
-        assert await verify_overlay_token(stream_token) is False
-        assert await verify_overlay_token(camwall_token) is False
+        assert await verify_overlay_token(stream_token) is None
+        assert await verify_overlay_token(camwall_token) is None
 
     async def test_camwall_gate_rejects_an_overlay_token(self, async_client: AsyncClient):
         """Symmetric guard: the new scope must not widen the Cam Wall either."""
         from backend.app.core.auth import verify_camwall_token
 
-        jwt = await _setup_admin(async_client, suffix="_gate_camwall")
-        overlay_token = await _mint(async_client, jwt, scope="overlay")
+        jwt = await setup_admin(async_client, suffix="_gate_camwall")
+        overlay_token = await mint_token(async_client, jwt, scope="overlay")
 
-        assert await verify_camwall_token(overlay_token) is False
+        assert await verify_camwall_token(overlay_token) is None

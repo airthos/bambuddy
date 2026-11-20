@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime
 
 from sqlalchemy import (
+    JSON,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -13,6 +14,7 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
+    true,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -89,20 +91,32 @@ class OIDCProvider(Base):
     # and is the recommended Azure configuration.
     # Has no interaction with require_email_verified when set to a non-"email" value:
     # custom claims never perform an email_verified check regardless of that setting.
-    email_claim: Mapped[str] = mapped_column(String(64), default="email")
+    email_claim: Mapped[str] = mapped_column(String(64), default="email", server_default="email")
     # When True (default), the "email" claim is only trusted when email_verified=True.
     # Set to False to accept the email even when email_verified is absent — required
     # for providers like Azure Entra ID that never send email_verified and where a
     # custom claim (email_claim != "email") is not preferred.
     # Has no effect when email_claim is not "email": the custom-claim path never
     # performs an email_verified check regardless of this setting.
-    require_email_verified: Mapped[bool] = mapped_column(Boolean, default=True)
+    require_email_verified: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     # Nullable FK — configurable default group for auto-created OIDC users.
     # Falls back to "Viewers" when None. ON DELETE SET NULL fires on PostgreSQL;
     # SQLite ignores it (no PRAGMA foreign_keys=ON), so runtime resolution handles dangling refs.
     default_group_id: Mapped[int | None] = mapped_column(
         Integer, ForeignKey("groups.id", ondelete="SET NULL"), nullable=True, default=None
     )
+    # #3107 — JWT claim name the group sync reads IdP groups from. Defaults to
+    # "groups". Providers put groups in different claims (Keycloak: "groups"
+    # as a JSON array after a client mapper; Authentik: "groups" as an array,
+    # but some setups ship "roles" or a custom claim), so it is configurable
+    # like email_claim. Same character rules enforced by _validate_email_claim_name.
+    group_claim: Mapped[str] = mapped_column(String(64), default="groups", server_default="groups")
+    # #3107 — mapping of IdP group value -> Bambuddy group name. Empty dict
+    # (the default) disables group sync entirely: the provider behaves exactly
+    # as it did before the column existed. Only groups named in the values are
+    # managed by the sync; everything else on the user is a manual assignment
+    # and survives logins (#1292 semantics, same as the LDAP sync).
+    group_mapping: Mapped[dict[str, str]] = mapped_column(JSON, default=dict, server_default="{}")
     # Optional icon URL the admin entered. The actual image bytes are fetched
     # server-side and cached in icon_data — the SPA never hotlinks this URL
     # (would require loosening img-src CSP; see PR #1333 / issue #1333).

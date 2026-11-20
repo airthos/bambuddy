@@ -3,7 +3,7 @@
  */
 
 import { describe, it, expect, beforeEach } from 'vitest';
-import { screen, waitFor, fireEvent, within } from '@testing-library/react';
+import { act, screen, waitFor, fireEvent, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { render } from '../utils';
 import { PrintersPage } from '../../pages/PrintersPage';
@@ -149,6 +149,22 @@ describe('PrintersPage', () => {
         // Status should be shown - may vary based on state
         expect(screen.getByText('X1 Carbon')).toBeInTheDocument();
       });
+    });
+
+    it('offers FTP file browsing when MQTT status is offline', async () => {
+      server.use(
+        http.get('/api/v1/printers/:id/status', () => {
+          return HttpResponse.json({ ...mockPrinterStatus, connected: false });
+        }),
+      );
+
+      render(<PrintersPage />);
+
+      const browseButtons = await screen.findAllByRole('button', { name: /browse printer files/i });
+      expect(browseButtons).toHaveLength(mockPrinters.length);
+      await userEvent.click(browseButtons[0]);
+
+      expect(await screen.findByText('File Manager')).toBeInTheDocument();
     });
   });
 
@@ -406,6 +422,40 @@ describe('PrintersPage', () => {
       });
     });
 
+    it('names the X2D aux fans by their side, left first (#3373)', async () => {
+      // On the X2D part 2 ("aux") is the left fan and part 10 ("aux2") the
+      // right one: Bambu Studio's N6.json, the other way round from the P2S.
+      renderWithStatus(
+        { ...mockPrinters[0], model: 'X2D' },
+        { ...statusWithFans, left_aux_fan_speed: 80, exhaust_fan_present: true },
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTitle('Right Auxiliary Fan')).toBeInTheDocument();
+      });
+      expect(screen.queryByTitle('Auxiliary Fan')).not.toBeInTheDocument();
+
+      const order = ['Part Cooling Fan', 'Left Auxiliary Fan', 'Right Auxiliary Fan', 'Exhaust'].map(
+        (title) => screen.getByTitle(title),
+      );
+      for (let i = 1; i < order.length; i++) {
+        expect(order[i - 1].compareDocumentPosition(order[i])).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+      }
+    });
+
+    it('keeps the P2S names: no right aux badge', async () => {
+      renderWithStatus(
+        { ...mockPrinters[0], model: 'P2S' },
+        { ...statusWithFans, left_aux_fan_speed: 80 },
+      );
+
+      await waitFor(() => {
+        expect(screen.getByTitle('Left Auxiliary Fan')).toBeInTheDocument();
+      });
+      expect(screen.getByTitle('Auxiliary Fan')).toBeInTheDocument();
+      expect(screen.queryByTitle('Right Auxiliary Fan')).not.toBeInTheDocument();
+    });
+
     it('shows left aux fan badge even at 0% while installed', async () => {
       renderWithStatus(
         { ...mockPrinters[0], model: 'P2S' },
@@ -494,6 +544,47 @@ describe('PrintersPage', () => {
       });
 
       expect(screen.getAllByRole('button', { name: 'Mark plate as cleared' }).length).toBeGreaterThan(0);
+    });
+
+    it('offers the clear action on a powered-down printer (#2864)', async () => {
+      // Auto Power Off leaves exactly this: gate up, printer unreachable. The
+      // control used to be hidden here, so a plate cleared by hand could not be
+      // acknowledged until the printer was powered back on.
+      let awaitingPlateClear = true;
+      let cleared = false;
+
+      server.use(
+        http.get('/api/v1/printers/', () => {
+          return HttpResponse.json([mockPrinters[0]]);
+        }),
+        http.get('/api/v1/printers/:id/status', () => {
+          return HttpResponse.json({
+            ...mockPrinterStatus,
+            connected: false,
+            state: 'unknown',
+            awaiting_plate_clear: awaitingPlateClear,
+          });
+        }),
+        http.post('/api/v1/printers/:id/clear-plate', () => {
+          cleared = true;
+          awaitingPlateClear = false;
+          return HttpResponse.json({ success: true, message: 'Plate cleared' });
+        })
+      );
+
+      render(<PrintersPage />);
+
+      const clearButton = await screen.findByRole('button', { name: 'Mark plate as cleared' });
+
+      fireEvent.click(clearButton);
+
+      await waitFor(() => {
+        expect(cleared).toBe(true);
+      });
+
+      await waitFor(() => {
+        expect(screen.queryByRole('button', { name: 'Mark plate as cleared' })).not.toBeInTheDocument();
+      });
     });
 
     it('updates the plate clear status after using the printer card action', async () => {
@@ -777,6 +868,64 @@ describe('PrintersPage', () => {
       expect(dashes.length).toBeGreaterThanOrEqual(3); // 3 empty rack positions (IDs 19,20,21)
     });
 
+    const hoverRackDiameter = async (diameter: string) => {
+      await waitFor(() => {
+        expect(screen.getAllByText('Nozzle Rack').length).toBeGreaterThan(0);
+      });
+      const chip = Array.from(document.querySelectorAll('span[data-rack-diameter]')).find(
+        s => s.textContent === diameter,
+      )!;
+      await userEvent.setup().hover(chip);
+    };
+
+    it('shows the nozzle print time from H2C firmware on the rack hover card (#1908)', async () => {
+      const withPrintTime = {
+        ...h2cStatus,
+        nozzle_rack: h2cStatus.nozzle_rack.map(n => (n.id === 17 ? { ...n, print_time_s: 90061 } : n)),
+      };
+      server.use(http.get('/api/v1/printers/:id/status', () => HttpResponse.json(withPrintTime)));
+
+      render(<PrintersPage />);
+      await hoverRackDiameter('0.6');
+
+      expect(await screen.findByText('Print time')).toBeInTheDocument();
+      expect(screen.getByText('25h 1m')).toBeInTheDocument();
+    });
+
+    it('shows the print time of the left and right hotend on their hover card (#1908)', async () => {
+      localStorage.setItem('printerCardSize', '2');
+      const h2c = { ...mockPrinters[0], model: 'H2C', nozzle_count: 2 };
+      const dualWithPrintTime = {
+        ...h2cStatus,
+        temperatures: { ...mockPrinterStatus.temperatures, nozzle_2: 25 },
+        nozzle_rack: h2cStatus.nozzle_rack.map(n =>
+          n.id === 0 ? { ...n, print_time_s: 3660 } : n.id === 1 ? { ...n, print_time_s: 7320 } : n,
+        ),
+      };
+      server.use(
+        http.get('/api/v1/printers/', () => HttpResponse.json([h2c])),
+        http.get('/api/v1/printers/:id/status', () => HttpResponse.json(dualWithPrintTime)),
+      );
+
+      render(<PrintersPage />);
+      const left = await screen.findByText('L 0.4');
+      await userEvent.setup().hover(left);
+
+      expect(await screen.findByText('2h 2m')).toBeInTheDocument(); // left hotend (id 1)
+      expect(screen.getByText('1h 1m')).toBeInTheDocument(); // right hotend (id 0)
+      expect(screen.getAllByText('Print time')).toHaveLength(2);
+    });
+
+    it('leaves the print time row out when the firmware does not report it (#1908)', async () => {
+      server.use(http.get('/api/v1/printers/:id/status', () => HttpResponse.json(h2cStatus)));
+
+      render(<PrintersPage />);
+      await hoverRackDiameter('0.6');
+
+      expect(await screen.findByText('Wear')).toBeInTheDocument();
+      expect(screen.queryByText('Print time')).not.toBeInTheDocument();
+    });
+
     it('keeps empty slot anchored to physical position when its nozzle is mounted (#943)', async () => {
       // H2C with rack slot 16 picked up into the hotend — firmware omits ID 16
       // entirely from nozzle.info. Each rack diameter is unique so we can assert
@@ -812,8 +961,55 @@ describe('PrintersPage', () => {
       const rackLabel = screen.getAllByText('Nozzle Rack')[0];
       const rackCard = rackLabel.parentElement!;
       const slotRow = rackCard.querySelectorAll('div.flex')[0];
-      const slotTexts = Array.from(slotRow.querySelectorAll('span')).map(s => s.textContent);
+      // Match the diameter spans specifically — each chip also carries a slot
+      // number span, and a bare `span` sweep would interleave the two.
+      const slotTexts = Array.from(slotRow.querySelectorAll('span[data-rack-diameter]')).map(s => s.textContent);
       expect(slotTexts).toEqual(['—', '0.2', '0.6', '0.8', '1.0', '1.2']);
+    });
+
+    it('labels every rack position 1..6 regardless of which nozzles are present', async () => {
+      // The numbering is positional, not a count of what is loaded: the empty
+      // position keeps its number so "the nozzle in slot 4" means the same
+      // thing whether or not slots 1..3 are occupied.
+      server.use(
+        http.get('/api/v1/printers/:id/status', () => {
+          return HttpResponse.json(h2cStatus);
+        })
+      );
+
+      render(<PrintersPage />);
+
+      await waitFor(() => {
+        expect(screen.getAllByText('Nozzle Rack').length).toBeGreaterThan(0);
+      });
+
+      const rackLabel = screen.getAllByText('Nozzle Rack')[0];
+      const slotRow = rackLabel.parentElement!.querySelectorAll('div.flex')[0];
+      const numbers = Array.from(slotRow.querySelectorAll('span:not([data-rack-diameter])')).map(s => s.textContent);
+      expect(numbers).toEqual(['1', '2', '3', '4', '5', '6']);
+    });
+
+    it('sizes the rack chips from the card scale rather than a fixed 28px', async () => {
+      // The chips were hard-coded while the type and icons around them grow
+      // with the card size, so at L and XL the rack read as a shrunken strip
+      // next to neighbours that had grown by up to 40%.
+      server.use(
+        http.get('/api/v1/printers/:id/status', () => {
+          return HttpResponse.json(h2cStatus);
+        })
+      );
+
+      render(<PrintersPage />);
+
+      await waitFor(() => {
+        expect(screen.getAllByText('Nozzle Rack').length).toBeGreaterThan(0);
+      });
+
+      const rackLabel = screen.getAllByText('Nozzle Rack')[0];
+      const slotRow = rackLabel.parentElement!.querySelectorAll('div.flex')[0];
+      const chip = slotRow.querySelector('span[data-rack-diameter]')!.parentElement!;
+      expect(chip.className).toContain('w-[var(--pc-i7,28px)]');
+      expect(chip.className).toContain('h-[var(--pc-i7,28px)]');
     });
 
     it('hides nozzle rack when only L/R nozzles present (H2D)', async () => {
@@ -930,6 +1126,36 @@ describe('PrintersPage', () => {
       // Version should not appear when firmware check is disabled
       expect(screen.queryByText('01.09.00.00')).not.toBeInTheDocument();
       expect(screen.queryByText('01.08.00.00')).not.toBeInTheDocument();
+    });
+
+    it('never asks for firmware when the check is off, not even before preferences load', async () => {
+      // The page used to decide on `undefined` while the preferences were still
+      // loading, so a check switched off still went out once per printer.
+      let firmwareRequests = 0;
+      let releasePreferences: () => void = () => {};
+      const preferencesHeld = new Promise<void>((resolve) => {
+        releasePreferences = resolve;
+      });
+      server.use(
+        http.get('/api/v1/firmware/updates/:id', () => {
+          firmwareRequests += 1;
+          return HttpResponse.json(firmwareUpdateAvailable);
+        }),
+        http.get('/api/v1/settings/ui-preferences', async () => {
+          await preferencesHeld;
+          return HttpResponse.json({ check_printer_firmware: false });
+        })
+      );
+
+      render(<PrintersPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('X1 Carbon')).toBeInTheDocument();
+      });
+      releasePreferences();
+      // Long enough for a query that was going to fire to have fired.
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      expect(firmwareRequests).toBe(0);
     });
 
     it('hides badge when API has no firmware data for the model', async () => {
@@ -1607,5 +1833,84 @@ describe('PrintersPage Phase 14 — Local-Branch BL-detection symmetry', () => {
       p => typeof (p.inventory as { onUnassignSpool?: () => void } | undefined)?.onUnassignSpool === 'function'
     );
     expect(definedUnassign.length).toBe(0);
+  });
+});
+
+/**
+ * F-U17: a failed Unassign on the printer card was silent in both inventory
+ * modes -- no toast, and the spool stayed assigned, so it looked like the
+ * click did nothing.
+ */
+describe('PrintersPage — Unassign failure', () => {
+  const genericTray = {
+    id: 0,
+    tray_type: 'PLA',
+    tray_uuid: '00000000000000000000000000000000',
+    tag_uid: '0000000000000000',
+    tray_color: 'FF0000FF',
+    tray_sub_brands: 'Generic PLA',
+  };
+
+  beforeEach(() => {
+    phase14HoverCardProps.length = 0;
+    localStorage.removeItem('printerCardSize');
+    server.use(
+      http.get('/api/v1/printers/', () => HttpResponse.json(mockPrinters)),
+      http.get('/api/v1/printers/:id/status', () =>
+        HttpResponse.json({ ...mockPrinterStatus, ams: [{ id: 0, tray: [genericTray] }] }),
+      ),
+      http.get('/api/v1/queue/', () => HttpResponse.json([])),
+    );
+  });
+
+  async function unassignFromCard() {
+    const withUnassign = await waitFor(() => {
+      const found = phase14HoverCardProps.find(
+        (p) => typeof (p.inventory as { onUnassignSpool?: () => void } | undefined)?.onUnassignSpool === 'function',
+      );
+      expect(found).toBeDefined();
+      return found!;
+    }, { timeout: 3000 });
+    act(() => {
+      (withUnassign.inventory as { onUnassignSpool: () => void }).onUnassignSpool();
+    });
+  }
+
+  it('reports a failed built-in unassign', async () => {
+    server.use(
+      http.get('/api/v1/spoolman/status', () => HttpResponse.json({ enabled: false, connected: false })),
+      http.get('/api/v1/inventory/assignments', () => HttpResponse.json([{
+        id: 1, spool_id: 42, printer_id: 1, ams_id: 0, tray_id: 0, printer_name: 'X1 Carbon', ams_label: null,
+        spool: { id: 42, material: 'PLA', brand: 'Generic', color_name: 'Red', label_weight: 1000, weight_used: 0, rgba: 'FF0000FF' },
+      }])),
+      http.delete('/api/v1/inventory/assignments/:pid/:aid/:tid', () =>
+        HttpResponse.json({ detail: 'Built-in unassign refused' }, { status: 500 }),
+      ),
+    );
+    render(<PrintersPage />);
+
+    await unassignFromCard();
+
+    expect(await screen.findByText(/Built-in unassign refused/)).toBeInTheDocument();
+  });
+
+  it('reports a failed Spoolman unassign', async () => {
+    server.use(
+      http.get('/api/v1/spoolman/status', () => HttpResponse.json({ enabled: true, connected: true })),
+      http.get('/api/v1/spoolman/inventory/spools', () => HttpResponse.json([
+        { id: 77, material: 'PLA', brand: 'Generic', color_name: 'Red', label_weight: 1000, weight_used: 0, rgba: 'FF0000FF' },
+      ])),
+      http.get('/api/v1/spoolman/inventory/slot-assignments/all', () => HttpResponse.json([
+        { printer_id: 1, printer_name: 'X1 Carbon', ams_id: 0, tray_id: 0, spoolman_spool_id: 77 },
+      ])),
+      http.delete('/api/v1/spoolman/inventory/slot-assignments/:id', () =>
+        HttpResponse.json({ detail: 'Spoolman unassign refused' }, { status: 503 }),
+      ),
+    );
+    render(<PrintersPage />);
+
+    await unassignFromCard();
+
+    expect(await screen.findByText(/Spoolman unassign refused/)).toBeInTheDocument();
   });
 });

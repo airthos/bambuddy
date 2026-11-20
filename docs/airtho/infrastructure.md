@@ -59,4 +59,4 @@ instead of pulling, `chmod +x scripts/farm_process.py` on the server.
 
 - `origin` → `https://github.com/airthos/bambuddy.git` (this fork; deploy target)
 - `upstream` → `https://github.com/maziggy/bambuddy.git` (source project; pull
-  occasionally to merge new releases — currently tracking a fork of `v0.2.4.3`)
+  occasionally to merge new releases — currently tracking `v1.3.1`, see [`upstream-sync.md`](upstream-sync.md))

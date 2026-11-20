@@ -14,6 +14,8 @@ printing physical slot 3.
 import json
 from unittest.mock import MagicMock
 
+import pytest
+
 from backend.app.services.bambu_mqtt import (
     A2L_LITE_GLOBAL_BASE,
     A2L_LITE_NORMALIZED_AMS_ID,
@@ -249,12 +251,14 @@ class TestOutboundTranslation:
         assert p["filaments"][0]["tray_id"] == 66  # 26 (normalised) -> 66 (physical)
 
     def test_load_filament_target_and_ams(self):
+        """BambuStudio (command_ams_change_filament): for a unit id of 16 or
+        more the target is the unit id itself, not a global tray."""
         client = _wired(_client())
         assert client.ams_load_filament(tray_id=26)
         p = _last_payload(client)
         assert p["ams_id"] == A2L_LITE_PHYSICAL_AMS_ID
         assert p["slot_id"] == 2
-        assert p["target"] == 66
+        assert p["target"] == A2L_LITE_PHYSICAL_AMS_ID
 
     def test_unload_uses_physical_ams(self):
         client = _wired(_client())
@@ -262,10 +266,17 @@ class TestOutboundTranslation:
         assert client.ams_unload_filament()
         assert _last_payload(client)["ams_id"] == A2L_LITE_PHYSICAL_AMS_ID
 
-    def test_refresh_tray_uses_physical_16(self):
+    @pytest.mark.asyncio
+    async def test_refresh_tray_uses_physical_16(self):
         client = _wired(_client())
         client.state.tray_now = 255  # nothing loaded, so refresh is allowed
-        ok, _ = client.ams_refresh_tray(ams_id=6, tray_id=2)
+
+        def accept(_topic, body, **_kw):
+            sent = json.loads(body)["print"]
+            client._process_message({"print": {**sent, "result": "SUCCESS", "reason": ""}})
+
+        client._client.publish.side_effect = accept
+        ok, _ = await client.ams_refresh_tray(ams_id=6, tray_id=2)
         assert ok
         p = _last_payload(client)
         assert p["ams_id"] == A2L_LITE_PHYSICAL_AMS_ID

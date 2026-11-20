@@ -5,22 +5,9 @@ import { Check, AlertTriangle, RefreshCw, Unlink } from 'lucide-react';
 import type { InventorySpool } from '../../api/client';
 import { spoolbuddyApi, api } from '../../api/client';
 import { SpoolIcon } from './SpoolIcon';
-import { spoolColorString } from '../../utils/colors';
-
-const DEFAULT_CORE_WEIGHT_KEY = 'spoolbuddy-default-core-weight';
-
-function getDefaultCoreWeight(): number {
-  try {
-    const stored = localStorage.getItem(DEFAULT_CORE_WEIGHT_KEY);
-    if (stored) {
-      const weight = parseInt(stored, 10);
-      if (weight >= 0 && weight <= 500) return weight;
-    }
-  } catch {
-    // Ignore errors
-  }
-  return 250;
-}
+import { resolveSpoolColorName, spoolColorString } from '../../utils/colors';
+import { shownCostPerKg } from '../../utils/spoolCost';
+import { DEFAULT_CORE_WEIGHT_G } from '../../utils/weight';
 
 interface InventorySpoolInfoCardProps {
   spool: InventorySpool;
@@ -63,10 +50,14 @@ export function InventorySpoolInfoCard({
   const kProfiles = (spool.k_profiles && spool.k_profiles.length > 0) ? spool.k_profiles : fetchedKProfiles;
 
   const colorHex = spoolColorString(spool.rgba);
+  // The stored name is not the displayed one: Bambu tags often carry no
+  // colour name at all, or an internal code, and Spoolman has no field for
+  // one — the catalog resolves the swatch's hex instead (#3090, #857).
+  const colorName = resolveSpoolColorName(spool.color_name, spool.rgba, spool.color_name_is_synthesized);
 
   const coreWeight = (spool.core_weight && spool.core_weight > 0)
     ? spool.core_weight
-    : getDefaultCoreWeight();
+    : DEFAULT_CORE_WEIGHT_G;
 
   const grossWeightFromScale = liveScaleWeight !== null
     ? Math.round(Math.max(0, liveScaleWeight))
@@ -108,6 +99,8 @@ export function InventorySpoolInfoCard({
   // Inventory fallback so gross is always populated across spools.
   const inventoryDerivedGrossWeight = Math.round(calculatedWeight);
   const resolvedGrossWeight = displayedGrossWeight ?? inventoryDerivedGrossWeight;
+  // The rate prints off this spool are charged (SM-C8).
+  const costPerKg = shownCostPerKg(spool);
   const nozzleTempRange = (spool.nozzle_temp_min != null && spool.nozzle_temp_max != null)
     ? `${spool.nozzle_temp_min}-${spool.nozzle_temp_max}\u00B0C`
     : null;
@@ -138,7 +131,7 @@ export function InventorySpoolInfoCard({
     <div className={`flex flex-col items-center space-y-4 max-w-md ${className ?? ''}`}>
       <div className="flex items-start gap-5">
         <div className="relative shrink-0">
-          <SpoolIcon color={colorHex} isEmpty={false} size={100} />
+          <SpoolIcon color={colorHex} isEmpty={false} size={100} spool={spool} />
           {fillPercent !== null && (
             <div
               className="absolute -bottom-2 -right-2 px-2 py-0.5 rounded-full text-xs font-bold text-white shadow-lg"
@@ -152,7 +145,7 @@ export function InventorySpoolInfoCard({
         <div className="flex-1 min-w-0 pt-1">
           <div className="flex items-center gap-2">
             <h3 className="text-lg font-semibold text-zinc-100">
-              {spool.color_name || 'Unknown color'}
+              {colorName || t('spoolbuddy.spool.unknownColor')}
             </h3>
             <span className="text-xs font-mono text-zinc-500 shrink-0">#{spool.id}</span>
           </div>
@@ -229,10 +222,10 @@ export function InventorySpoolInfoCard({
             <span className="font-mono text-zinc-300">{nozzleTempRange}</span>
           </div>
         )}
-        {spool.cost_per_kg != null && spool.cost_per_kg > 0 && (
+        {costPerKg.rate != null && costPerKg.rate > 0 && (
           <div className="flex justify-between items-center">
             <span className="text-zinc-500">{t('spoolbuddy.inventory.costPerKg', 'Cost/kg')}</span>
-            <span className="font-mono text-zinc-300">{spool.cost_per_kg.toFixed(2)}/kg</span>
+            <span className="font-mono text-zinc-300">{costPerKg.rate.toFixed(2)}/kg</span>
           </div>
         )}
         {kFactorSummary && (

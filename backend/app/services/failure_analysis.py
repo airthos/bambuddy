@@ -1,11 +1,13 @@
 from collections import defaultdict
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone, tzinfo
 
 from sqlalchemy import and_, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from backend.app.core.printer_scope import PrinterScope
 from backend.app.models.print_log import PrintLogEntry
 from backend.app.models.printer import Printer
+from backend.app.utils.local_time import local_date_end, local_date_start
 
 
 class FailureAnalysisService:
@@ -29,17 +31,23 @@ class FailureAnalysisService:
         printer_id: int | None = None,
         project_id: int | None = None,
         created_by_id: int | None = None,
+        printer_scope: PrinterScope | None = None,
+        day_zone: tzinfo | None = None,
     ) -> dict:
-        """Analyze failure patterns across logged print events."""
+        """Analyze failure patterns across logged print events.
+
+        ``day_zone``: the zone ``date_from``/``date_to`` are calendar days in
+        (the server's when None).
+        """
         # Build base query — separate date vs non-date filters for trend reuse
         base_filter = []
         non_date_filter = []
         if date_from or date_to:
             if date_from:
-                dt_from = datetime.combine(date_from, time.min, tzinfo=timezone.utc)
+                dt_from = local_date_start(date_from, day_zone)
                 base_filter.append(PrintLogEntry.created_at >= dt_from)
             if date_to:
-                dt_to = datetime.combine(date_to, time.max, tzinfo=timezone.utc)
+                dt_to = local_date_end(date_to, day_zone)
                 base_filter.append(PrintLogEntry.created_at <= dt_to)
             range_start = dt_from if date_from else datetime.now(timezone.utc) - timedelta(days=365)
             range_end = dt_to if date_to else datetime.now(timezone.utc)
@@ -76,6 +84,9 @@ class FailureAnalysisService:
                 non_date_filter.append(PrintLogEntry.created_by_id.is_(None))
             else:
                 non_date_filter.append(PrintLogEntry.created_by_id == created_by_id)
+        # Only prints on printers the caller may see (#1727)
+        if printer_scope is not None and (clause := printer_scope.where(PrintLogEntry.printer_id)) is not None:
+            non_date_filter.append(clause)
         base_filter.extend(non_date_filter)
 
         # Total counts
@@ -102,6 +113,29 @@ class FailureAnalysisService:
         # prints failed" caption.
         outcome_prints = successful_prints + failed_prints
         failure_rate = (failed_prints / outcome_prints * 100) if outcome_prints > 0 else 0
+
+        # Quality dimension (#1898): a completed print the user marked as
+        # reject is machine-success but scrap. Kept OUT of failure_rate — that
+        # number stays the machine's — and reported separately, with a yield
+        # rate that treats rejects as non-good output.
+        rejected_result = await self.db.execute(
+            select(func.count(PrintLogEntry.id)).where(
+                and_(*base_filter, PrintLogEntry.status == "completed", PrintLogEntry.user_verdict == "reject")
+            )
+        )
+        rejected_prints = rejected_result.scalar() or 0
+        yield_rate = ((successful_prints - rejected_prints) / outcome_prints * 100) if outcome_prints > 0 else 0
+
+        rejects_reason_result = await self.db.execute(
+            select(
+                PrintLogEntry.failure_reason,
+                func.count(PrintLogEntry.id).label("count"),
+            )
+            .where(and_(*base_filter, PrintLogEntry.status == "completed", PrintLogEntry.user_verdict == "reject"))
+            .group_by(PrintLogEntry.failure_reason)
+            .order_by(func.count(PrintLogEntry.id).desc())
+        )
+        rejects_by_reason = {(row[0] or "Unknown"): row[1] for row in rejects_reason_result.fetchall()}
 
         # Failures by reason
         reason_result = await self.db.execute(
@@ -151,6 +185,25 @@ class FailureAnalysisService:
                 select(Printer.id, Printer.name).where(Printer.id.in_(failures_by_printer_id.keys()))
             )
             printer_names = {row[0]: row[1] for row in printers_result.fetchall()}
+            # A printer deleted with its history kept has no row left to read a
+            # name from, and "Printer 3" tells nobody which machine kept failing
+            # (#2873). Each run recorded the name it printed on, so fall back to
+            # the last one that id was known by.
+            missing = [pid for pid in failures_by_printer_id if pid not in printer_names]
+            if missing:
+                last_named_run = (
+                    select(func.max(PrintLogEntry.id).label("entry_id"))
+                    .where(PrintLogEntry.printer_id.in_(missing), PrintLogEntry.printer_name.isnot(None))
+                    .group_by(PrintLogEntry.printer_id)
+                    .subquery()
+                )
+                historic_result = await self.db.execute(
+                    select(PrintLogEntry.printer_id, PrintLogEntry.printer_name).join(
+                        last_named_run, PrintLogEntry.id == last_named_run.c.entry_id
+                    )
+                )
+                for pid, name in historic_result.fetchall():
+                    printer_names[pid] = name
             failures_by_printer = {
                 printer_names.get(pid, f"Printer {pid}"): count for pid, count in failures_by_printer_id.items()
             }
@@ -238,6 +291,9 @@ class FailureAnalysisService:
             "total_prints": total_prints,
             "failed_prints": failed_prints,
             "failure_rate": round(failure_rate, 1),
+            "rejected_prints": rejected_prints,
+            "yield_rate": round(yield_rate, 1),
+            "rejects_by_reason": rejects_by_reason,
             "failures_by_reason": failures_by_reason,
             "failures_by_filament": failures_by_filament,
             "failures_by_printer": failures_by_printer,

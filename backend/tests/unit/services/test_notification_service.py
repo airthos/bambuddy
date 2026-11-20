@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from backend.app.models.notification import NotificationProvider
 from backend.app.services.notification_service import NotificationService
 
 
@@ -96,6 +97,39 @@ class TestNotificationService:
             )
 
             mock_send.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_billing_charge_failure_uses_provider_event(self, service, mock_provider, mock_db):
+        """A failed charge is routed to providers that enabled the billing event."""
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+            mock_build.return_value = ("Billing Charge Failed", "The reservation was retained")
+
+            await service.on_billing_charge_failed(
+                printer_id=7,
+                printer_name="Printer B",
+                filename="paid-job.3mf",
+                archive_id=42,
+                error="unique constraint",
+                db=mock_db,
+            )
+
+            mock_get.assert_awaited_once_with(mock_db, "on_billing_charge_failed", 7)
+            mock_build.assert_awaited_once_with(
+                mock_db,
+                "billing_charge_failed",
+                {
+                    "printer": "Printer B",
+                    "filename": "paid-job",
+                    "archive_id": "42",
+                    "error": "unique constraint",
+                },
+            )
+            assert mock_send.await_args.args[4:7] == ("billing_charge_failed", 7, "Printer B")
 
     # ========================================================================
     # Tests for on_print_complete (status routing)
@@ -312,9 +346,6 @@ class TestNotificationService:
             )
 
             mock_send.assert_called_once()
-            # Verify force_immediate is True for alarms
-            call_kwargs = mock_send.call_args[1]
-            assert call_kwargs.get("force_immediate") is True
 
     @pytest.mark.asyncio
     async def test_on_ams_temperature_high_sends_notification(self, service, mock_provider, mock_db):
@@ -339,9 +370,6 @@ class TestNotificationService:
             )
 
             mock_send.assert_called_once()
-            # Verify force_immediate is True for alarms
-            call_kwargs = mock_send.call_args[1]
-            assert call_kwargs.get("force_immediate") is True
 
     @pytest.mark.asyncio
     async def test_ams_alarm_skipped_when_toggle_disabled(self, service, mock_provider, mock_db):
@@ -395,33 +423,6 @@ class TestNotificationService:
             # When digest is enabled, _send_to_providers should still be called
             # but internally it will queue instead of send immediately
             mock_send.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_force_immediate_bypasses_digest(self, service, mock_provider, mock_db):
-        """Verify force_immediate=True bypasses digest mode."""
-        mock_provider.daily_digest_enabled = True
-        mock_provider.on_ams_humidity_high = True
-
-        with (
-            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
-            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
-            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
-        ):
-            mock_get.return_value = [mock_provider]
-            mock_build.return_value = ("Alert", "Alert message")
-
-            await service.on_ams_humidity_high(
-                printer_id=1,
-                printer_name="Test",
-                ams_label="AMS-A",
-                humidity=75.0,
-                threshold=60.0,
-                db=mock_db,
-            )
-
-            # Verify force_immediate is passed
-            call_kwargs = mock_send.call_args[1]
-            assert call_kwargs.get("force_immediate") is True
 
 
 class TestDigestModeAlwaysSendsImmediately:
@@ -723,7 +724,15 @@ class TestDiscordProvider:
 
 
 class TestNtfyPriority:
-    """Per-event ntfy Priority header (#990)."""
+    """Per-event ntfy Priority header (#990).
+
+    The map is stored under the provider's toggle columns ("on_print_failed"),
+    which is what the dialog builds its rows from, but every sender is called
+    with the bare event name ("print_failed"). These tests use the bare form on
+    purpose: the feature shipped broken because they used to pass the prefixed
+    name straight into ``_send_ntfy``, the one spelling production never
+    produces, so the lookup hit here and missed everywhere else (issue #3139).
+    """
 
     @pytest.fixture
     def service(self):
@@ -749,11 +758,24 @@ class TestNtfyPriority:
         mock_client = self._mock_client(service)
         with patch.object(service, "_get_client", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = mock_client
-            success, _ = await service._send_ntfy(config, "Title", "Body", event_type="on_print_failed")
+            success, _ = await service._send_ntfy(config, "Title", "Body", event_type="print_failed")
 
         assert success is True
         headers = mock_client.post.call_args.kwargs["headers"]
         assert headers.get("Priority") == "5"
+
+    @pytest.mark.asyncio
+    async def test_priority_header_set_for_bare_key(self, service):
+        """A map keyed by the bare event name resolves too, so a config written
+        by hand (or by any future caller that drops the prefix) still works."""
+        config = {"topic": "bambuddy", "event_priorities": {"print_failed": 4}}
+        mock_client = self._mock_client(service)
+        with patch.object(service, "_get_client", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = mock_client
+            await service._send_ntfy(config, "Title", "Body", event_type="print_failed")
+
+        headers = mock_client.post.call_args.kwargs["headers"]
+        assert headers.get("Priority") == "4"
 
     @pytest.mark.asyncio
     async def test_priority_header_omitted_for_unmapped_event(self, service):
@@ -765,7 +787,7 @@ class TestNtfyPriority:
         mock_client = self._mock_client(service)
         with patch.object(service, "_get_client", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = mock_client
-            await service._send_ntfy(config, "Title", "Body", event_type="on_print_complete")
+            await service._send_ntfy(config, "Title", "Body", event_type="print_complete")
 
         headers = mock_client.post.call_args.kwargs["headers"]
         assert "Priority" not in headers
@@ -777,7 +799,7 @@ class TestNtfyPriority:
         mock_client = self._mock_client(service)
         with patch.object(service, "_get_client", new_callable=AsyncMock) as mock_get:
             mock_get.return_value = mock_client
-            await service._send_ntfy(config, "Title", "Body", event_type="on_print_failed")
+            await service._send_ntfy(config, "Title", "Body", event_type="print_failed")
 
         headers = mock_client.post.call_args.kwargs["headers"]
         assert "Priority" not in headers
@@ -808,7 +830,7 @@ class TestNtfyPriority:
             mock_client = self._mock_client(service)
             with patch.object(service, "_get_client", new_callable=AsyncMock) as mock_get:
                 mock_get.return_value = mock_client
-                await service._send_ntfy(config, "Title", "Body", event_type="on_print_failed")
+                await service._send_ntfy(config, "Title", "Body", event_type="print_failed")
 
             headers = mock_client.post.call_args.kwargs["headers"]
             assert "Priority" not in headers, f"unexpected header for bad value {bad!r}"
@@ -828,11 +850,49 @@ class TestNtfyPriority:
                 "Title",
                 "Body",
                 image_data=b"\xff\xd8\xff\xe0fake-jpeg",
-                event_type="on_first_layer_complete",
+                event_type="first_layer_complete",
             )
 
         headers = mock_client.put.call_args.kwargs["headers"]
         assert headers.get("Priority") == "4"
+
+    @pytest.mark.asyncio
+    async def test_priority_reaches_ntfy_from_a_real_event(self, service):
+        """The wiring, end to end: a finished print, a provider configured the
+        way the dialog writes it, and the header on the request that leaves.
+
+        Everything above calls ``_send_ntfy`` directly, so none of it can see a
+        caller passing a key shape the lookup does not understand -- which is
+        exactly how #3139 shipped green.
+        """
+        provider = NotificationProvider(
+            id=1,
+            name="ntfy",
+            provider_type="ntfy",
+            enabled=True,
+            config=json.dumps({"topic": "bambuddy", "event_priorities": {"on_print_complete": 5}}),
+            quiet_hours_enabled=False,
+            daily_digest_enabled=False,
+        )
+        mock_client = self._mock_client(service)
+        mock_db = AsyncMock()
+
+        with (
+            patch.object(service, "_get_client", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_providers,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_template,
+            patch.object(service, "_update_provider_status", new_callable=AsyncMock),
+            patch.object(service, "_log_notification", new_callable=AsyncMock),
+        ):
+            mock_get.return_value = mock_client
+            mock_providers.return_value = [provider]
+            mock_template.return_value = ("Print complete", "Benchy finished")
+
+            await service.on_print_complete(1, "X1C", "completed", {"filename": "benchy.3mf"}, mock_db)
+
+        mock_client.post.assert_called_once()
+        headers = mock_client.post.call_args.kwargs["headers"]
+        assert headers.get("Priority") == "5"
 
 
 class TestHomeAssistantProvider:
@@ -918,6 +978,64 @@ class TestHomeAssistantProvider:
             # ttl must survive as a number, not a string — that's why the
             # field is JSON rather than key=value lines.
             assert payload["data"]["ttl"] == 0
+
+    @pytest.mark.asyncio
+    async def test_send_homeassistant_custom_data_keeps_nested_structures(self, service):
+        """Nested objects and lists reach the notify service unaltered (#1441).
+
+        The three tests around this one all use flat scalars, which is also all
+        the placeholder and the wiki showed — so a user asking whether action
+        buttons work had nothing telling them the field is a verbatim
+        pass-through rather than a key/value list. ``actions`` is the case they
+        asked about: a list of objects, the shape an HA automation writes under
+        ``data.actions``. Nothing between the textarea and the POST inspects the
+        parsed value beyond "is it an object", so this asserts the whole
+        structure rather than a key at a time.
+        """
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+
+        mock_db = AsyncMock()
+
+        with (
+            patch.object(service, "_get_client", new_callable=AsyncMock) as mock_get_client,
+            patch(
+                "backend.app.api.routes.settings.get_homeassistant_settings",
+                new_callable=AsyncMock,
+            ) as mock_ha_settings,
+        ):
+            mock_get_client.return_value = mock_client
+            mock_ha_settings.return_value = {
+                "ha_url": "http://ha.local:8123",
+                "ha_token": "test-token-123",
+                "ha_enabled": True,
+            }
+
+            actions = [
+                {"action": "SNOOZE_PRINT_FINISHED", "title": "Snooze 20 min"},
+                {"action": "BED_COOL_NOTIFY_ON", "title": "Notify on Bed Cool"},
+            ]
+            config = {
+                "service": "notify.mobile_app_myphone",
+                "data": json.dumps({"ttl": 0, "priority": "high", "group": "3D Printer", "actions": actions}),
+            }
+            success, _ = await service._send_homeassistant(config, "Print Finished", "Print is finished", db=mock_db)
+
+            assert success is True
+            payload = mock_client.post.call_args.kwargs.get("json") or mock_client.post.call_args[1].get("json")
+            assert payload["data"] == {
+                "ttl": 0,
+                "priority": "high",
+                "group": "3D Printer",
+                "actions": actions,
+            }
+            # Spelled out separately: a flattening or scalar-only filter would
+            # still leave the three sibling keys correct, so the equality above
+            # is not on its own evidence that the list survived.
+            assert payload["data"]["actions"] == actions
 
     @pytest.mark.asyncio
     async def test_send_homeassistant_without_data_omits_key(self, service):
@@ -1211,6 +1329,163 @@ class TestBarkProvider:
 
         assert success is True
         mock_send.assert_called_once()
+
+
+class TestGotifyProvider:
+    """Gotify (self-hosted push) provider (#2743)."""
+
+    @pytest.fixture
+    def service(self):
+        return NotificationService()
+
+    def _client_returning(self, status_code: int, text: str = ""):
+        mock_response = MagicMock()
+        mock_response.status_code = status_code
+        mock_response.text = text
+        mock_client = AsyncMock()
+        mock_client.post = AsyncMock(return_value=mock_response)
+        return mock_client
+
+    async def _send(self, service, mock_client, config, **kwargs):
+        with patch.object(service, "_get_client", new_callable=AsyncMock) as mock_get_client:
+            mock_get_client.return_value = mock_client
+            return await service._send_gotify(config, "Title", "Body", **kwargs)
+
+    @pytest.mark.asyncio
+    async def test_posts_message_with_token_in_header(self, service):
+        """The token goes in X-Gotify-Key, never in the URL, and an event
+        without a mapped level goes out at Gotify's middle priority."""
+        mock_client = self._client_returning(200)
+
+        success, _ = await self._send(
+            service, mock_client, {"server": "https://gotify.example.com/", "app_token": "Atoken"}
+        )
+
+        assert success is True
+        call_args = mock_client.post.call_args
+        assert call_args[0][0] == "https://gotify.example.com/message"
+        assert call_args.kwargs["headers"] == {"X-Gotify-Key": "Atoken"}
+        assert call_args.kwargs["json"] == {"title": "Title", "message": "Body", "priority": 5}
+
+    @pytest.mark.asyncio
+    async def test_a_pasted_endpoint_url_is_not_doubled(self, service):
+        mock_client = self._client_returning(200)
+
+        await self._send(service, mock_client, {"server": "https://g.example/gotify/message/", "app_token": "t"})
+
+        assert mock_client.post.call_args[0][0] == "https://g.example/gotify/message"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("level", "priority"),
+        [(1, 0), (2, 2), (3, 5), (4, 8), (5, 10)],
+    )
+    async def test_event_level_maps_to_gotify_priority(self, service, level, priority):
+        """The dialog stores the toggle column name; senders get the bare event."""
+        mock_client = self._client_returning(200)
+        config = {"server": "https://g.example", "app_token": "t", "event_priorities": {"on_print_failed": level}}
+
+        await self._send(service, mock_client, config, event_type="print_failed")
+
+        assert mock_client.post.call_args.kwargs["json"]["priority"] == priority
+
+    @pytest.mark.asyncio
+    async def test_invalid_level_falls_back_to_default(self, service):
+        mock_client = self._client_returning(200)
+        config = {"server": "https://g.example", "app_token": "t", "event_priorities": {"print_failed": 9}}
+
+        await self._send(service, mock_client, config, event_type="print_failed")
+
+        assert mock_client.post.call_args.kwargs["json"]["priority"] == 5
+
+    @pytest.mark.asyncio
+    async def test_tap_url_and_photo_go_in_notification_extras(self, service):
+        mock_client = self._client_returning(200)
+
+        await self._send(
+            service,
+            mock_client,
+            {"server": "https://g.example", "app_token": "t"},
+            url="https://bambuddy.example/archives?confirm=1",
+            image_url="https://bambuddy.example/api/v1/notifications/photos/a.jpg",
+        )
+
+        assert mock_client.post.call_args.kwargs["json"]["extras"] == {
+            "client::notification": {
+                "click": {"url": "https://bambuddy.example/archives?confirm=1"},
+                "bigImageUrl": "https://bambuddy.example/api/v1/notifications/photos/a.jpg",
+            }
+        }
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("config", [{"server": "https://g.example"}, {"app_token": "t"}, {}])
+    async def test_missing_server_or_token(self, service, config):
+        mock_client = self._client_returning(200)
+
+        success, message = await self._send(service, mock_client, config)
+
+        assert success is False
+        assert "required" in message
+        mock_client.post.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_http_error_does_not_echo_the_body(self, service):
+        mock_client = self._client_returning(401, text='{"error":"Unauthorized","errorDescription":"secret"}')
+
+        success, message = await self._send(service, mock_client, {"server": "https://g.example", "app_token": "bad"})
+
+        assert success is False
+        assert "HTTP 401" in message
+        assert "secret" not in message
+
+    @pytest.mark.asyncio
+    async def test_send_to_provider_dispatches_gotify(self, service):
+        provider = MagicMock()
+        provider.provider_type = "gotify"
+        provider.config = json.dumps({"server": "https://g.example", "app_token": "t"})
+        provider.quiet_hours_enabled = False
+
+        with patch.object(service, "_send_gotify", new_callable=AsyncMock) as mock_send:
+            mock_send.return_value = (True, "OK")
+            success, _ = await service._send_to_provider(
+                provider, "Title", "Message", db=AsyncMock(), event_type="print_failed"
+            )
+
+        assert success is True
+        assert mock_send.call_args.kwargs["event_type"] == "print_failed"
+        assert mock_send.call_args.kwargs["url"] is None
+
+    @pytest.mark.asyncio
+    async def test_confirm_request_opens_the_confirm_url_on_tap(self, service):
+        provider = MagicMock()
+        provider.provider_type = "gotify"
+        provider.config = json.dumps({"server": "https://g.example", "app_token": "t"})
+        provider.quiet_hours_enabled = False
+        provider.attach_photo = False
+
+        with patch.object(service, "_send_gotify", new_callable=AsyncMock) as mock_send:
+            mock_send.return_value = (True, "OK")
+            await service._send_to_provider(
+                provider,
+                "Title",
+                "Message",
+                db=AsyncMock(),
+                event_type="print_confirm_request",
+                variables={"confirm_url": "https://bambuddy.example/archives?confirm=7"},
+            )
+
+        assert mock_send.call_args.kwargs["url"] == "https://bambuddy.example/archives?confirm=7"
+
+    @pytest.mark.asyncio
+    async def test_test_notification_reaches_gotify(self, service):
+        with patch.object(service, "_send_gotify", new_callable=AsyncMock) as mock_send:
+            mock_send.return_value = (True, "OK")
+            success, _ = await service.send_test_notification(
+                "gotify", {"server": "https://g.example", "app_token": "t"}, attach_photo=False
+            )
+
+        assert success is True
+        assert mock_send.call_args.kwargs["event_type"] == "test"
 
 
 class TestNotificationVariableFallbacks:
@@ -2128,9 +2403,6 @@ class TestPlateNotEmptyNotifications:
 
             mock_get.assert_called_once()
             mock_send.assert_called_once()
-            # Verify force_immediate is True (critical alert)
-            call_kwargs = mock_send.call_args[1]
-            assert call_kwargs.get("force_immediate") is True
 
     @pytest.mark.asyncio
     async def test_on_plate_not_empty_skipped_when_disabled(self, service, mock_provider, mock_db):

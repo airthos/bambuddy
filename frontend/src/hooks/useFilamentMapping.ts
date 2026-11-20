@@ -1,21 +1,56 @@
 import { useMemo } from 'react';
 import { getColorName } from '../utils/colors';
+import type { RackGroupInfo } from '../components/PrintModal/types';
 import {
   normalizeColor,
   normalizeColorForCompare,
   colorsAreSimilar,
+  filamentTypesCompatible,
+  findNearestSimilar,
   formatSlotLabel,
   getGlobalTrayId,
+  isAmsHtUnit,
   preferLowestSortKey,
   compareSortKeys,
+  rackExternalLabel,
 } from '../utils/amsHelpers';
-import type { PrinterStatus } from '../api/client';
+import { externalSlotIndex, trayLayoutOf } from '../utils/trayIds';
+import type { PrinterStatus, SlotSpoolIdentity } from '../api/client';
+
+/** Global-tray-id → the identity of the spool Bambuddy has bound to that slot. */
+export type SlotSpoolIdentities = Map<number, SlotSpoolIdentity>;
+
+/**
+ * Name a slot after the spool bound to it, the way the printer card does.
+ *
+ * Telemetry can only ever say "PLA" plus a colour hex for anything that isn't
+ * a Bambu spool: the tray record has no brand field, `tray_sub_brands` stays
+ * empty, and the hex gets resolved against Bambu's own colour catalogue. So a
+ * Devil Design PLA Basic Orange the operator assigned in Bambuddy read back as
+ * "PLA (Sunflower Yellow)" here while the printer card named it correctly.
+ *
+ * Returns null when the slot has no binding or the binding says nothing
+ * useful, and the caller keeps the telemetry description it had before.
+ */
+function spoolDisplayName(identity: SlotSpoolIdentity | undefined): string | null {
+  if (!identity) return null;
+  // Same order the hover card prints: brand, then material, then subtype.
+  const parts = [identity.brand, identity.material, identity.subtype].filter(Boolean);
+  return parts.length > 0 ? parts.join(' ') : null;
+}
 
 /**
  * Build loaded filaments list from printer status (non-hook version).
  * Extracts filaments from all AMS units (regular and HT) and external spool.
+ *
+ * `slotSpools` is optional and display-only: it renames slots after their
+ * bound spool without touching `type`, `color` or `trayInfoIdx`, so matching
+ * and the dispatcher keep drawing on the printer's own telemetry.
  */
-export function buildLoadedFilaments(printerStatus: PrinterStatus | undefined): LoadedFilament[] {
+export function buildLoadedFilaments(
+  printerStatus: PrinterStatus | undefined,
+  slotSpools?: SlotSpoolIdentities,
+): LoadedFilament[] {
   const filaments: LoadedFilament[] = [];
   const amsExtruderMap = printerStatus?.ams_extruder_map;
   // Dual-nozzle detection. The backend always emits a 2-entry nozzles array
@@ -27,29 +62,37 @@ export function buildLoadedFilaments(printerStatus: PrinterStatus | undefined): 
   // dual-nozzle hardware exposes multiple external feeds) each independently
   // imply dual-nozzle — keep them as fallbacks for any firmware rev that
   // surfaces one signal but not the other. (#1257)
+  // A rack printer (H3C) has nine external inputs but one extruder.
+  const rackExternals = trayLayoutOf(printerStatus?.ams, printerStatus?.vt_tray).rack;
   const hasDualNozzle =
     Boolean(printerStatus?.nozzles?.[1]?.nozzle_diameter)
     || (amsExtruderMap && Object.keys(amsExtruderMap).length > 0)
-    || (printerStatus?.vt_tray?.length ?? 0) > 1;
+    || ((printerStatus?.vt_tray?.length ?? 0) > 1 && !rackExternals);
 
   // Add filaments from all AMS units (regular and HT)
   printerStatus?.ams?.forEach((amsUnit) => {
-    const isHt = amsUnit.tray.length === 1; // AMS-HT has single tray
+    const isHt = isAmsHtUnit(amsUnit.id);
     amsUnit.tray.forEach((tray) => {
       if (tray.tray_type) {
         const color = normalizeColor(tray.tray_color);
+        const globalTrayId = getGlobalTrayId(amsUnit.id, tray.id, false, amsUnit.ams_type);
+        const identity = slotSpools?.get(globalTrayId);
         filaments.push({
           type: tray.tray_type,
           color,
-          colorName: getColorName(color),
+          colorName: identity?.color_name?.trim() || getColorName(color, tray.tray_sub_brands, tray.tray_info_idx),
           amsId: amsUnit.id,
           trayId: tray.id,
           isHt,
           isExternal: false,
-          label: formatSlotLabel(amsUnit.id, tray.id, isHt, false),
-          globalTrayId: getGlobalTrayId(amsUnit.id, tray.id, false),
+          label: formatSlotLabel(amsUnit.id, tray.id, isHt, false, amsUnit.ams_type),
+          globalTrayId,
           trayInfoIdx: tray.tray_info_idx || '',
           traySubBrands: tray.tray_sub_brands || '',
+          spoolName: spoolDisplayName(identity) ?? undefined,
+          extraColors: identity?.extra_colors ?? undefined,
+          effectType: identity?.effect_type ?? undefined,
+          spoolSubtype: identity?.subtype ?? undefined,
           extruderId: amsExtruderMap?.[String(amsUnit.id)],
           remain: tray.remain ?? -1,
         });
@@ -62,19 +105,26 @@ export function buildLoadedFilaments(printerStatus: PrinterStatus | undefined): 
     if (extTray.tray_type) {
       const color = normalizeColor(extTray.tray_color);
       const trayId = extTray.id ?? 254;
-      const hasDualExternal = (printerStatus?.vt_tray?.length ?? 0) > 1;
+      const hasDualExternal = (printerStatus?.vt_tray?.length ?? 0) > 1 && !rackExternals;
+      // The external holder's global tray id IS the tray id (254 / 255), which
+      // is how the backend keys it too — see `_ams_key_to_global`.
+      const identity = slotSpools?.get(trayId);
       filaments.push({
         type: extTray.tray_type,
         color,
-        colorName: getColorName(color),
+        colorName: identity?.color_name?.trim() || getColorName(color, extTray.tray_sub_brands, extTray.tray_info_idx),
         amsId: -1,
-        trayId: trayId - 254,
+        trayId: externalSlotIndex(trayId),
         isHt: false,
         isExternal: true,
-        label: hasDualExternal ? (trayId === 254 ? 'Ext-L' : 'Ext-R') : 'External',
+        label: rackExternals ? rackExternalLabel(trayId) : hasDualExternal ? (trayId === 254 ? 'Ext-L' : 'Ext-R') : 'External',
         globalTrayId: trayId,
         trayInfoIdx: extTray.tray_info_idx || '',
         traySubBrands: extTray.tray_sub_brands || '',
+        spoolName: spoolDisplayName(identity) ?? undefined,
+        extraColors: identity?.extra_colors ?? undefined,
+        effectType: identity?.effect_type ?? undefined,
+        spoolSubtype: identity?.subtype ?? undefined,
         extruderId: hasDualNozzle ? (255 - trayId) : undefined,
         remain: extTray.remain ?? -1,
       });
@@ -137,10 +187,24 @@ export interface LoadedFilament {
   trayInfoIdx?: string;
   /** Filament subtype name (e.g., "PLA Basic", "PLA Matte", "PETG HF") */
   traySubBrands?: string;
+  /** "Devil Design PLA Basic" — the spool Bambuddy has bound to this slot,
+   *  when there is one. Display only; prefer it over `traySubBrands`, which
+   *  the printer leaves empty for everything that isn't a Bambu spool. */
+  spoolName?: string;
   /** Extruder ID for dual-nozzle printers (0=right, 1=left) */
   extruderId?: number;
   /** Remaining filament percentage (0-100), -1 = unknown */
   remain: number;
+  /** The bound spool's remaining colour stops and effect overlay, when the
+   *  slot has a binding (#3159). Display only, like `spoolName`: a tray record
+   *  carries one hex, so without these a two-tone spool draws as its base
+   *  colour. Absent for a slot configured on the printer -- the firmware has
+   *  nothing to report, and a solid swatch is then the honest one. */
+  extraColors?: string;
+  effectType?: string;
+  /** The bound spool's subtype ("PLA Silk", "Multicolor"), which decides
+   *  whether the swatch renders its stops as a conic sweep. */
+  spoolSubtype?: string;
 }
 
 /**
@@ -155,6 +219,13 @@ export interface FilamentRequirement {
   tray_info_idx?: string;
   /** Target nozzle for dual-nozzle printers (0=right, 1=left) */
   nozzle_id?: number;
+  /** Filament group this slot prints in, on a nozzle-rack machine (#1784).
+   *  The group is the slicer's logical nozzle, so it is what a rack position
+   *  gets chosen for. Absent on every other model. */
+  group_id?: number;
+  /** What that group needs of a hotend, for filtering the rack positions it
+   *  can be sent to. */
+  group?: RackGroupInfo;
 }
 
 /**
@@ -196,11 +267,12 @@ interface UseFilamentMappingResult {
  * Extracts filaments from all AMS units (regular and HT) and external spool.
  */
 export function useLoadedFilaments(
-  printerStatus: PrinterStatus | undefined
+  printerStatus: PrinterStatus | undefined,
+  slotSpools?: SlotSpoolIdentities,
 ): LoadedFilament[] {
   return useMemo(() => {
-    return buildLoadedFilaments(printerStatus);
-  }, [printerStatus]);
+    return buildLoadedFilaments(printerStatus, slotSpools);
+  }, [printerStatus, slotSpools]);
 }
 
 /**
@@ -256,7 +328,7 @@ export function buildFilamentComparison(
       const manualLoaded = loadedFilaments.find((f) => f.globalTrayId === manualTrayId);
 
       if (manualLoaded) {
-        const typeMatch = manualLoaded.type?.toUpperCase() === req.type?.toUpperCase();
+        const typeMatch = filamentTypesCompatible(manualLoaded.type, req.type);
         const colorMatch = coloursMatch(manualLoaded.color, req.color);
 
         let status: FilamentStatus;
@@ -329,19 +401,19 @@ export function buildFilamentComparison(
         }
         exactMatch = idxMatches.find(
           (f) =>
-            f.type?.toUpperCase() === req.type?.toUpperCase() &&
+            filamentTypesCompatible(f.type, req.type) &&
             normalizeColorForCompare(f.color) === normalizeColorForCompare(req.color)
         );
         if (!exactMatch) {
-          similarMatch = idxMatches.find(
-            (f) =>
-              f.type?.toUpperCase() === req.type?.toUpperCase() &&
-              colorsAreSimilar(f.color, req.color)
+          similarMatch = findNearestSimilar(
+            idxMatches.filter((f) => filamentTypesCompatible(f.type, req.type)),
+            req.color,
+            (f) => f.color,
           );
         }
         if (!exactMatch && !similarMatch) {
           typeOnlyMatch = idxMatches.find(
-            (f) => f.type?.toUpperCase() === req.type?.toUpperCase()
+            (f) => filamentTypesCompatible(f.type, req.type)
           );
         }
       }
@@ -351,19 +423,19 @@ export function buildFilamentComparison(
     if (!idxMatch && !exactMatch && !similarMatch && !typeOnlyMatch) {
       exactMatch = available.find(
         (f) =>
-          f.type?.toUpperCase() === req.type?.toUpperCase() &&
+          filamentTypesCompatible(f.type, req.type) &&
           normalizeColorForCompare(f.color) === normalizeColorForCompare(req.color)
       );
       if (!exactMatch) {
-        similarMatch = available.find(
-          (f) =>
-            f.type?.toUpperCase() === req.type?.toUpperCase() &&
-            colorsAreSimilar(f.color, req.color)
+        similarMatch = findNearestSimilar(
+          available.filter((f) => filamentTypesCompatible(f.type, req.type)),
+          req.color,
+          (f) => f.color,
         );
       }
       if (!exactMatch && !similarMatch) {
         typeOnlyMatch = available.find(
-          (f) => f.type?.toUpperCase() === req.type?.toUpperCase()
+          (f) => filamentTypesCompatible(f.type, req.type)
         );
       }
     }
@@ -446,8 +518,9 @@ export function useFilamentMapping(
   manualMappings: Record<number, number>,
   preferLowest?: boolean,
   inventoryByTrayId?: Map<number, number>,
+  slotSpools?: SlotSpoolIdentities,
 ): UseFilamentMappingResult {
-  const loadedFilaments = useLoadedFilaments(printerStatus);
+  const loadedFilaments = useLoadedFilaments(printerStatus, slotSpools);
 
   // FTS routes any AMS slot to any extruder, so per-nozzle slot restriction
   // doesn't apply when it's installed (#1162).

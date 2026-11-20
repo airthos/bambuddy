@@ -54,6 +54,12 @@ does not touch dispatch coordination; this race is still open.
 
 ## Reprints share one archive, so they share one Sentry recording
 
+> **Worse after the v1.3.1 sync (2026-11-19).** Upstream's archive redesign makes one
+> archive with many runs the normal case (`022ea39a1`: a file printing on several
+> printers at once is one archive). Seen in production the same day: archive 462 ran on
+> 3DP 2, 3 and 4 at once and only 3DP 2 got a recording. Fix: key recordings by run
+> (`print_log_entries.id`) instead of archive.
+
 Found 2026-10-28 while fixing the archive-id reuse bug (see Sentry fix 5 in
 [`features.md`](features.md)). Several queue items can point at the same
 `print_archives` row (archive 434 had queue items 1665–1671 across printers 2, 3 and 4).
@@ -71,3 +77,19 @@ configuration (push-off is expected to clear the plate physically). This is what
 the fouled-bed issue in Fix 8 possible in the first place, and why that fix is
 status-aware rather than just re-enabling the plate-clear requirement — turning the
 requirement back on would break the lights-out flow this farm depends on.
+
+## Mid-print AMS runout charges the wrong spool
+
+Found 2026-11-19 on 3DP 2 (archive 463, 2026-11-18): slot T3 ran out at layer ~61 and
+the AMS switched to T2. The usage tracker charged all 162.3 g to spool 10 (T2) and 0 g to
+spool 15 (T3), and dropped ~5 g on a phantom "AMS255-T0" segment. Root cause in
+`bambu_mqtt.py`: the tray-change log is seeded at print start from `tray_now`, which is
+255 on a P1S before the start-gcode loads filament, so no seed; the start-load of T3 is
+then not logged either, because `last_loaded_tray` is already 3 from the previous print.
+The log starts at the runout ([(254, 61), (2, 67)]), so `compute_tray_split_grams` gives
+layers 0–61 to nobody. 254 is a transient during the switch, treated as a real tray.
+**Same code in upstream v1.3.1** (closest upstream issue is the reverse case, #3322).
+Resolution sketch: when the log is empty at the first change, seed `(start_tray, 0)` from
+the dispatch mapping / `tray_now_at_start`; ignore 254 on printers with no external spool
+in use.
+
